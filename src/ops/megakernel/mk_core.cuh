@@ -30,6 +30,10 @@ enum class MkOp : std::uint32_t {
     RmsNorm2048,     // ptr0=x, ptr1=weight, out0=dst; dim0=rows (each row = 2048 bf16)
     W8GemvResidual,  // ptr0=x, ptr1=codes, ptr2=scales, out0=residual_dst;
                      // dim0=row0, dim1=rows (multiple of warps), dim2=k
+    W8DecodeK,       // verbatim w8_k2048_decode body, one warp per output row.
+                     // ptr0=x, ptr1=codes, ptr2=scales, out0=dst (plain store) or
+                     // residual accumulate when dim3!=0; dim0=row0, dim1=rows,
+                     // dim2=K (2048|4096), dim3=residual flag
     Noop,
 };
 

@@ -118,6 +118,92 @@ __device__ inline void mk_body_w8_gemv_residual(const MkInstr& instr) {
     }
 }
 
+// Verbatim transplant of w8_k2048_decode_kernel (ops/linear/w8/w8_k2048_decode.cuh)
+// generalized over K: one warp owns one output row, 8 bf16/lane per phase, u16 group
+// scales broadcast via shfl(lane>>2). Identical per-row FP order -> bit-exact against
+// the engine's decode in-proj path. 16 warps of the interpreter CTA cover
+// dim1 (=16) consecutive rows starting at dim0.
+template <int K>
+__device__ inline void mk_body_w8_decode(const MkInstr& instr) {
+    const auto* x      = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* codes  = static_cast<const std::uint8_t*>(instr.ptr[1]);
+    const auto* scales = static_cast<const std::uint8_t*>(instr.ptr[2]);
+    auto* out          = static_cast<__nv_bfloat16*>(instr.out[0]);
+    const std::int64_t row0 = instr.dim[0];
+    const std::int64_t rows = instr.dim[1];
+    const bool residual     = instr.dim[3] != 0;
+
+    constexpr int kGroup             = 32;
+    constexpr int kGroupsPerRow      = K / kGroup;
+    constexpr int kValuesPerLane     = 8;
+    constexpr int kValuesPerPhase    = 32 * kValuesPerLane;
+    constexpr int kGroupsPerPhase    = kValuesPerPhase / kGroup;
+    constexpr int kPhases            = K / kValuesPerPhase;
+    constexpr unsigned kFullWarpMask = 0xffffffffu;
+
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
+
+    for (std::int64_t r = warp; r < rows; r += warps) {
+        const std::int64_t row        = row0 + r;
+        const std::uint8_t* code_row  = codes + row * K;
+        const std::uint8_t* scale_row = scales + row * kGroupsPerRow * 2;
+
+        float accumulator = 0.0f;
+#pragma unroll
+        for (int phase = 0; phase < kPhases; ++phase) {
+            unsigned scale_bits = 0;
+            if (lane < kGroupsPerPhase) {
+                scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scale_row + static_cast<std::int64_t>(phase * kGroupsPerPhase + lane) * 2);
+            }
+            scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
+            const float scale = __half2float(__ushort_as_half(scale_bits));
+
+            const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
+            const uint2 packed = *reinterpret_cast<const uint2*>(code_row + phase_k);
+            float weights[kValuesPerLane];
+#pragma unroll
+            for (int word_index = 0; word_index < 2; ++word_index) {
+                const std::uint32_t word = (&packed.x)[word_index];
+                weights[word_index * 4 + 0] =
+                    static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
+                weights[word_index * 4 + 1] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xffu)) * scale;
+                weights[word_index * 4 + 2] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 16) & 0xffu)) * scale;
+                weights[word_index * 4 + 3] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
+            }
+
+            const uint4 values = *reinterpret_cast<const uint4*>(x + phase_k);
+            const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.x));
+            const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.y));
+            const float2 x2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.z));
+            const float2 x3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.w));
+            accumulator = fmaf(weights[0], x0.x, accumulator);
+            accumulator = fmaf(weights[1], x0.y, accumulator);
+            accumulator = fmaf(weights[2], x1.x, accumulator);
+            accumulator = fmaf(weights[3], x1.y, accumulator);
+            accumulator = fmaf(weights[4], x2.x, accumulator);
+            accumulator = fmaf(weights[5], x2.y, accumulator);
+            accumulator = fmaf(weights[6], x3.x, accumulator);
+            accumulator = fmaf(weights[7], x3.y, accumulator);
+        }
+
+        accumulator = mk_warp_reduce_sum(accumulator);
+        if (lane == 0) {
+            if (residual) {
+                const float prior = __bfloat162float(out[row]);
+                out[row]          = __float2bfloat16_rn(prior + accumulator);
+            } else {
+                out[row] = __float2bfloat16_rn(accumulator);
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& shared) {
     switch (instr.op) {
     case MkOp::RmsNorm2048:
@@ -125,6 +211,13 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         return;
     case MkOp::W8GemvResidual:
         mk_body_w8_gemv_residual(instr);
+        return;
+    case MkOp::W8DecodeK:
+        if (instr.dim[2] == 2048) {
+            mk_body_w8_decode<2048>(instr);
+        } else {
+            mk_body_w8_decode<4096>(instr);
+        }
         return;
     case MkOp::Halt:
     case MkOp::Noop:
@@ -134,8 +227,25 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
 
 // ---- the interpreter -------------------------------------------------------
 
+// While lane 0 spins on dependency counters, every other thread pulls this
+// instruction's WEIGHT bytes into L2 — weights are immutable, so prefetching
+// ahead of the data dependency is always safe, and the DRAM fetch overlaps the
+// wait instead of following it. This is the megakernel-only overlap that the
+// kernel-per-op model cannot express.
+__device__ __forceinline__ void mk_prefetch_weights(const MkInstr& instr) {
+    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8GemvResidual) { return; }
+    const auto* codes        = static_cast<const char*>(instr.ptr[1]);
+    const std::int64_t base  = instr.dim[0] * instr.dim[2];
+    const std::int64_t bytes = instr.dim[1] * instr.dim[2];
+    for (std::int64_t off = static_cast<std::int64_t>(threadIdx.x) * 128; off < bytes;
+         off += static_cast<std::int64_t>(kMkThreads) * 128) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(codes + base + off));
+    }
+}
+
 __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
-    const MkStream* __restrict__ streams, std::uint32_t* __restrict__ counters) {
+    const MkStream* __restrict__ streams, std::uint32_t* __restrict__ counters,
+    int enable_prefetch) {
     __shared__ MkShared shared;
     const MkStream stream = streams[blockIdx.x];
     for (std::uint32_t i = 0; i < stream.count; ++i) {
@@ -149,6 +259,7 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             }
             __syncthreads();
         }
+        if (enable_prefetch != 0) { mk_prefetch_weights(instr_s); }
         mk_wait_phase(instr_s, counters);
         mk_execute(instr_s, shared);
         mk_post_phase(instr_s, counters);
@@ -167,6 +278,16 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_ref_w8_gemv_kernel(MkInstr i
     MkInstr local = instr;
     local.dim[0]  = instr.dim[0] + static_cast<std::int64_t>(blockIdx.x) * instr.dim[1];
     mk_body_w8_gemv_residual(local);
+}
+
+__global__ __launch_bounds__(kMkThreads, 1) void mk_ref_w8_decode_kernel(MkInstr instr) {
+    MkInstr local = instr;
+    local.dim[0]  = instr.dim[0] + static_cast<std::int64_t>(blockIdx.x) * instr.dim[1];
+    if (instr.dim[2] == 2048) {
+        mk_body_w8_decode<2048>(local);
+    } else {
+        mk_body_w8_decode<4096>(local);
+    }
 }
 
 } // namespace ninfer::ops::mk
