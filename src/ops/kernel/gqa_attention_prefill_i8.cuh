@@ -35,19 +35,25 @@ inline constexpr int kGqaPrefillI8VBytes = kGqaPrefillI8Bc * kGqaPrefillHeadDim;
 // non-transposed byte-matrix ldmatrix pattern as K in the QK loop (ldmatrix.trans only permutes
 // 16-bit elements, so a byte matrix cannot be transposed at load time).
 inline constexpr int kGqaPrefillI8VStageBytes = kGqaPrefillI8Bc * kGqaPrefillHeadDim;
-inline constexpr int kGqaPrefillI8PBytes      = kGqaPrefillI8Br * kGqaPrefillI8Bc;
+// One s8 copy of P per 64-d value group, with the per-key V group scale folded in:
+// P'_g[k] = P[k] * vs(k, g), quantized with an exact per-(row, g) scale. Each PV warp owns
+// exactly one value group (d_slice == g), so it reads only its own copy.
+inline constexpr int kGqaPrefillI8PBytes =
+    kGqaPrefillI8Br * kGqaPrefillI8Bc * kGqaPrefillI8Groups;
+inline constexpr int kGqaPrefillI8PScaleBytes =
+    kGqaPrefillI8Br * kGqaPrefillI8Groups * static_cast<int>(sizeof(float));
 inline constexpr int kGqaPrefillI8ScaleBytes =
     2 * kGqaPrefillI8Bc * kGqaPrefillI8Groups * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8StatsBytes =
     2 * kGqaPrefillI8Br * static_cast<int>(sizeof(float));
-inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI8QScaleBytes +
-                                              kGqaPrefillI8KBytes + kGqaPrefillI8VBytes +
-                                              kGqaPrefillI8VStageBytes + kGqaPrefillI8PBytes +
-                                              kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes;
+inline constexpr int kGqaPrefillI8SmemBytes =
+    kGqaPrefillI8QBytes + kGqaPrefillI8QScaleBytes + kGqaPrefillI8KBytes + kGqaPrefillI8VBytes +
+    kGqaPrefillI8VStageBytes + kGqaPrefillI8PBytes + kGqaPrefillI8PScaleBytes +
+    kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes;
 
 static_assert(kGqaPrefillI8Groups == 4);
 static_assert(kGqaPrefillI8DConsumers == 4);
-static_assert(kGqaPrefillI8SmemBytes == 72192);
+static_assert(kGqaPrefillI8SmemBytes == 85504);
 
 __device__ __forceinline__ void gqa_prefill_i8_store_swz(std::int8_t* tile, int row, int d,
                                                          std::int8_t code) {
@@ -62,8 +68,14 @@ __device__ __forceinline__ int gqa_prefill_i8_swz32(int row, int col16) {
     return (((col16 >> 3) ^ (row & 3)) << 3) | (col16 & 7);
 }
 
-__device__ __forceinline__ int gqa_prefill_i8_p8_off(int row, int col) {
-    return (row * (kGqaPrefillI8Bc / 2) + gqa_prefill_i8_swz32(row, col >> 1)) * 2 + (col & 1);
+__device__ __forceinline__ int gqa_prefill_i8_p8_off(int group, int row, int col) {
+    const int base = group * kGqaPrefillI8Br * kGqaPrefillI8Bc;
+    return base + (row * (kGqaPrefillI8Bc / 2) + gqa_prefill_i8_swz32(row, col >> 1)) * 2 +
+           (col & 1);
+}
+
+__device__ __forceinline__ std::int8_t gqa_prefill_i8_p_code(float value, float inv_scale) {
+    return static_cast<std::int8_t>(__float2int_rn(value * inv_scale));
 }
 
 __device__ __forceinline__ std::uint8_t gqa_prefill_f32_to_e4m3(float v) {
@@ -257,9 +269,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     std::int8_t* k_i8 = reinterpret_cast<std::int8_t*>(reinterpret_cast<unsigned char*>(q_scale) +
                                                        kGqaPrefillI8QScaleBytes);
     std::int8_t* v_i8 = k_i8 + kGqaPrefillI8KBytes;
-    std::uint8_t* v_t8 = reinterpret_cast<std::uint8_t*>(v_i8 + kGqaPrefillI8VBytes);
-    std::uint8_t* p_s  = v_t8 + kGqaPrefillI8VStageBytes;
-    __half* k_scale_s  = reinterpret_cast<__half*>(p_s + kGqaPrefillI8PBytes);
+    std::int8_t* v_t8 = v_i8 + kGqaPrefillI8VBytes;
+    std::int8_t* p_s  = v_t8 + kGqaPrefillI8VStageBytes;
+    float* p_scale_s  = reinterpret_cast<float*>(p_s + kGqaPrefillI8PBytes);
+    __half* k_scale_s = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_scale_s) +
+                                                  kGqaPrefillI8PScaleBytes);
     __half* v_scale_s    = k_scale_s + Bc * Groups;
     float* alpha_s       = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
     float* final_l_s     = alpha_s + Br;
@@ -488,6 +502,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                          : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
             float bl0              = 0.0f;
             float bl1              = 0.0f;
+            float p_stage[QKNt][4];
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;
@@ -506,12 +521,10 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                // x64 (exact) pulls tail probabilities out of the e4m3 subnormal range;
-                // the epilogue folds 1/64 into inv_l.
-                p_s[gqa_prefill_i8_p8_off(row0, col0)] = gqa_prefill_f32_to_e4m3(p00 * 64.0f);
-                p_s[gqa_prefill_i8_p8_off(row0, col1)] = gqa_prefill_f32_to_e4m3(p01 * 64.0f);
-                p_s[gqa_prefill_i8_p8_off(row1, col0)] = gqa_prefill_f32_to_e4m3(p10 * 64.0f);
-                p_s[gqa_prefill_i8_p8_off(row1, col1)] = gqa_prefill_f32_to_e4m3(p11 * 64.0f);
+                p_stage[nt][0] = p00;
+                p_stage[nt][1] = p01;
+                p_stage[nt][2] = p10;
+                p_stage[nt][3] = p11;
             }
             bl0        = warp_sum<4>(bl0, FullMask);
             bl1        = warp_sum<4>(bl1, FullMask);
@@ -523,6 +536,45 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
+
+            // Two-pass product quantization of P: for every value group g fold the per-key V
+            // scale into P and quantize s8 against the exact per-(row, g) maximum.
+#pragma unroll
+            for (int g = 0; g < Groups; ++g) {
+                float m0 = 0.0f;
+                float m1 = 0.0f;
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    const int key_l = nt * 8 + 2 * lid;
+                    const float vsa = __half2float(v_scale_s[key_l * Groups + g]);
+                    const float vsb = __half2float(v_scale_s[(key_l + 1) * Groups + g]);
+                    m0 = fmaxf(m0, fmaxf(fabsf(p_stage[nt][0]) * vsa, fabsf(p_stage[nt][1]) * vsb));
+                    m1 = fmaxf(m1, fmaxf(fabsf(p_stage[nt][2]) * vsa, fabsf(p_stage[nt][3]) * vsb));
+                }
+                m0 = warp_max<4>(m0, FullMask);
+                m1 = warp_max<4>(m1, FullMask);
+                const float inv0 = m0 > 0.0f ? 127.0f / m0 : 0.0f;
+                const float inv1 = m1 > 0.0f ? 127.0f / m1 : 0.0f;
+                if (lid == 0) {
+                    p_scale_s[row0 * Groups + g] = m0 > 0.0f ? m0 / 127.0f : 0.0f;
+                    p_scale_s[row1 * Groups + g] = m1 > 0.0f ? m1 / 127.0f : 0.0f;
+                }
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    const int col0f = nt * 8 + 2 * lid;
+                    const int col1f = col0f + 1;
+                    const float vsa = __half2float(v_scale_s[col0f * Groups + g]);
+                    const float vsb = __half2float(v_scale_s[col1f * Groups + g]);
+                    p_s[gqa_prefill_i8_p8_off(g, row0, col0f)] =
+                        gqa_prefill_i8_p_code(p_stage[nt][0] * vsa, inv0);
+                    p_s[gqa_prefill_i8_p8_off(g, row0, col1f)] =
+                        gqa_prefill_i8_p_code(p_stage[nt][1] * vsb, inv0);
+                    p_s[gqa_prefill_i8_p8_off(g, row1, col0f)] =
+                        gqa_prefill_i8_p_code(p_stage[nt][2] * vsa, inv1);
+                    p_s[gqa_prefill_i8_p8_off(g, row1, col1f)] =
+                        gqa_prefill_i8_p_code(p_stage[nt][3] * vsb, inv1);
+                }
+            }
         } else if (warp < ProducerWarps + VWorkerWarps) {
             const int worker_tid  = tid - ProducerWarps * 32;
             constexpr int KeyOcts = Bc / 8;
@@ -531,25 +583,21 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int d       = chunk / KeyOcts;
                 const int key_oct = chunk - d * KeyOcts;
                 const int key_l0  = key_oct * 8;
-                const int grp     = d >> 6;
-                unsigned w0       = 0;
-                unsigned w1       = 0;
+                unsigned w0 = 0;
+                unsigned w1 = 0;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const int key_l = key_l0 + j;
-                    float v         = 0.0f;
-                    if (k0 + key_l <= max_query_abs) {
-                        const float vs = __half2float(v_scale_s[key_l * Groups + grp]);
-                        v = static_cast<float>(v_i8[key_l * D + d]) * vs;
-                    }
-                    const unsigned byte = gqa_prefill_f32_to_e4m3(v);
+                    const int key_l     = key_l0 + j;
+                    const unsigned byte = k0 + key_l <= max_query_abs
+                                              ? static_cast<unsigned char>(v_i8[key_l * D + d])
+                                              : 0u;
                     if (j < 4) {
                         w0 |= byte << (8 * j);
                     } else {
                         w1 |= byte << (8 * (j - 4));
                     }
                 }
-                std::uint8_t* dst =
+                std::int8_t* dst =
                     &v_t8[(d * (Bc / 2) + gqa_prefill_i8_swz32(d, key_l0 >> 1)) * 2];
                 store_vec(dst, make_int2(static_cast<int>(w0), static_cast<int>(w1)));
             }
@@ -572,25 +620,33 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             acc[n][3] *= alpha1;
         }
 
+        const float ps0 = p_scale_s[(row_base + gid) * Groups + d_slice];
+        const float ps1 = p_scale_s[(row_base + gid + 8) * Groups + d_slice];
 #pragma unroll
-        for (int k = 0; k < Bc / 32; ++k) {
-            unsigned pf[4];
-            const int prow    = row_base + a_rowoff;
-            const int pcol16  = k * 16 + a_coloff;
-            ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                        smem_addr(&p_s[(prow * (Bc / 2) + gqa_prefill_i8_swz32(prow, pcol16)) * 2]));
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int global_n = d_slice * PVNtPerWarp + n;
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
-            for (int n = 0; n < PVNtPerWarp; ++n) {
-                const int global_n = d_slice * PVNtPerWarp + n;
+            for (int k = 0; k < Bc / 32; ++k) {
+                unsigned pf[4];
+                const int prow   = row_base + a_rowoff;
+                const int pcol16 = k * 16 + a_coloff;
+                ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                            smem_addr(&p_s[d_slice * Br * Bc +
+                                           (prow * (Bc / 2) +
+                                            gqa_prefill_i8_swz32(prow, pcol16)) * 2]));
                 unsigned vf[2];
                 const int vrow   = global_n * 8 + b_rin;
                 const int vcol16 = k * 16 + b_koff;
                 ldmatrix_x2(vf[0], vf[1],
                             smem_addr(&v_t8[(vrow * (Bc / 2) +
                                              gqa_prefill_i8_swz32(vrow, vcol16)) * 2]));
-                mma_fp8_e4m3(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
-                             pf[3], vf[0], vf[1]);
+                mma_s8(c0, c1, c2, c3, pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+            acc[n][0] = __fmaf_rn(static_cast<float>(c0), ps0, acc[n][0]);
+            acc[n][1] = __fmaf_rn(static_cast<float>(c1), ps0, acc[n][1]);
+            acc[n][2] = __fmaf_rn(static_cast<float>(c2), ps1, acc[n][2]);
+            acc[n][3] = __fmaf_rn(static_cast<float>(c3), ps1, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
@@ -609,10 +665,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int row_base = row_tile * 16;
     const int row0     = row_base + gid;
     const int row1     = row0 + 8;
-    const float inv_l0 =
-        final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) * (1.0f / 64.0f) : 0.0f;
-    const float inv_l1 =
-        final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) * (1.0f / 64.0f) : 0.0f;
+    const float inv_l0 = final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) : 0.0f;
+    const float inv_l1 = final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) : 0.0f;
 #pragma unroll
     for (int n = 0; n < PVNtPerWarp; ++n) {
         const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
