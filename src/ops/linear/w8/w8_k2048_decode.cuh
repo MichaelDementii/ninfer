@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -21,7 +22,7 @@ struct W8DecodeStoreEpilogue {
 };
 
 template <std::int32_t Rows, std::int32_t RowsPerCta, class Output,
-          class Epilogue = W8DecodeStoreEpilogue>
+          class Epilogue = W8DecodeStoreEpilogue, bool PdlPrefetch = false>
 __global__ __launch_bounds__(RowsPerCta * 32,
                              2) void w8_k2048_decode_kernel(const __nv_bfloat16* __restrict__ x,
                                                             const std::uint8_t* __restrict__ codes,
@@ -45,23 +46,37 @@ __global__ __launch_bounds__(RowsPerCta * 32,
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kK;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroupsPerRow * 2;
 
+    // Codes and scales are immutable weights: they never depend on the producer kernel. Issue
+    // every weight load first so that, under a programmatic dependent launch, the DRAM stream
+    // overlaps the producer; only the activation reads sit behind the fence.
+    unsigned scale_bits[kPhases];
+    uint2 packed[kPhases];
+#pragma unroll
+    for (int phase = 0; phase < kPhases; ++phase) {
+        scale_bits[phase] = 0;
+        if (lane < kGroupsPerPhase) {
+            scale_bits[phase] = *reinterpret_cast<const std::uint16_t*>(
+                scale_row + static_cast<std::int64_t>(phase * kGroupsPerPhase + lane) * 2);
+        }
+        packed[phase] =
+            load_vec<uint2>(code_row + phase * kValuesPerPhase + lane * kValuesPerLane);
+    }
+    if constexpr (PdlPrefetch) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+        pdl::wait_for_dependencies();
+    }
+
     float accumulator = 0.0f;
 #pragma unroll
     for (int phase = 0; phase < kPhases; ++phase) {
-        unsigned scale_bits = 0;
-        if (lane < kGroupsPerPhase) {
-            scale_bits = *reinterpret_cast<const std::uint16_t*>(
-                scale_row + static_cast<std::int64_t>(phase * kGroupsPerPhase + lane) * 2);
-        }
-        scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
-        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const unsigned bits = __shfl_sync(kFullWarpMask, scale_bits[phase], lane >> 2);
+        const float scale   = __half2float(__ushort_as_half(bits));
 
-        const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
-        const uint2 packed = load_vec<uint2>(code_row + phase_k);
+        const int phase_k = phase * kValuesPerPhase + lane * kValuesPerLane;
         float weights[kValuesPerLane];
 #pragma unroll
         for (int word_index = 0; word_index < 2; ++word_index) {
-            const std::uint32_t word = (&packed.x)[word_index];
+            const std::uint32_t word = (&packed[phase].x)[word_index];
             weights[word_index * 4 + 0] =
                 static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
             weights[word_index * 4 + 1] =

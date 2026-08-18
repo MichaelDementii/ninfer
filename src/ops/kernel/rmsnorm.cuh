@@ -2,6 +2,7 @@
 
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
@@ -129,6 +130,9 @@ __launch_bounds__(Block) __global__
                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
                                    std::int64_t rows, float eps) {
     static_assert(Block % kWarpSize == 0);
+    // Release programmatic dependents (the attention input projection) immediately: they
+    // prefetch immutable weights while the norm runs and fence before reading its output.
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 

@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/w8/w8_k2048_decode.cuh"
 
 namespace ninfer::ops::detail {
@@ -32,12 +33,14 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                         static_cast<__nv_bfloat16*>(gate.data),
                         static_cast<__nv_bfloat16*>(v.data)};
-    w8_k2048_decode_kernel<kRows, kRowsPerCta>
-        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
-    CUDA_CHECK(cudaGetLastError());
+    // Launched as a programmatic dependent of the preceding input rmsnorm: weight prefetch
+    // overlaps the norm, the fence covers the activation reads.
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kRows / kRowsPerCta), dim3(kRowsPerCta * 32), 0, stream},
+        w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8DecodeStoreEpilogue, true>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, W8DecodeStoreEpilogue{}));
 }
 
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,

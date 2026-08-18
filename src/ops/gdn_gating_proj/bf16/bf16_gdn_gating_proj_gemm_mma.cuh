@@ -12,6 +12,7 @@
 // eight warps for more independent MMA accumulators. Both preserve a single
 // kernel launch.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/common/warp.cuh"
@@ -93,6 +94,10 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     const int token0   = static_cast<int>(blockIdx.x) * kBf16GdnBlockN;
     const int split    = static_cast<int>(blockIdx.z);
     const int kt_begin = split * kTilesPerSplit;
+
+    // Release programmatic dependents (the GDN input projection) immediately: they prefetch
+    // immutable weights while this kernel runs and fence before touching its outputs.
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
 
     if constexpr (NormalizeInput) {
         static_assert(SplitK == 32, "fused input normalization is tuned for split-32");

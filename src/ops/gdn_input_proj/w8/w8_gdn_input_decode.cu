@@ -1,6 +1,7 @@
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/linear/w8/w8_k2048_decode.cuh"
 
@@ -58,12 +59,14 @@ void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
     constexpr int kRowsPerCta = 8;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    w8_k2048_decode_kernel<kRows, kRowsPerCta>
-        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
-    CUDA_CHECK(cudaGetLastError());
+    // Launched as a programmatic dependent of the fused norm/control projection: the kernel
+    // prefetches its weight stream during the producer and fences only before reading x.
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kRows / kRowsPerCta), dim3(kRowsPerCta * 32), 0, stream},
+        w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8DecodeStoreEpilogue, true>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, W8DecodeStoreEpilogue{}));
 }
 
 void w8_gdn_input_decode_conv_snapshot_launch(
@@ -79,12 +82,12 @@ void w8_gdn_input_decode_conv_snapshot_launch(
                            snapshot_base_slot, query, key, value),
         static_cast<__nv_bfloat16*>(z.data),
     };
-    w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue>
-        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kRows / kRowsPerCta), dim3(kRowsPerCta * 32), 0, stream},
+        w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue, true>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue));
 }
 
 } // namespace ninfer::ops::detail
