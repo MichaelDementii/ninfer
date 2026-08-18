@@ -71,7 +71,7 @@ constexpr int kD3JSlice   = 16;
 constexpr int kD3Slices   = kMoeInter / kD3JSlice;      // 32
 constexpr int kD4RowSlice = 16;
 constexpr int kD4Slices   = kHidden / kD4RowSlice;      // 128
-constexpr int kCtr        = 23;   // 12 dep + 11 pop counters per layer
+constexpr int kCtr        = 25;   // 13 dep + 12 pop counters per layer
 
 __global__ void fill_codes_kernel(std::uint8_t* data, std::size_t n, std::uint32_t seed) {
     const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -126,7 +126,11 @@ int main() {
 
     __nv_bfloat16* d_h2;
     float *d_scores, *d_alpha, *d_sscale, *d_act;
+    float *d_ab, *d_gf, *d_betaf;
     int* d_ids;
+    CHECK(cudaMalloc(&d_ab, kGatRows * sizeof(float)));
+    CHECK(cudaMalloc(&d_gf, 32 * sizeof(float)));
+    CHECK(cudaMalloc(&d_betaf, 32 * sizeof(float)));
     CHECK(cudaMalloc(&d_h2, kHidden * sizeof(__nv_bfloat16)));
     CHECK(cudaMalloc(&d_scores, kRouterRows * sizeof(float)));
     CHECK(cudaMalloc(&d_alpha, kTopK * sizeof(float)));
@@ -175,6 +179,7 @@ int main() {
     std::vector<std::uint16_t*> d_in_scales(kLayers), d_out_scales(kLayers),
         d_sgu_scales(kLayers), d_sd_scales(kLayers);
     std::vector<float*> d_rec_state(kLayers);
+    std::vector<float*> d_alog(kLayers), d_dtb(kLayers);
 
     const std::size_t sgu_rows  = 2 * kMoeInter;                       // shared gate_up, K=2048
     const std::size_t sgu_codes = sgu_rows * kHidden;
@@ -191,6 +196,19 @@ int main() {
         CHECK(cudaMalloc(&d_conv_w[l], 4 * kConvRows * sizeof(__nv_bfloat16)));
         CHECK(cudaMalloc(&d_conv_state[l], conv_state_count * sizeof(__nv_bfloat16)));
         CHECK(cudaMalloc(&d_rec_state[l], rec_state_count * sizeof(float)));
+        CHECK(cudaMalloc(&d_alog[l], 32 * sizeof(float)));
+        CHECK(cudaMalloc(&d_dtb[l], 32 * sizeof(float)));
+        {
+            std::vector<float> alog(32), dtb(32);
+            for (int h = 0; h < 32; ++h) {
+                alog[h] = -1.5f + 0.05f * dist(rng);   // exp(A_log) ~ 0.2 => alpha in (0,1)
+                dtb[h]  = 0.3f * dist(rng);
+            }
+            CHECK(cudaMemcpy(d_alog[l], alog.data(), 32 * sizeof(float),
+                             cudaMemcpyHostToDevice));
+            CHECK(cudaMemcpy(d_dtb[l], dtb.data(), 32 * sizeof(float),
+                             cudaMemcpyHostToDevice));
+        }
         CHECK(cudaMalloc(&d_in_codes[l], in_code_bytes));
         CHECK(cudaMalloc(&d_in_scales[l], in_scale_count * sizeof(std::uint16_t)));
         CHECK(cudaMalloc(&d_out_codes[l], out_code_bytes));
@@ -265,10 +283,23 @@ int main() {
         instr.op      = MkOp::Bf16Gemv;
         instr.ptr[0]  = d_h;
         instr.ptr[1]  = d_gw[l];
-        instr.out[0]  = d_g;
+        instr.out[0]  = d_ab;
         instr.dim[0]  = 0;
         instr.dim[1]  = kGatSlice;
         instr.dim[2]  = kHidden;
+        instr.dim[3]  = 1;   // fp32 out
+        return instr;
+    };
+    auto make_gg = [&](int l) {
+        MkInstr instr = blank();
+        instr.op      = MkOp::GdnGating;
+        instr.ptr[0]  = d_ab;
+        instr.ptr[1]  = d_ab + 32;
+        instr.ptr[2]  = d_alog[l];
+        instr.ptr[3]  = d_dtb[l];
+        instr.out[0]  = d_gf;
+        instr.out[1]  = d_betaf;
+        instr.dim[0]  = 32;
         return instr;
     };
     auto make_inconv = [&](int l) {
@@ -293,12 +324,16 @@ int main() {
         instr.ptr[0]  = d_qc;
         instr.ptr[1]  = d_kc;
         instr.ptr[2]  = d_vc;
-        instr.ptr[3]  = d_g;
+        instr.ptr[3]  = d_gf;
+        instr.ptr[4]  = d_betaf;
+        instr.ptr[5]  = nullptr;
+        instr.ptr[6]  = nullptr;
         instr.out[0]  = d_o;
         instr.out[1]  = d_rec_state[l];
         instr.dim[0]  = 0;
         instr.dim[1]  = kRecPerSl;
         instr.dim[2]  = pack_f32(kGdnScale);
+        instr.dim[3]  = 0;
         return instr;
     };
     auto make_gn = [&](int l) {
@@ -396,7 +431,7 @@ int main() {
     std::vector<MkInstr> tape;
     for (int l = 0; l < kLayers; ++l) {
         MkInstr norm      = make_norm(l);
-        norm.task_counter = kCtr * l + 12;
+        norm.task_counter = kCtr * l + 13;
         norm.done_counter = kCtr * l;
         if (l > 0) {
             norm.wait_counter[0] = kCtr * (l - 1) + 11;
@@ -407,15 +442,22 @@ int main() {
         tape.push_back(norm);
 
         MkInstr gat         = make_gating(l);
-        gat.task_counter    = kCtr * l + 13;
+        gat.task_counter    = kCtr * l + 14;
         gat.slice_count     = kGatRows / kGatSlice;
         gat.done_counter    = kCtr * l + 4;
         gat.wait_counter[0] = kCtr * l;
         gat.wait_target[0]  = 1;
         tape.push_back(gat);
 
+        MkInstr gg         = make_gg(l);
+        gg.task_counter    = kCtr * l + 24;
+        gg.done_counter    = kCtr * l + 12;
+        gg.wait_counter[0] = kCtr * l + 4;
+        gg.wait_target[0]  = kGatRows / kGatSlice;
+        tape.push_back(gg);
+
         MkInstr in         = make_inconv(l);
-        in.task_counter    = kCtr * l + 14;
+        in.task_counter    = kCtr * l + 15;
         in.slice_count     = kInSlices;
         in.done_counter    = kCtr * l + 1;
         in.done2_counter   = kCtr * l + 2;
@@ -425,17 +467,17 @@ int main() {
         tape.push_back(in);
 
         MkInstr rec         = make_rec(l);
-        rec.task_counter    = kCtr * l + 15;
+        rec.task_counter    = kCtr * l + 16;
         rec.slice_count     = kRecSlices;
         rec.done_counter    = kCtr * l + 5;
         rec.wait_counter[0] = kCtr * l + 2;
         rec.wait_target[0]  = kHeadSlices;
-        rec.wait_counter[1] = kCtr * l + 4;
-        rec.wait_target[1]  = kGatRows / kGatSlice;
+        rec.wait_counter[1] = kCtr * l + 12;
+        rec.wait_target[1]  = 1;
         tape.push_back(rec);
 
         MkInstr gn         = make_gn(l);
-        gn.task_counter    = kCtr * l + 16;
+        gn.task_counter    = kCtr * l + 17;
         gn.done_counter    = kCtr * l + 6;
         gn.wait_counter[0] = kCtr * l + 5;
         gn.wait_target[0]  = kRecSlices;
@@ -444,7 +486,7 @@ int main() {
         tape.push_back(gn);
 
         MkInstr out_i         = make_out(l);
-        out_i.task_counter    = kCtr * l + 17;
+        out_i.task_counter    = kCtr * l + 18;
         out_i.slice_count     = kOutSlices;
         out_i.done_counter    = kCtr * l + 3;
         out_i.wait_counter[0] = kCtr * l + 6;
@@ -452,14 +494,14 @@ int main() {
         tape.push_back(out_i);
 
         MkInstr norm2         = make_norm2(l);
-        norm2.task_counter    = kCtr * l + 18;
+        norm2.task_counter    = kCtr * l + 19;
         norm2.done_counter    = kCtr * l + 7;
         norm2.wait_counter[0] = kCtr * l + 3;
         norm2.wait_target[0]  = kOutSlices;
         tape.push_back(norm2);
 
         MkInstr d1         = make_d1(l);
-        d1.task_counter    = kCtr * l + 19;
+        d1.task_counter    = kCtr * l + 20;
         d1.slice_count     = kD1Slices;
         d1.done_counter    = kCtr * l + 8;
         d1.wait_counter[0] = kCtr * l + 7;
@@ -467,14 +509,14 @@ int main() {
         tape.push_back(d1);
 
         MkInstr d2         = make_d2();
-        d2.task_counter    = kCtr * l + 20;
+        d2.task_counter    = kCtr * l + 21;
         d2.done_counter    = kCtr * l + 9;
         d2.wait_counter[0] = kCtr * l + 8;
         d2.wait_target[0]  = kD1Slices;
         tape.push_back(d2);
 
         MkInstr d3         = make_d3(l);
-        d3.task_counter    = kCtr * l + 21;
+        d3.task_counter    = kCtr * l + 22;
         d3.slice_count     = kD3Slices;
         d3.done_counter    = kCtr * l + 10;
         d3.wait_counter[0] = kCtr * l + 9;
@@ -482,7 +524,7 @@ int main() {
         tape.push_back(d3);
 
         MkInstr d4         = make_d4(l);
-        d4.task_counter    = kCtr * l + 22;
+        d4.task_counter    = kCtr * l + 23;
         d4.slice_count     = kD4Slices;
         d4.done_counter    = kCtr * l + 11;
         d4.wait_counter[0] = kCtr * l + 10;
@@ -494,7 +536,7 @@ int main() {
     CHECK(cudaMalloc(&d_tape, tape.size() * sizeof(MkInstr)));
     CHECK(cudaMemcpy(d_tape, tape.data(), tape.size() * sizeof(MkInstr),
                      cudaMemcpyHostToDevice));
-    std::vector<MkStream> streams(static_cast<std::size_t>(n_sm),
+    std::vector<MkStream> streams(static_cast<std::size_t>(2 * n_sm),
                                   MkStream{d_tape, static_cast<std::uint32_t>(tape.size())});
     MkStream* d_streams = nullptr;
     CHECK(cudaMalloc(&d_streams, streams.size() * sizeof(MkStream)));
@@ -519,6 +561,7 @@ int main() {
             mk_ref_rmsnorm_kernel<<<1, kMkThreads, 0, stream>>>(make_norm(l));
             mk_ref_generic_kernel<<<kGatRows / kGatSlice, kMkThreads, 0, stream>>>(
                 make_gating(l));
+            mk_ref_generic_kernel<<<1, kMkThreads, 0, stream>>>(make_gg(l));
             mk_ref_generic_kernel<<<kInSlices, kMkThreads, 0, stream>>>(make_inconv(l));
             mk_ref_generic_kernel<<<kRecSlices, kMkThreads, 0, stream>>>(make_rec(l));
             mk_ref_generic_kernel<<<1, kMkThreads, 0, stream>>>(make_gn(l));
@@ -532,7 +575,7 @@ int main() {
     };
     auto run_mk = [&](cudaStream_t stream, int prefetch) {
         CHECK(cudaMemsetAsync(d_counters, 0, counter_count * sizeof(std::uint32_t), stream));
-        mk_interpreter_kernel<<<n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, prefetch);
+        mk_interpreter_kernel<<<2 * n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, prefetch);
     };
 
     cudaStream_t stream;
@@ -571,6 +614,7 @@ int main() {
     CHECK(cudaEventCreate(&t0));
     CHECK(cudaEventCreate(&t1));
 
+    reset_all();
     for (int i = 0; i < warmup; ++i) { run_ref(stream); }
     CHECK(cudaEventRecord(t0, stream));
     for (int i = 0; i < iters; ++i) { run_ref(stream); }
@@ -580,6 +624,7 @@ int main() {
     CHECK(cudaEventElapsedTime(&ms_ref, t0, t1));
 
     auto time_mk = [&](int prefetch) {
+        reset_all();
         for (int i = 0; i < warmup; ++i) { run_mk(stream, prefetch); }
         CHECK(cudaEventRecord(t0, stream));
         for (int i = 0; i < iters; ++i) { run_mk(stream, prefetch); }
@@ -608,7 +653,7 @@ int main() {
          2.0 * 4 * kConvRows + 2.0 * 2 * conv_state_count + 8.0 * rec_state_count +
          moe_bytes) /
         1e9;
-    const int boundaries = kLayers * 11;
+    const int boundaries = kLayers * 12;
     std::printf("traffic: %.2f GB/pass\n", gb);
     std::printf("ref (per-op kernels):     %8.2f us/pass  (%.0f GB/s)\n", us_ref,
                 gb / us_ref * 1e6);

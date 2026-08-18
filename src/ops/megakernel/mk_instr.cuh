@@ -206,13 +206,14 @@ __device__ inline void mk_body_w8_decode(const MkInstr& instr) {
 }
 
 // Small control projection: bf16 W[rows x k] @ x, one warp per output row.
+// dim3 != 0 stores FP32 (engine gating feeds the transform in fp32).
 __device__ inline void mk_body_bf16_gemv(const MkInstr& instr) {
     const auto* x = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
     const auto* w = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
-    auto* out     = static_cast<__nv_bfloat16*>(instr.out[0]);
     const std::int64_t row0 = instr.dim[0];
     const std::int64_t rows = instr.dim[1];
     const std::int64_t k    = instr.dim[2];
+    const bool f32_out      = instr.dim[3] != 0;
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
@@ -229,7 +230,31 @@ __device__ inline void mk_body_bf16_gemv(const MkInstr& instr) {
             acc = fmaf(wf.y, xf.y, acc);
         }
         acc = mk_warp_reduce_sum(acc);
-        if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
+        if (lane == 0) {
+            if (f32_out) {
+                static_cast<float*>(instr.out[0])[row] = acc;
+            } else {
+                static_cast<__nv_bfloat16*>(instr.out[0])[row] = __float2bfloat16_rn(acc);
+            }
+        }
+    }
+}
+
+// GDN gating transform (engine gdn_gating math, 35B: 32 value heads):
+// g[h] = -expf(A_log[h]) * softplus(a[h] + dt_bias[h]); beta[h] = sigmoid(b[h]).
+__device__ inline void mk_body_gdn_gating(const MkInstr& instr) {
+    const auto* a       = static_cast<const float*>(instr.ptr[0]);
+    const auto* b       = static_cast<const float*>(instr.ptr[1]);
+    const auto* a_log   = static_cast<const float*>(instr.ptr[2]);
+    const auto* dt_bias = static_cast<const float*>(instr.ptr[3]);
+    auto* g             = static_cast<float*>(instr.out[0]);
+    auto* beta          = static_cast<float*>(instr.out[1]);
+    const int heads     = static_cast<int>(instr.dim[0]);
+    for (int h = static_cast<int>(threadIdx.x); h < heads; h += kMkThreads) {
+        const float av = a[h] + dt_bias[h];
+        const float sp = av > 20.0f ? av : log1pf(expf(av));
+        g[h]           = -expf(a_log[h]) * sp;
+        beta[h]        = 1.0f / (1.0f + expf(-b[h]));
     }
 }
 
@@ -264,12 +289,12 @@ __device__ inline void mk_body_gated_norm128(const MkInstr& instr) {
         const float2 w1 = __bfloat1622float2(weight[lane + 32]);
         const float2 z0 = __bfloat1622float2(z[base + lane]);
         const float2 z1 = __bfloat1622float2(z[base + lane + 32]);
-        const auto sil  = [](float v) { return v / (1.0f + __expf(-v)); };
-        out[base + lane] = __floats2bfloat162_rn(xf[0].x * inv * (w0.x + 1.0f) * sil(z0.x),
-                                                 xf[0].y * inv * (w0.y + 1.0f) * sil(z0.y));
+        const auto sil  = [](float v) { return v / (1.0f + expf(-v)); };
+        out[base + lane] = __floats2bfloat162_rn(xf[0].x * inv * w0.x * sil(z0.x),
+                                                 xf[0].y * inv * w0.y * sil(z0.y));
         out[base + lane + 32] =
-            __floats2bfloat162_rn(xf[1].x * inv * (w1.x + 1.0f) * sil(z1.x),
-                                  xf[1].y * inv * (w1.y + 1.0f) * sil(z1.y));
+            __floats2bfloat162_rn(xf[1].x * inv * w1.x * sil(z1.x),
+                                  xf[1].y * inv * w1.y * sil(z1.y));
     }
 }
 
@@ -361,9 +386,16 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
 
         if (lane == 0) {
             if (row < kChannels) {
-                const float s0 = __bfloat162float(conv_state[row]);
-                const float s1 = __bfloat162float(conv_state[kChannels + row]);
-                const float s2 = __bfloat162float(conv_state[2 * kChannels + row]);
+                const auto* slots =
+                    static_cast<const std::int32_t*>(instr.ptr[7]);   // nullptr => slot 0
+                const std::int64_t slot_off =
+                    slots != nullptr
+                        ? static_cast<std::int64_t>(slots[0]) * (3LL * kChannels)
+                        : 0;
+                __nv_bfloat16* slot_state = conv_state + slot_off;
+                const float s0 = __bfloat162float(slot_state[row]);
+                const float s1 = __bfloat162float(slot_state[kChannels + row]);
+                const float s2 = __bfloat162float(slot_state[2 * kChannels + row]);
                 const float w0 = __bfloat162float(conv_w[row]);
                 const float w1 = __bfloat162float(conv_w[kChannels + row]);
                 const float w2 = __bfloat162float(conv_w[2 * kChannels + row]);
@@ -372,7 +404,7 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
                 conv           = fmaf(w1, s1, conv);
                 conv           = fmaf(w2, s2, conv);
                 conv           = fmaf(w3, accumulator, conv);
-                const float sil            = conv / (1.0f + __expf(-conv));
+                const float sil            = conv / (1.0f + expf(-conv));
                 const __nv_bfloat16 output = __float2bfloat16_rn(sil);
                 if (row < 2048) {
                     qc[row] = output;
@@ -381,9 +413,9 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
                 } else {
                     vc[row - 4096] = output;
                 }
-                conv_state[row]                 = __float2bfloat16_rn(s1);
-                conv_state[kChannels + row]     = __float2bfloat16_rn(s2);
-                conv_state[2 * kChannels + row] = __float2bfloat16_rn(accumulator);
+                slot_state[row]                 = __float2bfloat16_rn(s1);
+                slot_state[kChannels + row]     = __float2bfloat16_rn(s2);
+                slot_state[2 * kChannels + row] = __float2bfloat16_rn(accumulator);
             } else {
                 z[row - kChannels] = __float2bfloat16_rn(accumulator);
             }
@@ -396,15 +428,19 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
 // L2 normalization) — the engine kernel has NO cross-warp traffic, so one warp
 // here = one (value_head, 4-row dv tile) unit, bit-exact per unit.
 __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
-    const auto* q   = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
-    const auto* k   = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
-    const auto* v   = static_cast<const __nv_bfloat16*>(instr.ptr[2]);
-    const auto* gb  = static_cast<const __nv_bfloat16*>(instr.ptr[3]);
-    auto* out       = static_cast<__nv_bfloat16*>(instr.out[0]);
-    auto* state     = static_cast<float*>(instr.out[1]);
-    const std::int64_t unit0 = instr.dim[0];
-    const std::int64_t units = instr.dim[1];
-    const float scale        = __int_as_float(static_cast<int>(instr.dim[2]));
+    const auto* q             = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* k             = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
+    const auto* v             = static_cast<const __nv_bfloat16*>(instr.ptr[2]);
+    const auto* g_arr         = static_cast<const float*>(instr.ptr[3]);
+    const auto* beta_arr      = static_cast<const float*>(instr.ptr[4]);
+    const auto* initial_slots = static_cast<const std::int32_t*>(instr.ptr[5]);
+    const auto* snapshot_base = static_cast<const std::int32_t*>(instr.ptr[6]);
+    auto* out                 = static_cast<__nv_bfloat16*>(instr.out[0]);
+    auto* state               = static_cast<float*>(instr.out[1]);
+    const std::int64_t unit0  = instr.dim[0];
+    const std::int64_t units  = instr.dim[1];
+    const float scale         = __int_as_float(static_cast<int>(instr.dim[2]));
+    const std::int64_t slot_stride = instr.dim[3];   // 0 => single-slot direct (harness)
 
     constexpr int kStateDim = 128;
     const int lane          = static_cast<int>(threadIdx.x) & 31;
@@ -412,17 +448,25 @@ __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
     const int warps         = kMkThreads / 32;
     const int dqk_base      = lane * 4;
 
+    const std::int64_t read_slot_off =
+        initial_slots != nullptr ? static_cast<std::int64_t>(initial_slots[0]) * slot_stride : 0;
+    const std::int64_t write_slot_off =
+        snapshot_base != nullptr ? static_cast<std::int64_t>(snapshot_base[0]) * slot_stride : 0;
+
     for (std::int64_t u = unit0 + warp; u < unit0 + units; u += warps) {
         const int head    = static_cast<int>(u >> 5);
         const int dv_base = static_cast<int>(u & 31) * 4;
         const int h_qk    = head >> 1;   // 32 value heads share 16 qk heads
 
-        float* state_h = state + static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+        const float* state_read = state + read_slot_off +
+                                  static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+        float* state_write = state + write_slot_off +
+                             static_cast<std::int64_t>(head) * kStateDim * kStateDim;
         float st[4][4];
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             const float4 sv = *reinterpret_cast<const float4*>(
-                state_h + static_cast<std::int64_t>(dv_base + r) * kStateDim + dqk_base);
+                state_read + static_cast<std::int64_t>(dv_base + r) * kStateDim + dqk_base);
             st[r][0] = sv.x;
             st[r][1] = sv.y;
             st[r][2] = sv.z;
@@ -453,8 +497,8 @@ __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
         float key[4];
         load_qk_norm(k + static_cast<std::int64_t>(h_qk) * kStateDim, key);
 
-        const float g_val    = __bfloat162float(gb[head]);
-        const float beta_val = __bfloat162float(gb[32 + head]);
+        const float g_val    = g_arr[head];
+        const float beta_val = beta_arr[head];
         const float alpha    = expf(g_val);
 
         float v_local = 0.0f;
@@ -493,7 +537,7 @@ __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
 
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            *reinterpret_cast<float4*>(state_h +
+            *reinterpret_cast<float4*>(state_write +
                                        static_cast<std::int64_t>(dv_base + r) * kStateDim +
                                        dqk_base) =
                 make_float4(st[r][0], st[r][1], st[r][2], st[r][3]);
@@ -510,7 +554,7 @@ __device__ inline void mk_body_sigmoid_mul(const MkInstr& instr) {
     const std::int64_t count = instr.dim[1];
     for (std::int64_t i = e0 + threadIdx.x; i < e0 + count; i += kMkThreads) {
         const float g = __bfloat162float(gate[i >> 6]);
-        const float s = 1.0f / (1.0f + __expf(-g));
+        const float s = 1.0f / (1.0f + expf(-g));
         out[i]        = __float2bfloat16_rn(__bfloat162float(v[i]) * s);
     }
 }
@@ -535,7 +579,7 @@ __device__ __forceinline__ __half2 mk_half2_from_bits(std::uint32_t bits) {
     return value;
 }
 
-__device__ __forceinline__ float mk_silu(float v) { return v / (1.0f + __expf(-v)); }
+__device__ __forceinline__ float mk_silu(float v) { return v / (1.0f + expf(-v)); }
 
 __device__ __forceinline__ float mk_dot_bf16_eight(const __nv_bfloat16* a,
                                                    const __nv_bfloat16* b) {
@@ -947,7 +991,7 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
     if (lane < moe::kTopK) { alpha[lane] = exponential / denominator; }
     if (lane == 0) {
         const float s = scores[moe::kExperts];
-        *shared_scale = 1.0f / (1.0f + __expf(-s));
+        *shared_scale = 1.0f / (1.0f + expf(-s));
     }
 }
 
@@ -1031,14 +1075,16 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
         if (lane == 0) { shared.d4.paths[path][rr] = scaled; }
     }
     __syncthreads();
-    if (warp < rows && lane == 0) {
-        const int row = row0 + warp;
-        float value   = __bfloat162float(destination[row]);
+    for (int rr = warp; rr < rows; rr += kMkThreads / 32) {
+        if (lane == 0) {
+            const int row = row0 + rr;
+            float value   = __bfloat162float(destination[row]);
 #pragma unroll
-        for (int path = 0; path < moe::kTopK + 1; ++path) {
-            value += shared.d4.paths[path][warp];
+            for (int path = 0; path < moe::kTopK + 1; ++path) {
+                value += shared.d4.paths[path][rr];
+            }
+            destination[row] = __float2bfloat16_rn(value);
         }
-        destination[row] = __float2bfloat16_rn(value);
     }
     __syncthreads();
 }
@@ -1072,6 +1118,9 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         return;
     case MkOp::GdnRecurrent:
         mk_body_gdn_recurrent(instr);
+        return;
+    case MkOp::GdnGating:
+        mk_body_gdn_gating(instr);
         return;
     case MkOp::MoeD1:
         mk_body_moe_d1(instr, shared);

@@ -52,6 +52,8 @@ enum class MkOp : std::uint32_t {
                      // ptr0=q(16 heads x128), ptr1=k, ptr2=v(32x128), ptr3=g_beta(bf16
                      // 64: g[32]+beta[32]); out0=o(32x128), out1=state(f32 32x128x128);
                      // dim0=unit0, dim1=units, dim2=scale bits
+    GdnGating,       // gating transform: ptr0=a(f32 32), ptr1=b(f32 32), ptr2=A_log,
+                     // ptr3=dt_bias; out0=g(f32 32), out1=beta(f32 32); dim0=heads
     MoeD1,           // router scores: ptr0=x(2048), ptr1=router(bf16 257x2048),
                      // out0=scores(f32 257); dim0=row0, dim1=rows(2/slice) — two 8-warp
                      // groups per CTA, engine block-reduce order preserved per row
