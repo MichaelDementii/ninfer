@@ -31,12 +31,22 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 3> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    {2048, 4096, 4096},
 }};
 
 constexpr std::array<RouteSpec, 6> kK6144Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
+
+constexpr std::array<RouteSpec, 6> kK4096Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
@@ -65,7 +75,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kK4096Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
@@ -113,6 +124,7 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
+    if (problem.k == 4096) { return resolve_from(kK4096Routes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
 }
 

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
@@ -16,6 +17,14 @@ namespace {
 using artifact::NumericFormat;
 
 bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
+
+// Experimental: NINFER_Q5_OUT=1 loads the repacked artifact whose text-layer output
+// projections are stored as Q5G64_F16S (row bytes -38%). Default remains W8G32_F16S.
+NumericFormat text_output_projection_format() {
+    static const char* env    = std::getenv("NINFER_Q5_OUT");
+    static const bool use_q5  = env != nullptr && env[0] == '1';
+    return use_q5 ? NumericFormat::Q5G64_F16S : NumericFormat::W8G32_F16S;
+}
 
 NumericFormat routed_down_format(std::size_t layer) {
     return layer == 34 || layer == 38 || layer == 39 ? NumericFormat::Q6G64_F16S
@@ -117,7 +126,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output = artifact::bind_device_tensor(
-                binder, prefix + "attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
+                binder, prefix + "attention/output", text_output_projection_format(),
+                {2048, 4096});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {32});
@@ -132,7 +142,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
             target.gdn.output = artifact::bind_device_tensor(
-                binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 4096});
+                binder, prefix + "gdn/output", text_output_projection_format(), {2048, 4096});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
@@ -254,7 +264,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
                                                               NumericFormat::BF16, {256});
             target.output     = artifact::materialized_weight(backing, source.attention.output,
-                                                              NumericFormat::W8G32_F16S, 2048, 4096);
+                                                              text_output_projection_format(),
+                                                              2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =
@@ -275,8 +286,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, source.gdn.query_key_value_z, NumericFormat::W8G32_F16S, 12288, 2048);
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.output              = artifact::materialized_weight(backing, source.gdn.output,
-                                                                       NumericFormat::W8G32_F16S, 2048, 4096);
+            target.output              = artifact::materialized_weight(
+                backing, source.gdn.output, text_output_projection_format(), 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =

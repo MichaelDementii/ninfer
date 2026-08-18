@@ -19,6 +19,11 @@ int q5_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 6144, 401U, kK6144RouteStarts, kK6144RouteInteriors});
+    constexpr std::array<std::int32_t, 5> kK4096RouteStarts{2, 14, 33, 49, 129};
+    constexpr std::array<std::int32_t, 6> kK4096RouteInteriors{1, 8, 24, 40, 96, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{2048, 4096, 977U, kK4096RouteStarts, kK4096RouteInteriors});
     constexpr std::array<std::int32_t, 5> kK17408RouteStarts{2, 17, 33, 49, 129};
     constexpr std::array<std::int32_t, 6> kK17408RouteInteriors{1, 8, 24, 40, 96, 256};
     failures += ninfer::test::linear_add::run_shape(

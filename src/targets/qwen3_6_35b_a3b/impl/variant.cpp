@@ -258,9 +258,13 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(Weight
                                                                           qwen3_6::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
-    return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
-                                                    TextConfig::query_size,
-                                                    ops::LinearPolicy::A16Only, first, last);
+    return std::max(
+        ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
+                                                 TextConfig::query_size,
+                                                 ops::LinearPolicy::A16Only, first, last),
+        ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                 TextConfig::query_size,
+                                                 ops::LinearPolicy::A16Only, first, last));
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
@@ -295,9 +299,13 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     qwen3_6::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
-    return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
-                                                    TextConfig::value_dim,
-                                                    ops::LinearPolicy::A16Only, first, last);
+    return std::max(
+        ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
+                                                 TextConfig::value_dim,
+                                                 ops::LinearPolicy::A16Only, first, last),
+        ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                 TextConfig::value_dim,
+                                                 ops::LinearPolicy::A16Only, first, last));
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
