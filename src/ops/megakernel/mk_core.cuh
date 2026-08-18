@@ -40,6 +40,18 @@ enum class MkOp : std::uint32_t {
                      // out0=dst; dim0=row0, dim1=rows, dim2=eps bits — RMSNorm(x)*silu(z)
     SigmoidMul,      // ptr0=v, ptr1=gate(bf16, one per 64 elems), out0=dst;
                      // dim0=elem0, dim1=count — dst = v * sigmoid(gate[i>>6])
+    W8DecodeConv,    // w8_k2048_decode body + GdnConvEpilogue (T=1): rows<8192 run the
+                     // 4-tap causal conv + silu and split to q/k/v with in-place state
+                     // update; rows>=8192 store plain bf16 to z.
+                     // ptr0=x, ptr1=codes, ptr2=scales, ptr3=conv_w(4x8192 plane-wise),
+                     // ptr4=conv_state(3x8192, updated in place), ptr5=vc, ptr6=z,
+                     // out0=qc, out1=kc; dim0=row0, dim1=rows
+    GdnRecurrent,    // gated delta net T=1, verbatim per-warp math of
+                     // recurrent_bf16_direct_kernel<NormalizeQK=true>. One warp = one
+                     // (value_head, 4-row dv tile) unit; unit u: head=u>>5, dv=(u&31)*4.
+                     // ptr0=q(16 heads x128), ptr1=k, ptr2=v(32x128), ptr3=g_beta(bf16
+                     // 64: g[32]+beta[32]); out0=o(32x128), out1=state(f32 32x128x128);
+                     // dim0=unit0, dim1=units, dim2=scale bits
     Noop,
 };
 
