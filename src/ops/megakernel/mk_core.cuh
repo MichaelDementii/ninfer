@@ -54,6 +54,10 @@ enum class MkOp : std::uint32_t {
                      // dim0=unit0, dim1=units, dim2=scale bits
     GdnGating,       // gating transform: ptr0=a(f32 32), ptr1=b(f32 32), ptr2=A_log,
                      // ptr3=dt_bias; out0=g(f32 32), out1=beta(f32 32); dim0=heads
+    W8SimtOutProj,   // author's T=1 out-proj (w8_rowsplit_gemm_simt): warp-per-row,
+                     // cp.async double-buffered 1024-value slabs, residual epilogue.
+                     // ptr0=x(4096), ptr1=codes, ptr2=scales, out0=residual dst;
+                     // dim0=row0, dim1=rows
     MoeD1,           // router scores: ptr0=x(2048), ptr1=router(bf16 257x2048),
                      // out0=scores(f32 257); dim0=row0, dim1=rows(2/slice) — two 8-warp
                      // groups per CTA, engine block-reduce order preserved per row

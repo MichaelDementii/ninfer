@@ -60,6 +60,11 @@ struct Workspace {
 
 struct Recorder {
     bool ready          = false;
+    bool prof           = false;
+    int rounds_done     = 0;
+    unsigned long long* wait_ns = nullptr;
+    unsigned long long* exec_ns = nullptr;
+    std::vector<MkOp> tape_ops;   // host mirror: op per tape index
     int n_sm            = 0;
     Workspace ws{};
     std::uint32_t* counters = nullptr;
@@ -113,6 +118,14 @@ struct Recorder {
         MK_CHECK(cudaMalloc(&tape_device, tape_capacity * sizeof(MkInstr)));
         streams_capacity = 256 * static_cast<std::size_t>(n_sm);
         MK_CHECK(cudaMalloc(&streams_device, streams_capacity * sizeof(MkStream)));
+        const char* prof_env = std::getenv("NINFER_MEGAKERNEL_PROF");
+        prof                 = prof_env != nullptr && prof_env[0] == '1';
+        if (prof) {
+            MK_CHECK(cudaMalloc(&wait_ns, tape_capacity * sizeof(unsigned long long)));
+            MK_CHECK(cudaMalloc(&exec_ns, tape_capacity * sizeof(unsigned long long)));
+            MK_CHECK(cudaMemset(wait_ns, 0, tape_capacity * sizeof(unsigned long long)));
+            MK_CHECK(cudaMemset(exec_ns, 0, tape_capacity * sizeof(unsigned long long)));
+        }
         ready = true;
     }
 
@@ -137,6 +150,7 @@ struct Recorder {
     void push(MkInstr instr) {
         instr.task_counter = alloc_ctr();
         pending.push_back(instr);
+        if (rounds_done == 0) { tape_ops.push_back(instr.op); }
         ++classes_this_round;
     }
 };
@@ -166,6 +180,14 @@ void mk_begin_round(cudaStream_t stream) {
     r.segments_this_round = 0;
     r.classes_this_round  = 0;
     r.pending.clear();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    MK_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status == cudaStreamCaptureStatusNone) {
+        // Eager rounds (e.g. --no-cuda-graph profiling) can reuse the arenas: the
+        // prior round has fully drained by the next host-side decode step.
+        r.tape_used    = 0;
+        r.streams_used = 0;
+    }
     MK_CHECK(cudaMemsetAsync(r.counters, 0, r.counter_capacity * sizeof(std::uint32_t), stream));
 }
 
@@ -447,8 +469,12 @@ void mk_flush(cudaStream_t stream) {
                              stream));
     r.streams_used += static_cast<std::size_t>(r.n_sm);
 
-    mk_interpreter_kernel<<<r.n_sm, kMkThreads, 0, stream>>>(seg_streams, r.counters, 1, nullptr,
-                                                             nullptr);
+    unsigned long long* seg_wait =
+        r.prof ? r.wait_ns + static_cast<std::size_t>(segment - r.tape_device) : nullptr;
+    unsigned long long* seg_exec =
+        r.prof ? r.exec_ns + static_cast<std::size_t>(segment - r.tape_device) : nullptr;
+    mk_interpreter_kernel<<<r.n_sm, kMkThreads, 0, stream>>>(seg_streams, r.counters, 1, seg_wait,
+                                                             seg_exec);
     MK_CHECK(cudaGetLastError());
     r.pending.clear();
     ++r.segments_this_round;
@@ -461,6 +487,32 @@ void mk_end_round(cudaStream_t stream) {
         std::fprintf(stderr, "[megakernel] round captured: %d segments, %d classes, %u counters\n",
                      r.segments_this_round, r.classes_this_round, r.ctr_next);
         r.logged_once = true;
+    }
+    if (r.prof) {
+        ++r.rounds_done;
+        if (r.rounds_done == 50) {
+            MK_CHECK(cudaStreamSynchronize(stream));
+            const std::size_t n = r.tape_ops.size();
+            std::vector<unsigned long long> wait_h(n), exec_h(n);
+            MK_CHECK(cudaMemcpy(wait_h.data(), r.wait_ns, n * sizeof(unsigned long long),
+                                cudaMemcpyDeviceToHost));
+            MK_CHECK(cudaMemcpy(exec_h.data(), r.exec_ns, n * sizeof(unsigned long long),
+                                cudaMemcpyDeviceToHost));
+            double wait_sum[32] = {};
+            double exec_sum[32] = {};
+            for (std::size_t i = 0; i < n; ++i) {
+                const int op = static_cast<int>(r.tape_ops[i]) & 31;
+                wait_sum[op] += static_cast<double>(wait_h[i]);
+                exec_sum[op] += static_cast<double>(exec_h[i]);
+            }
+            std::fprintf(stderr, "[megakernel prof] per-op CTA-clock sums over %d rounds:\n",
+                         r.rounds_done);
+            for (int op = 0; op < 32; ++op) {
+                if (wait_sum[op] + exec_sum[op] == 0.0) { continue; }
+                std::fprintf(stderr, "  op%-2d wait %12.0f exec %12.0f (us@2.4GHz)\n", op,
+                             wait_sum[op] / 2400.0, exec_sum[op] / 2400.0);
+            }
+        }
     }
 }
 
