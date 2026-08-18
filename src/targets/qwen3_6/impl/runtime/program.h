@@ -151,12 +151,10 @@ struct DecodeGraphFamily {
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
 struct AdaptiveSpecState {
-    std::array<float, 16> ema_tps{};
-    std::array<std::uint32_t, 16> tries{};
+    float alpha                  = 0.75f;  // per-position acceptance estimate (EMA)
     std::uint32_t rounds         = 0;
     std::uint32_t current        = 0;
     std::uint32_t pending_window = 0;  // window of the round awaiting resolution; 0 = main path
-    std::uint32_t rng            = 0x9e3779b9u;
 };
 
 struct SequenceState {
@@ -299,6 +297,8 @@ public:
         DecodeGraphFamily graphs;
     };
     std::vector<MtpWindowRig> mtp_window_rigs;
+    std::array<double, 16> window_cost_ema{};   // seconds per round, by window-1 (global)
+    std::array<std::uint32_t, 16> window_cost_n{};
     bool adaptive_spec = false;
 
     PinnedHostBuffer round_host;

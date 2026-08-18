@@ -1935,40 +1935,34 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     if (adaptive_spec && lanes.size() == 1 && lanes[0] < max_concurrency) {
         AdaptiveSpecState& ad = sequences[lanes[0]].adaptive;
         const std::uint32_t n = draft_window;
-        std::uint32_t pick;
+        std::uint32_t pick    = 0;
         static const char* force_env      = std::getenv("NINFER_SPEC_FORCE_W");
         static const std::uint32_t forced = force_env ? std::atoi(force_env) : 0;
         if (forced >= 1 && forced <= n) {
             pick = forced;
-            ad.current = pick;
-            window = pick;
-            if (window != draft_window) {
-                for (MtpWindowRig& rig : mtp_window_rigs) {
-                    if (rig.window == window) { window_rig = &rig; }
-                }
-                if (window_rig == nullptr) { window = draft_window; }
-            }
-            goto adaptive_selected;
-        }
-        if (ad.rounds < 2 * n) {
-            pick = (ad.rounds % n) + 1;
         } else {
-            ad.rng ^= ad.rng << 13;
-            ad.rng ^= ad.rng >> 17;
-            ad.rng ^= ad.rng << 5;
-            if (ad.rng % 100 < 6) {
-                pick = (ad.rng >> 8) % n + 1;
-            } else {
-                std::uint32_t best  = ad.current == 0 ? n : ad.current;
-                float best_tps      = ad.ema_tps[best - 1];
+            for (std::uint32_t w = 1; w <= n && pick == 0; ++w) {
+                if (window_cost_n[w - 1] < 3) { pick = w; }
+            }
+            if (pick == 0) {
+                // alpha-model: throughput(w) = (1 + sum_{k<=w} alpha^k) / C(w)
+                const double a       = static_cast<double>(ad.alpha);
+                const std::uint32_t cur = ad.current == 0 ? n : ad.current;
+                double best_value    = 0.0;
+                std::uint32_t best_w = cur;
+                double expected      = 0.0;
+                double ak            = 1.0;
                 for (std::uint32_t w = 1; w <= n; ++w) {
-                    if (ad.tries[w - 1] == 0) { continue; }
-                    if (ad.ema_tps[w - 1] > best_tps * 1.03f) {
-                        best     = w;
-                        best_tps = ad.ema_tps[w - 1];
+                    ak *= a;
+                    expected += ak;
+                    const double value = (1.0 + expected) / window_cost_ema[w - 1];
+                    const double bias  = w == cur ? 1.02 : 1.0;  // hysteresis
+                    if (value * bias > best_value) {
+                        best_value = value * bias;
+                        best_w     = w;
                     }
                 }
-                pick = best;
+                pick = best_w;
             }
         }
         ad.current = pick;
@@ -1979,7 +1973,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             if (window_rig == nullptr) { window = draft_window; }
         }
-    adaptive_selected:;
     }
 
     const std::uint32_t width      = window + 1;
@@ -2108,12 +2101,18 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             if (adaptive_spec && lanes.size() == 1) {
                 AdaptiveSpecState& ad = sequence.adaptive;
-                const float tps = static_cast<float>(count_i) /
-                                  static_cast<float>(std::max(seconds, 1e-6));
+                if (pcur > 0) {
+                    const auto acc = static_cast<std::uint32_t>(accepted_i);
+                    const float obs = acc >= pcur
+                                          ? 1.0f
+                                          : static_cast<float>(acc) / static_cast<float>(acc + 1);
+                    ad.alpha = 0.9f * ad.alpha + 0.1f * obs;
+                }
                 const std::size_t slot = window - 1;
-                ad.ema_tps[slot] =
-                    ad.tries[slot] == 0 ? tps : 0.85f * ad.ema_tps[slot] + 0.15f * tps;
-                ad.tries[slot] += 1;
+                window_cost_ema[slot]  = window_cost_n[slot] == 0
+                                             ? seconds
+                                             : 0.9 * window_cost_ema[slot] + 0.1 * seconds;
+                window_cost_n[slot] += 1;
                 ad.rounds += 1;
                 ad.pending_window = window_rig ? window : 0;
             }
