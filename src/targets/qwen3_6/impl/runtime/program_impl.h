@@ -1944,9 +1944,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             for (std::uint32_t w = 1; w <= n && pick == 0; ++w) {
                 if (window_cost_n[w - 1] < 3) { pick = w; }
             }
+            if (pick == 0 && ad.current != 0 && ad.hold > 0) {
+                ad.hold -= 1;
+                pick = ad.current;
+            }
             if (pick == 0) {
                 // alpha-model: throughput(w) = (1 + sum_{k<=w} alpha^k) / C(w)
-                const double a       = static_cast<double>(ad.alpha);
+                const double a =
+                    static_cast<double>(ad.s_ema) / static_cast<double>(ad.s_ema + ad.f_ema);
                 const std::uint32_t cur = ad.current == 0 ? n : ad.current;
                 double best_value    = 0.0;
                 std::uint32_t best_w = cur;
@@ -1962,7 +1967,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         best_w     = w;
                     }
                 }
-                pick = best_w;
+                pick    = best_w;
+                ad.hold = 3;
             }
         }
         ad.current = pick;
@@ -2103,10 +2109,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 AdaptiveSpecState& ad = sequence.adaptive;
                 if (pcur > 0) {
                     const auto acc = static_cast<std::uint32_t>(accepted_i);
-                    const float obs = acc >= pcur
-                                          ? 1.0f
-                                          : static_cast<float>(acc) / static_cast<float>(acc + 1);
-                    ad.alpha = 0.9f * ad.alpha + 0.1f * obs;
+                    ad.s_ema = 0.95f * ad.s_ema + static_cast<float>(acc);
+                    ad.f_ema = 0.95f * ad.f_ema + (acc < pcur ? 1.0f : 0.0f);
+                    if (window - 1 < ad.window_histogram.size()) {
+                        ad.window_histogram[window - 1] += 1;
+                    }
                 }
                 const std::size_t slot = window - 1;
                 window_cost_ema[slot]  = window_cost_n[slot] == 0

@@ -151,10 +151,16 @@ struct DecodeGraphFamily {
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
 struct AdaptiveSpecState {
-    float alpha                  = 0.75f;  // per-position acceptance estimate (EMA)
+    // Censored-geometric acceptance model: alpha = s_ema / (s_ema + f_ema). Every accepted
+    // draft position is a success; a round that stopped short of its window adds one failure.
+    // The ratio of decayed counters stays unbiased under any mix of windows.
+    float s_ema                  = 6.0f;
+    float f_ema                  = 2.0f;
     std::uint32_t rounds         = 0;
     std::uint32_t current        = 0;
+    std::uint32_t hold           = 0;
     std::uint32_t pending_window = 0;  // window of the round awaiting resolution; 0 = main path
+    std::array<std::uint16_t, 16> window_histogram{};
 };
 
 struct SequenceState {
