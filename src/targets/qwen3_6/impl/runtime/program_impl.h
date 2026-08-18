@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "ops/megakernel/mk_engine.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -1385,7 +1386,9 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
     const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
     graph_observed_bytes       = consumed;
-    if (consumed > graph_allowance_bytes) {
+    const std::size_t mk_margin =
+        ops::mk::mk_engine_enabled() ? (128ull << 20) : 0;   // megakernel graph nodes
+    if (consumed > graph_allowance_bytes + mk_margin) {
         throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");

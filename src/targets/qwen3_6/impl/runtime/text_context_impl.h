@@ -1,5 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
+
+#include "ops/megakernel/mk_engine.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
@@ -854,6 +856,54 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
+    {
+        const auto mk_try = [&](const auto& proj) {
+            if constexpr (requires {
+                              proj.query_key_value_z;
+                              proj.a_b_projection;
+                              proj.a_log;
+                              proj.dt_bias;
+                          }) {
+                if (!(ops::mk::mk_engine_enabled() && ph == Phase::Verify && T == 1 &&
+                      active_sequence_batch_ == 1 &&
+                      gdn_state_action_ == GdnStateAction::UpdateInPlace &&
+                      active_valid_columns_ == nullptr &&
+                      active_linear_state_slots_ != nullptr)) {
+                    return false;
+                }
+                Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
+                Tensor& rec_states  = state_.recurrent.at(static_cast<std::size_t>(gidx));
+                ops::mk::MkGdnMixerArgs args{};
+                args.x               = x.data;
+                args.input_norm_w    = w.input_norm->data;
+                args.rms_eps         = kCfg.rms_eps;
+                args.a_w = proj.a_b_projection.qdata;
+                args.b_w = static_cast<const void*>(
+                    static_cast<const char*>(
+                        static_cast<const void*>(proj.a_b_projection.qdata)) +
+                    32LL * 2048 * 2);
+                args.a_log           = proj.a_log.data;
+                args.dt_bias         = proj.dt_bias.data;
+                args.qkvz_codes      = proj.query_key_value_z.qdata;
+                args.qkvz_scales     = proj.query_key_value_z.scales;
+                args.conv_w          = w.conv1d->data;
+                args.conv_state      = conv_states.data;
+                args.state_slots     = active_linear_state_slots_->data;
+                args.rec_state       = rec_states.data;
+                args.rec_slot_stride = 128LL * 128 * rec_states.ne[2];
+                args.gdn_scale       = kGdnScale;
+                args.gdn_norm_w      = w.gdn_norm->data;
+                args.out_codes       = w.out_proj->qdata;
+                args.out_scales      = w.out_proj->scales;
+                ops::mk::mk_record_gdn_mixer(args);
+                return true;
+            } else {
+                return false;
+            }
+        };
+        if (mk_try(*w.projection)) { return; }
+    }
+
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
@@ -958,6 +1008,39 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+
+    {
+        const auto mk_try = [&](const auto& payload) {
+            if constexpr (requires { payload.op.routed_gate_up; }) {
+                if (!(ops::mk::mk_engine_enabled() && ph == Phase::Verify && T == 1 &&
+                      active_sequence_batch_ == 1)) {
+                    return false;
+                }
+                const auto& mw = payload.op;
+                if (mw.routed_gate_up.qtype != QType::Q4G64_F16S) { return false; }
+                ops::mk::MkMoeArgs args{};
+                args.x           = x.data;
+                args.post_norm_w = post_norm->data;
+                args.rms_eps     = kCfg.rms_eps;
+                args.router      = mw.router_shared_gate.qdata;
+                args.rgu_codes   = mw.routed_gate_up.qdata;
+                args.rgu_scales  = mw.routed_gate_up.scales;
+                args.rd_codes    = mw.routed_down.qdata;
+                args.rd_high     = mw.routed_down.qhigh;
+                args.rd_scales   = mw.routed_down.scales;
+                args.rd_is_q6    = mw.routed_down.qtype == QType::Q6G64_F16S ? 1 : 0;
+                args.sgu_codes   = mw.shared_gate_up.qdata;
+                args.sgu_scales  = mw.shared_gate_up.scales;
+                args.sd_codes    = mw.shared_down.qdata;
+                args.sd_scales   = mw.shared_down.scales;
+                ops::mk::mk_record_moe(args);
+                return true;
+            } else {
+                return false;
+            }
+        };
+        if (mk_try(*m.payload)) { return; }
+    }
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
@@ -967,6 +1050,11 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    const bool mk_active =
+        ops::mk::mk_engine_enabled() && ph == Phase::Verify && x.ne[1] == 1 &&
+        active_sequence_batch_ == 1 && gdn_state_action_ == GdnStateAction::UpdateInPlace &&
+        active_valid_columns_ == nullptr && active_linear_state_slots_ != nullptr;
+    if (mk_active) { ops::mk::mk_begin_round(ctx_.stream); }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -979,6 +1067,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
+                if (mk_active) { ops::mk::mk_flush(ctx_.stream); }
                 attn_mix(full, x, fidx, ph);
             }
             {
@@ -1012,6 +1101,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             }
         }
     }
+    if (mk_active) { ops::mk::mk_end_round(ctx_.stream); }
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {

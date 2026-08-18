@@ -871,6 +871,34 @@ __device__ __forceinline__ float q5_dot_fp32_row(const std::uint8_t* codes,
     return mk_warp_reduce_sum(acc);
 }
 
+__device__ __forceinline__ float q6_dot_fp32_row(const std::uint8_t* codes,
+                                                 const std::uint8_t* high,
+                                                 const std::uint8_t* scales, int row,
+                                                 const float* x) {
+    constexpr int kGroups   = kIntermediate / 64;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane >> 3;
+    const int lane_in_group = lane & 7;
+    float acc               = 0.0f;
+    for (int group_base = 0; group_base < kGroups; group_base += 4) {
+        const int group = group_base + lane_group;
+        const float4 x0 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8 + 4);
+        const float values[8]          = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kGroups + group;
+        const std::uint32_t packed =
+            *reinterpret_cast<const std::uint32_t*>(codes + group_index * 32 + lane_in_group * 4);
+        const std::uint16_t high_bits =
+            *reinterpret_cast<const std::uint16_t*>(high + group_index * 16 + lane_in_group * 2);
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
+        float weights[8];
+        q6_decode_eight(packed, high_bits, scale_bits, weights);
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { acc = fmaf(weights[item], values[item], acc); }
+    }
+    return mk_warp_reduce_sum(acc);
+}
+
 __device__ __forceinline__ float w8_dot_fp32_row(const std::uint8_t* codes,
                                                  const std::uint8_t* scales, int row,
                                                  const float* x) {
@@ -1094,9 +1122,16 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
         float scaled;
         if (path < moe::kTopK) {
             const int expert = ids[path];
-            const float dot  = moe::q5_dot_fp32_row(
-                routed_codes, routed_high, routed_scales, expert * moe::kHidden + row,
-                act + static_cast<std::int64_t>(path) * moe::kIntermediate);
+            const float dot =
+                instr.dim[5] != 0
+                    ? moe::q6_dot_fp32_row(
+                          routed_codes, routed_high, routed_scales,
+                          expert * moe::kHidden + row,
+                          act + static_cast<std::int64_t>(path) * moe::kIntermediate)
+                    : moe::q5_dot_fp32_row(
+                          routed_codes, routed_high, routed_scales,
+                          expert * moe::kHidden + row,
+                          act + static_cast<std::int64_t>(path) * moe::kIntermediate);
             scaled = alpha[path] * dot;
         } else {
             const float dot = moe::w8_dot_fp32_row(
