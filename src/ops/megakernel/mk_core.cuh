@@ -52,6 +52,18 @@ enum class MkOp : std::uint32_t {
                      // ptr0=q(16 heads x128), ptr1=k, ptr2=v(32x128), ptr3=g_beta(bf16
                      // 64: g[32]+beta[32]); out0=o(32x128), out1=state(f32 32x128x128);
                      // dim0=unit0, dim1=units, dim2=scale bits
+    MoeD1,           // router scores: ptr0=x(2048), ptr1=router(bf16 257x2048),
+                     // out0=scores(f32 257); dim0=row0, dim1=rows(2/slice) — two 8-warp
+                     // groups per CTA, engine block-reduce order preserved per row
+    MoeD2,           // top-8 select + softmax alpha + shared sigmoid scale (1 warp):
+                     // ptr0=scores, out0=ids(i32 8), out1=alpha(f32 8); ptr1=shared_scale
+    MoeD3,           // gate_up + silu*up: ptr0=x, ptr1=ids, ptr2..4=routed Q4
+                     // codes/high/scales, ptr5..6=shared W8 codes/scales,
+                     // out0=act(f32 9x512); dim0=j0, dim1=j_count
+    MoeD4,           // down + rank-ordered FP32 sum + residual: ptr0=ids, ptr1=alpha,
+                     // ptr2=shared_scale, ptr3=act, ptr4..6=routed Q5 codes/high/scales,
+                     // ptr7=shared W8 codes, out1=shared W8 scales, out0=destination(x);
+                     // dim0=row0, dim1=rows
     Noop,
 };
 
@@ -116,7 +128,15 @@ union MkShared {
         float warp_sums[kMkThreads / 32];
         float inv;
     } rms;
-    // W8 GEMV keeps everything in registers/L2 in v0.1 (no staging yet).
+    struct {
+        float partial[2][8];       // two 8-warp router-row groups
+    } d1;
+    struct {
+        float selected_logits[8];  // top-8 selector scratch (single warp)
+    } d2;
+    struct {
+        float paths[9][32];        // rank-ordered FP32 down epilogue, 32 rows/slice
+    } d4;
     MkInstr instr_broadcast;
 };
 

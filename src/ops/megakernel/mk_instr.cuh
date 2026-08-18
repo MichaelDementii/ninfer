@@ -16,6 +16,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <math_constants.h>
 
 #include <cstdint>
 
@@ -514,6 +515,534 @@ __device__ inline void mk_body_sigmoid_mul(const MkInstr& instr) {
     }
 }
 
+// ==== sparse MoE (T=1), verbatim ports of sparse_moe_decode_kernels.cu =======
+
+namespace moe {
+
+constexpr int kHidden       = 2048;
+constexpr int kExperts      = 256;
+constexpr int kRouterRows   = kExperts + 1;
+constexpr int kTopK         = 8;
+constexpr int kIntermediate = 512;
+
+__device__ __forceinline__ float2 mk_bf16x2_bits_to_float2(std::uint32_t bits) {
+    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bits));
+}
+
+__device__ __forceinline__ __half2 mk_half2_from_bits(std::uint32_t bits) {
+    __half2 value;
+    *reinterpret_cast<std::uint32_t*>(&value) = bits;
+    return value;
+}
+
+__device__ __forceinline__ float mk_silu(float v) { return v / (1.0f + __expf(-v)); }
+
+__device__ __forceinline__ float mk_dot_bf16_eight(const __nv_bfloat16* a,
+                                                   const __nv_bfloat16* b) {
+    const uint4 av  = *reinterpret_cast<const uint4*>(a);
+    const uint4 bv  = *reinterpret_cast<const uint4*>(b);
+    const float2 a0 = mk_bf16x2_bits_to_float2(av.x);
+    const float2 a1 = mk_bf16x2_bits_to_float2(av.y);
+    const float2 a2 = mk_bf16x2_bits_to_float2(av.z);
+    const float2 a3 = mk_bf16x2_bits_to_float2(av.w);
+    const float2 b0 = mk_bf16x2_bits_to_float2(bv.x);
+    const float2 b1 = mk_bf16x2_bits_to_float2(bv.y);
+    const float2 b2 = mk_bf16x2_bits_to_float2(bv.z);
+    const float2 b3 = mk_bf16x2_bits_to_float2(bv.w);
+    float sum       = 0.0f;
+    sum             = fmaf(a0.x, b0.x, sum);
+    sum             = fmaf(a0.y, b0.y, sum);
+    sum             = fmaf(a1.x, b1.x, sum);
+    sum             = fmaf(a1.y, b1.y, sum);
+    sum             = fmaf(a2.x, b2.x, sum);
+    sum             = fmaf(a2.y, b2.y, sum);
+    sum             = fmaf(a3.x, b3.x, sum);
+    sum             = fmaf(a3.y, b3.y, sum);
+    return sum;
+}
+
+__device__ __forceinline__ void q4_decode_eight(std::uint32_t packed, std::uint16_t scale_bits,
+                                                float (&weights)[8]) {
+    const std::uint32_t word = packed ^ 0x88888888u;
+    const float scale        = __half2float(__ushort_as_half(scale_bits));
+    const __half2 bias       = __half2half2(__ushort_as_half(0x6408)); // 1032.0
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const std::uint32_t bits = ((word >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+        const __half2 decoded    = __hsub2(mk_half2_from_bits(bits), bias);
+        const float2 values      = __half22float2(decoded);
+        weights[pair]            = values.x * scale;
+        weights[pair + 4]        = values.y * scale;
+    }
+}
+
+__device__ __forceinline__ void q5_decode_eight(std::uint32_t packed, std::uint8_t high_bits,
+                                                std::uint16_t scale_bits, float (&weights)[8]) {
+    const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xffu;
+    const float scale        = __half2float(__ushort_as_half(scale_bits));
+    const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+        bits |= (((high >> pair) & 1u) << 4) | (((high >> (pair + 4)) & 1u) << 20);
+        const __half2 decoded = __hsub2(mk_half2_from_bits(bits), bias);
+        const float2 values   = __half22float2(decoded);
+        weights[pair]         = values.x * scale;
+        weights[pair + 4]     = values.y * scale;
+    }
+}
+
+__device__ __forceinline__ void q6_decode_eight(std::uint32_t packed, std::uint16_t high_bits,
+                                                std::uint16_t scale_bits, float (&weights)[8]) {
+    const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xaaaau;
+    const float scale        = __half2float(__ushort_as_half(scale_bits));
+    const __half2 bias       = __half2half2(__ushort_as_half(0x6420)); // 1056.0
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+        bits |= (((high >> (2 * pair)) & 3u) << 4) | (((high >> (2 * pair + 8)) & 3u) << 20);
+        const __half2 decoded = __hsub2(mk_half2_from_bits(bits), bias);
+        const float2 values   = __half22float2(decoded);
+        weights[pair]         = values.x * scale;
+        weights[pair + 4]     = values.y * scale;
+    }
+}
+
+// dot_two_rows<Q4Codec, 2048>: 8-value lane ownership, four adjacent groups per
+// warp transaction (verbatim engine loop, x read straight from global).
+__device__ __forceinline__ void q4_dot_two_rows(const std::uint8_t* codes,
+                                                const std::uint8_t* scales, int row0, int row1,
+                                                const __nv_bfloat16* x, float& result0,
+                                                float& result1) {
+    constexpr int kGroups   = kHidden / 64;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane >> 3;
+    const int lane_in_group = lane & 7;
+    float acc0              = 0.0f;
+    float acc1              = 0.0f;
+    for (int group_base = 0; group_base < kGroups; group_base += 4) {
+        const int group           = group_base + lane_group;
+        const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+        const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+        const std::uint32_t packed0 =
+            *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
+        const std::uint32_t packed1 =
+            *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
+        const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
+        const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+        float weights0[8];
+        float weights1[8];
+        q4_decode_eight(packed0, scale0, weights0);
+        q4_decode_eight(packed1, scale1, weights1);
+        const uint4 input     = *reinterpret_cast<const uint4*>(x + group * 64 + lane_in_group * 8);
+        const float2 x0       = mk_bf16x2_bits_to_float2(input.x);
+        const float2 x1       = mk_bf16x2_bits_to_float2(input.y);
+        const float2 x2       = mk_bf16x2_bits_to_float2(input.z);
+        const float2 x3       = mk_bf16x2_bits_to_float2(input.w);
+        const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            acc0 = fmaf(weights0[item], values[item], acc0);
+            acc1 = fmaf(weights1[item], values[item], acc1);
+        }
+    }
+    result0 = mk_warp_reduce_sum(acc0);
+    result1 = mk_warp_reduce_sum(acc1);
+}
+
+// dot_two_rows<W8Codec, 2048>: one value per lane per 32-group (verbatim).
+__device__ __forceinline__ void w8_dot_two_rows(const std::uint8_t* codes,
+                                                const std::uint8_t* scales, int row0, int row1,
+                                                const __nv_bfloat16* x, float& result0,
+                                                float& result1) {
+    constexpr int kGroups = kHidden / 32;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    float acc0            = 0.0f;
+    float acc1            = 0.0f;
+    for (int group = 0; group < kGroups; ++group) {
+        const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+        const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+        const float s0            = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2)));
+        const float s1            = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2)));
+        const float w0 =
+            static_cast<float>(static_cast<std::int8_t>(codes[index0 * 32 + lane])) * s0;
+        const float w1 =
+            static_cast<float>(static_cast<std::int8_t>(codes[index1 * 32 + lane])) * s1;
+        const float xv = __bfloat162float(x[group * 32 + lane]);
+        acc0           = fmaf(w0, xv, acc0);
+        acc1           = fmaf(w1, xv, acc1);
+    }
+    result0 = mk_warp_reduce_sum(acc0);
+    result1 = mk_warp_reduce_sum(acc1);
+}
+
+// Two j-columns of one expert share every x load: gate/up for j and j+1 in one
+// sweep (4 accumulators). Per-output FP order identical to the single version.
+__device__ __forceinline__ void q4_dot_two_rows_x2(const std::uint8_t* codes,
+                                                   const std::uint8_t* scales, int rg0, int ru0,
+                                                   int rg1, int ru1, const __nv_bfloat16* x,
+                                                   float (&result)[4]) {
+    constexpr int kGroups   = kHidden / 64;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane >> 3;
+    const int lane_in_group = lane & 7;
+    float acc[4]            = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int rows[4]       = {rg0, ru0, rg1, ru1};
+    for (int group_base = 0; group_base < kGroups; group_base += 4) {
+        const int group   = group_base + lane_group;
+        const uint4 input = *reinterpret_cast<const uint4*>(x + group * 64 + lane_in_group * 8);
+        const float2 x0   = mk_bf16x2_bits_to_float2(input.x);
+        const float2 x1   = mk_bf16x2_bits_to_float2(input.y);
+        const float2 x2   = mk_bf16x2_bits_to_float2(input.z);
+        const float2 x3   = mk_bf16x2_bits_to_float2(input.w);
+        const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const std::int64_t index = static_cast<std::int64_t>(rows[r]) * kGroups + group;
+            const std::uint32_t packed =
+                *reinterpret_cast<const std::uint32_t*>(codes + index * 32 + lane_in_group * 4);
+            const auto scale = *reinterpret_cast<const std::uint16_t*>(scales + index * 2);
+            float weights[8];
+            q4_decode_eight(packed, scale, weights);
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                acc[r] = fmaf(weights[item], values[item], acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) { result[r] = mk_warp_reduce_sum(acc[r]); }
+}
+
+__device__ __forceinline__ void w8_dot_two_rows_x2(const std::uint8_t* codes,
+                                                   const std::uint8_t* scales, int rg0, int ru0,
+                                                   int rg1, int ru1, const __nv_bfloat16* x,
+                                                   float (&result)[4]) {
+    constexpr int kGroups = kHidden / 32;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    float acc[4]          = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int rows[4]     = {rg0, ru0, rg1, ru1};
+    for (int group = 0; group < kGroups; ++group) {
+        const float xv = __bfloat162float(x[group * 32 + lane]);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const std::int64_t index = static_cast<std::int64_t>(rows[r]) * kGroups + group;
+            const float s            = __half2float(__ushort_as_half(
+                *reinterpret_cast<const std::uint16_t*>(scales + index * 2)));
+            const float w =
+                static_cast<float>(static_cast<std::int8_t>(codes[index * 32 + lane])) * s;
+            acc[r] = fmaf(w, xv, acc[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) { result[r] = mk_warp_reduce_sum(acc[r]); }
+}
+
+// Two down-rows share every activation load.
+__device__ __forceinline__ void q5_dot_fp32_row_x2(const std::uint8_t* codes,
+                                                   const std::uint8_t* high,
+                                                   const std::uint8_t* scales, int row0, int row1,
+                                                   const float* x, float& r0, float& r1) {
+    constexpr int kGroups   = kIntermediate / 64;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane >> 3;
+    const int lane_in_group = lane & 7;
+    float acc0              = 0.0f;
+    float acc1              = 0.0f;
+    for (int group_base = 0; group_base < kGroups; group_base += 4) {
+        const int group = group_base + lane_group;
+        const float4 x0 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8 + 4);
+        const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        const std::int64_t i0 = static_cast<std::int64_t>(row0) * kGroups + group;
+        const std::int64_t i1 = static_cast<std::int64_t>(row1) * kGroups + group;
+        float w0[8], w1[8];
+        q5_decode_eight(*reinterpret_cast<const std::uint32_t*>(codes + i0 * 32 + lane_in_group * 4),
+                        high[i0 * 8 + lane_in_group],
+                        *reinterpret_cast<const std::uint16_t*>(scales + i0 * 2), w0);
+        q5_decode_eight(*reinterpret_cast<const std::uint32_t*>(codes + i1 * 32 + lane_in_group * 4),
+                        high[i1 * 8 + lane_in_group],
+                        *reinterpret_cast<const std::uint16_t*>(scales + i1 * 2), w1);
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            acc0 = fmaf(w0[item], values[item], acc0);
+            acc1 = fmaf(w1[item], values[item], acc1);
+        }
+    }
+    r0 = mk_warp_reduce_sum(acc0);
+    r1 = mk_warp_reduce_sum(acc1);
+}
+
+__device__ __forceinline__ void w8_dot_fp32_row_x2(const std::uint8_t* codes,
+                                                   const std::uint8_t* scales, int row0, int row1,
+                                                   const float* x, float& r0, float& r1) {
+    constexpr int kGroups = kIntermediate / 32;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    float acc0            = 0.0f;
+    float acc1            = 0.0f;
+    for (int group = 0; group < kGroups; ++group) {
+        const float xv           = x[group * 32 + lane];
+        const std::int64_t i0    = static_cast<std::int64_t>(row0) * kGroups + group;
+        const std::int64_t i1    = static_cast<std::int64_t>(row1) * kGroups + group;
+        const float s0           = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scales + i0 * 2)));
+        const float s1           = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scales + i1 * 2)));
+        acc0 = fmaf(static_cast<float>(static_cast<std::int8_t>(codes[i0 * 32 + lane])) * s0, xv,
+                    acc0);
+        acc1 = fmaf(static_cast<float>(static_cast<std::int8_t>(codes[i1 * 32 + lane])) * s1, xv,
+                    acc1);
+    }
+    r0 = mk_warp_reduce_sum(acc0);
+    r1 = mk_warp_reduce_sum(acc1);
+}
+
+// dot_fp32_rows<Codec, 1> over K=512 activations (verbatim).
+__device__ __forceinline__ float q5_dot_fp32_row(const std::uint8_t* codes,
+                                                 const std::uint8_t* high,
+                                                 const std::uint8_t* scales, int row,
+                                                 const float* x) {
+    constexpr int kGroups   = kIntermediate / 64;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane >> 3;
+    const int lane_in_group = lane & 7;
+    float acc               = 0.0f;
+    for (int group_base = 0; group_base < kGroups; group_base += 4) {
+        const int group = group_base + lane_group;
+        const float4 x0 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + group * 64 + lane_in_group * 8 + 4);
+        const float values[8]          = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kGroups + group;
+        const std::uint32_t packed =
+            *reinterpret_cast<const std::uint32_t*>(codes + group_index * 32 + lane_in_group * 4);
+        const std::uint8_t high_bits = high[group_index * 8 + lane_in_group];
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
+        float weights[8];
+        q5_decode_eight(packed, high_bits, scale_bits, weights);
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { acc = fmaf(weights[item], values[item], acc); }
+    }
+    return mk_warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ float w8_dot_fp32_row(const std::uint8_t* codes,
+                                                 const std::uint8_t* scales, int row,
+                                                 const float* x) {
+    constexpr int kGroups = kIntermediate / 32;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    float acc             = 0.0f;
+    for (int group = 0; group < kGroups; ++group) {
+        const std::int64_t index = static_cast<std::int64_t>(row) * kGroups + group;
+        const float scale        = __half2float(
+            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + index * 2)));
+        const float w =
+            static_cast<float>(static_cast<std::int8_t>(codes[index * 32 + lane])) * scale;
+        acc = fmaf(w, x[group * 32 + lane], acc);
+    }
+    return mk_warp_reduce_sum(acc);
+}
+
+} // namespace moe
+
+// Router scores: two 8-warp row groups per CTA, engine reduce order per row.
+__device__ inline void mk_body_moe_d1(const MkInstr& instr, MkShared& shared) {
+    const auto* x      = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* router = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
+    auto* scores       = static_cast<float*>(instr.out[0]);
+    const std::int64_t row0 = instr.dim[0];
+    const std::int64_t rows = instr.dim[1];
+
+    const int warp     = static_cast<int>(threadIdx.x) >> 5;
+    const int lane     = static_cast<int>(threadIdx.x) & 31;
+    const int group    = warp >> 3;
+    const int warp_in8 = warp & 7;
+    const std::int64_t row = row0 + group;
+
+    if (group < 2 && row < row0 + rows && row < moe::kRouterRows) {
+        constexpr int kSlice = moe::kHidden / 8;
+        const auto* row_ptr  = router + row * moe::kHidden;
+        float sum            = 0.0f;
+        const int k          = warp_in8 * kSlice + lane * 8;
+        sum += moe::mk_dot_bf16_eight(row_ptr + k, x + k);
+        sum = mk_warp_reduce_sum(sum);
+        if (lane == 0) { shared.d1.partial[group][warp_in8] = sum; }
+    }
+    __syncthreads();
+    if ((warp == 0 || warp == 8) && group < 2 && row < row0 + rows && row < moe::kRouterRows) {
+        float value = lane < 8 ? shared.d1.partial[group][lane] : 0.0f;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset, 8);
+        }
+        if (lane == 0) { scores[row] = value; }
+    }
+    __syncthreads();
+}
+
+// Top-8 select + softmax alpha + shared sigmoid scale: single warp (verbatim
+// sparse_moe_select_top8_warp).
+__device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
+    const auto* scores = static_cast<const float*>(instr.ptr[0]);
+    auto* shared_scale = const_cast<float*>(static_cast<const float*>(instr.ptr[1]));
+    auto* ids          = static_cast<int*>(instr.out[0]);
+    auto* alpha        = static_cast<float*>(instr.out[1]);
+    const int warp     = static_cast<int>(threadIdx.x) >> 5;
+    if (warp != 0) { return; }
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+
+    struct Ranked {
+        float value;
+        int id;
+        int origin;
+    };
+    const auto better = [](const Ranked& a, const Ranked& b) {
+        return a.value > b.value || (a.value == b.value && a.id < b.id);
+    };
+    Ranked local[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int id = lane + item * 32;
+        local[item]  = {scores[id], id, lane};
+    }
+#pragma unroll
+    for (int i = 1; i < 8; ++i) {
+        const Ranked value = local[i];
+        int position       = i;
+        while (position > 0 && better(value, local[position - 1])) {
+            local[position] = local[position - 1];
+            --position;
+        }
+        local[position] = value;
+    }
+    int cursor = 0;
+#pragma unroll
+    for (int rank = 0; rank < moe::kTopK; ++rank) {
+        Ranked candidate = cursor < 8 ? local[cursor] : Ranked{-CUDART_INF_F, 0x7fffffff, lane};
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            Ranked other;
+            other.value  = __shfl_down_sync(0xffffffffu, candidate.value, offset);
+            other.id     = __shfl_down_sync(0xffffffffu, candidate.id, offset);
+            other.origin = __shfl_down_sync(0xffffffffu, candidate.origin, offset);
+            if (better(other, candidate)) { candidate = other; }
+        }
+        candidate.value  = __shfl_sync(0xffffffffu, candidate.value, 0);
+        candidate.id     = __shfl_sync(0xffffffffu, candidate.id, 0);
+        candidate.origin = __shfl_sync(0xffffffffu, candidate.origin, 0);
+        if (lane == 0) {
+            ids[rank]                      = candidate.id;
+            shared.d2.selected_logits[rank] = candidate.value;
+        }
+        if (lane == candidate.origin) { ++cursor; }
+        __syncwarp();
+    }
+    float exponential = 0.0f;
+    if (lane < moe::kTopK) {
+        exponential = expf(shared.d2.selected_logits[lane] - shared.d2.selected_logits[0]);
+    }
+    float denominator = mk_warp_reduce_sum(exponential);
+    denominator       = __shfl_sync(0xffffffffu, denominator, 0);
+    if (lane < moe::kTopK) { alpha[lane] = exponential / denominator; }
+    if (lane == 0) {
+        const float s = scores[moe::kExperts];
+        *shared_scale = 1.0f / (1.0f + __expf(-s));
+    }
+}
+
+// gate_up + silu*up. Tasks = 9 paths x js j-values, distributed over ALL 16
+// warps (each dot is warp-local, so any warp may own any task with identical
+// FP order).
+__device__ inline void mk_body_moe_d3(const MkInstr& instr) {
+    const auto* x             = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* ids           = static_cast<const int*>(instr.ptr[1]);
+    const auto* routed_codes  = static_cast<const std::uint8_t*>(instr.ptr[2]);
+    const auto* routed_scales = static_cast<const std::uint8_t*>(instr.ptr[4]);
+    const auto* shared_codes  = static_cast<const std::uint8_t*>(instr.ptr[5]);
+    const auto* shared_scales = static_cast<const std::uint8_t*>(instr.ptr[6]);
+    auto* act                 = static_cast<float*>(instr.out[0]);
+    const int j0              = static_cast<int>(instr.dim[0]);
+    const int js              = static_cast<int>(instr.dim[1]);
+
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int tasks = (moe::kTopK + 1) * js;
+
+    for (int task = warp; task < tasks; task += kMkThreads / 32) {
+        const int path = task / js;
+        const int j    = j0 + (task - path * js);
+        float gate     = 0.0f;
+        float up       = 0.0f;
+        if (path < moe::kTopK) {
+            const int expert   = ids[path];
+            const int row_base = expert * (2 * moe::kIntermediate);
+            moe::q4_dot_two_rows(routed_codes, routed_scales, row_base + j,
+                                 row_base + moe::kIntermediate + j, x, gate, up);
+        } else {
+            moe::w8_dot_two_rows(shared_codes, shared_scales, j, moe::kIntermediate + j, x,
+                                 gate, up);
+        }
+        if (lane == 0) {
+            act[static_cast<std::int64_t>(path) * moe::kIntermediate + j] =
+                moe::mk_silu(gate) * up;
+        }
+    }
+}
+
+// down + rank-ordered FP32 sum + residual. Tasks = 9 paths x 16 rows over all
+// 16 warps; per-row path sums stay in fixed 0..8 order (single lane adds), so
+// the epilogue matches the engine's deterministic rank-order accumulation.
+__device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
+    const auto* ids           = static_cast<const int*>(instr.ptr[0]);
+    const auto* alpha         = static_cast<const float*>(instr.ptr[1]);
+    const auto* shared_scale  = static_cast<const float*>(instr.ptr[2]);
+    const auto* act           = static_cast<const float*>(instr.ptr[3]);
+    const auto* routed_codes  = static_cast<const std::uint8_t*>(instr.ptr[4]);
+    const auto* routed_high   = static_cast<const std::uint8_t*>(instr.ptr[5]);
+    const auto* routed_scales = static_cast<const std::uint8_t*>(instr.ptr[6]);
+    const auto* shared_codes  = static_cast<const std::uint8_t*>(instr.ptr[7]);
+    const auto* shared_scales = static_cast<const std::uint8_t*>(instr.out[1]);
+    auto* destination         = static_cast<__nv_bfloat16*>(instr.out[0]);
+    const int row0            = static_cast<int>(instr.dim[0]);
+    const int rows            = static_cast<int>(instr.dim[1]);   // <= 16
+
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int tasks = (moe::kTopK + 1) * rows;
+
+    for (int task = warp; task < tasks; task += kMkThreads / 32) {
+        const int path = task / rows;
+        const int rr   = task - path * rows;
+        const int row  = row0 + rr;
+        float scaled;
+        if (path < moe::kTopK) {
+            const int expert = ids[path];
+            const float dot  = moe::q5_dot_fp32_row(
+                routed_codes, routed_high, routed_scales, expert * moe::kHidden + row,
+                act + static_cast<std::int64_t>(path) * moe::kIntermediate);
+            scaled = alpha[path] * dot;
+        } else {
+            const float dot = moe::w8_dot_fp32_row(
+                shared_codes, shared_scales, row,
+                act + static_cast<std::int64_t>(moe::kTopK) * moe::kIntermediate);
+            scaled = *shared_scale * dot;
+        }
+        if (lane == 0) { shared.d4.paths[path][rr] = scaled; }
+    }
+    __syncthreads();
+    if (warp < rows && lane == 0) {
+        const int row = row0 + warp;
+        float value   = __bfloat162float(destination[row]);
+#pragma unroll
+        for (int path = 0; path < moe::kTopK + 1; ++path) {
+            value += shared.d4.paths[path][warp];
+        }
+        destination[row] = __float2bfloat16_rn(value);
+    }
+    __syncthreads();
+}
+
 __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& shared) {
     switch (instr.op) {
     case MkOp::RmsNorm2048:
@@ -543,6 +1072,18 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         return;
     case MkOp::GdnRecurrent:
         mk_body_gdn_recurrent(instr);
+        return;
+    case MkOp::MoeD1:
+        mk_body_moe_d1(instr, shared);
+        return;
+    case MkOp::MoeD2:
+        mk_body_moe_d2(instr, shared);
+        return;
+    case MkOp::MoeD3:
+        mk_body_moe_d3(instr);
+        return;
+    case MkOp::MoeD4:
+        mk_body_moe_d4(instr, shared);
         return;
     case MkOp::Halt:
     case MkOp::Noop:
