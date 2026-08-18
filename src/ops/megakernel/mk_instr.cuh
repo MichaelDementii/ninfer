@@ -204,6 +204,88 @@ __device__ inline void mk_body_w8_decode(const MkInstr& instr) {
     }
 }
 
+// Small control projection: bf16 W[rows x k] @ x, one warp per output row.
+__device__ inline void mk_body_bf16_gemv(const MkInstr& instr) {
+    const auto* x = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
+    const auto* w = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
+    auto* out     = static_cast<__nv_bfloat16*>(instr.out[0]);
+    const std::int64_t row0 = instr.dim[0];
+    const std::int64_t rows = instr.dim[1];
+    const std::int64_t k    = instr.dim[2];
+
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
+
+    for (std::int64_t r = warp; r < rows; r += warps) {
+        const std::int64_t row = row0 + r;
+        const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(w + row * k);
+        float acc = 0.0f;
+        for (std::int64_t i = lane; i < k / 2; i += 32) {
+            const float2 wf = __bfloat1622float2(w2[i]);
+            const float2 xf = __bfloat1622float2(x[i]);
+            acc = fmaf(wf.x, xf.x, acc);
+            acc = fmaf(wf.y, xf.y, acc);
+        }
+        acc = mk_warp_reduce_sum(acc);
+        if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
+    }
+}
+
+// Gated RMSNorm over d=128 rows (engine: gated_rmsnorm on GDN head outputs):
+// one warp per row, 4 bf16x2 pairs per lane; dst = norm(x)*w*silu(z).
+__device__ inline void mk_body_gated_norm128(const MkInstr& instr) {
+    const auto* x      = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
+    const auto* weight = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
+    const auto* z      = static_cast<const __nv_bfloat162*>(instr.ptr[2]);
+    auto* out          = static_cast<__nv_bfloat162*>(instr.out[0]);
+    const std::int64_t row0 = instr.dim[0];
+    const std::int64_t rows = instr.dim[1];
+    const float eps         = __int_as_float(static_cast<int>(instr.dim[2]));
+
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
+
+    for (std::int64_t r = warp; r < rows; r += warps) {
+        const std::int64_t base = (row0 + r) * 64;   // 64 bf16x2 pairs per d=128 row
+        float2 xf[2];
+        const __nv_bfloat162 v0 = x[base + lane];
+        const __nv_bfloat162 v1 = x[base + lane + 32];
+        xf[0] = __bfloat1622float2(v0);
+        xf[1] = __bfloat1622float2(v1);
+        float sum = xf[0].x * xf[0].x + xf[0].y * xf[0].y + xf[1].x * xf[1].x +
+                    xf[1].y * xf[1].y;
+        sum             = mk_warp_reduce_sum(sum);
+        float inv       = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
+        inv             = __shfl_sync(0xffffffffu, inv, 0);
+        const float2 w0 = __bfloat1622float2(weight[lane]);
+        const float2 w1 = __bfloat1622float2(weight[lane + 32]);
+        const float2 z0 = __bfloat1622float2(z[base + lane]);
+        const float2 z1 = __bfloat1622float2(z[base + lane + 32]);
+        const auto sil  = [](float v) { return v / (1.0f + __expf(-v)); };
+        out[base + lane] = __floats2bfloat162_rn(xf[0].x * inv * (w0.x + 1.0f) * sil(z0.x),
+                                                 xf[0].y * inv * (w0.y + 1.0f) * sil(z0.y));
+        out[base + lane + 32] =
+            __floats2bfloat162_rn(xf[1].x * inv * (w1.x + 1.0f) * sil(z1.x),
+                                  xf[1].y * inv * (w1.y + 1.0f) * sil(z1.y));
+    }
+}
+
+// dst[i] = v[i] * sigmoid(gate[i >> 6]) over dim1 elements.
+__device__ inline void mk_body_sigmoid_mul(const MkInstr& instr) {
+    const auto* v    = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* gate = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
+    auto* out        = static_cast<__nv_bfloat16*>(instr.out[0]);
+    const std::int64_t e0    = instr.dim[0];
+    const std::int64_t count = instr.dim[1];
+    for (std::int64_t i = e0 + threadIdx.x; i < e0 + count; i += kMkThreads) {
+        const float g = __bfloat162float(gate[i >> 6]);
+        const float s = 1.0f / (1.0f + __expf(-g));
+        out[i]        = __float2bfloat16_rn(__bfloat162float(v[i]) * s);
+    }
+}
+
 __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& shared) {
     switch (instr.op) {
     case MkOp::RmsNorm2048:
@@ -219,10 +301,26 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
             mk_body_w8_decode<4096>(instr);
         }
         return;
+    case MkOp::Bf16Gemv:
+        mk_body_bf16_gemv(instr);
+        return;
+    case MkOp::GatedNorm128:
+        mk_body_gated_norm128(instr);
+        return;
+    case MkOp::SigmoidMul:
+        mk_body_sigmoid_mul(instr);
+        return;
     case MkOp::Halt:
     case MkOp::Noop:
         return;
     }
+}
+
+__global__ __launch_bounds__(kMkThreads, 1) void mk_ref_generic_kernel(MkInstr instr) {
+    __shared__ MkShared shared;
+    MkInstr local = instr;
+    local.dim[0]  = instr.dim[0] + static_cast<std::int64_t>(blockIdx.x) * instr.dim[1];
+    mk_execute(local, shared);
 }
 
 // ---- the interpreter -------------------------------------------------------

@@ -34,6 +34,12 @@ enum class MkOp : std::uint32_t {
                      // ptr0=x, ptr1=codes, ptr2=scales, out0=dst (plain store) or
                      // residual accumulate when dim3!=0; dim0=row0, dim1=rows,
                      // dim2=K (2048|4096), dim3=residual flag
+    Bf16Gemv,        // ptr0=x, ptr1=W(bf16 row-major), out0=dst; dim0=row0,
+                     // dim1=rows, dim2=k — small control projections (gating)
+    GatedNorm128,    // ptr0=x(base of d=128 rows), ptr1=weight(128), ptr2=z(base),
+                     // out0=dst; dim0=row0, dim1=rows, dim2=eps bits — RMSNorm(x)*silu(z)
+    SigmoidMul,      // ptr0=v, ptr1=gate(bf16, one per 64 elems), out0=dst;
+                     // dim0=elem0, dim1=count — dst = v * sigmoid(gate[i>>6])
     Noop,
 };
 

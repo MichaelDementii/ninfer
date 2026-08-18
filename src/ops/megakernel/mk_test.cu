@@ -79,16 +79,20 @@ int main() {
 
     // ---- buffers -------------------------------------------------------------
     __nv_bfloat16 *d_x = nullptr, *d_h = nullptr, *d_u = nullptr;
+    __nv_bfloat16 *d_g = nullptr, *d_gn = nullptr, *d_sg = nullptr;
     CHECK(cudaMalloc(&d_x, kHidden * sizeof(__nv_bfloat16)));
     CHECK(cudaMalloc(&d_h, kHidden * sizeof(__nv_bfloat16)));
     CHECK(cudaMalloc(&d_u, kInRows * sizeof(__nv_bfloat16)));
+    CHECK(cudaMalloc(&d_g, 64 * sizeof(__nv_bfloat16)));
+    CHECK(cudaMalloc(&d_gn, kOutK * sizeof(__nv_bfloat16)));
+    CHECK(cudaMalloc(&d_sg, kOutK * sizeof(__nv_bfloat16)));
 
     const std::size_t in_code_bytes   = static_cast<std::size_t>(kInRows) * kHidden;
     const std::size_t in_scale_count  = static_cast<std::size_t>(kInRows) * (kHidden / 32);
     const std::size_t out_code_bytes  = static_cast<std::size_t>(kHidden) * kOutK;
     const std::size_t out_scale_count = static_cast<std::size_t>(kHidden) * (kOutK / 32);
 
-    std::vector<__nv_bfloat16*> d_norm_w(kLayers);
+    std::vector<__nv_bfloat16*> d_norm_w(kLayers), d_gw(kLayers);
     std::vector<std::uint8_t*> d_in_codes(kLayers), d_out_codes(kLayers);
     std::vector<std::uint16_t*> d_in_scales(kLayers), d_out_scales(kLayers);
 
@@ -96,6 +100,13 @@ int main() {
     std::normal_distribution<float> dist(0.0f, 0.5f);
     for (int l = 0; l < kLayers; ++l) {
         CHECK(cudaMalloc(&d_norm_w[l], kHidden * sizeof(__nv_bfloat16)));
+        CHECK(cudaMalloc(&d_gw[l], 64 * kHidden * sizeof(__nv_bfloat16)));
+        {
+            std::vector<__nv_bfloat16> gw(64 * kHidden);
+            for (auto& e : gw) { e = __float2bfloat16_rn(0.05f * dist(rng)); }
+            CHECK(cudaMemcpy(d_gw[l], gw.data(), gw.size() * sizeof(__nv_bfloat16),
+                             cudaMemcpyHostToDevice));
+        }
         CHECK(cudaMalloc(&d_in_codes[l], in_code_bytes));
         CHECK(cudaMalloc(&d_in_scales[l], in_scale_count * sizeof(std::uint16_t)));
         CHECK(cudaMalloc(&d_out_codes[l], out_code_bytes));
@@ -158,45 +169,103 @@ int main() {
         return instr;
     };
 
-    // ---- tape (identical for every SM: 3 task classes per layer) --------------
-    // counters per layer l (7 each): dep c_norm=7l, c_in=7l+1, c_in_head=7l+2,
-    // c_out=7l+3; pop counters 7l+4 (norm), 7l+5 (in), 7l+6 (out).
-    // Chunked dependency: out-proj reads only u[0 : kOutK], i.e. the first
-    // kOutK/kRowSlice = 256 in-proj slices -> waits c_in_head instead of c_in.
-    // norm(l+1) then must ALSO wait for the full c_in(l) (tail slices still read
-    // h while it would be overwritten).
-    constexpr int kHeadSlices = kOutK / kRowSlice;   // 256
+    // ---- tape (identical for every SM: 6 task classes per layer) --------------
+    // Engine-like granularity: the small control chain (gating -> gated norm ->
+    // sigmoid) runs in PARALLEL with the wide in-proj inside the megakernel,
+    // joining before out-proj; the per-op reference is forced to serialize all
+    // six launches — exactly the structural difference vs the real decode graph.
+    // counters per layer l (13 each): deps c_norm=13l+0, c_in=+1, c_in_head=+2,
+    // c_out=+3, c_gat=+4, c_gn=+5, c_sg=+6; pops +7..+12 (norm,in,out,gat,gn,sg).
+    // gated norm reads u[0:8192] (x head + z region) -> in-proj posts done2 for
+    // its first 512 slices. norm(l+1) still waits the FULL c_in(l).
+    constexpr int kHeadSlices = (2 * kOutK) / kRowSlice;   // 512: u[0:8192]
+    constexpr int kGatRows    = 64;
+    constexpr int kGatSlice   = 32;
+    constexpr int kCtr        = 13;
     std::vector<MkInstr> tape;
     for (int l = 0; l < kLayers; ++l) {
         MkInstr norm       = make_norm(l);
-        norm.task_counter  = 7 * l + 4;
-        norm.done_counter  = 7 * l;
+        norm.task_counter  = kCtr * l + 7;
+        norm.done_counter  = kCtr * l;
         if (l > 0) {
-            norm.wait_counter[0] = 7 * (l - 1) + 3;
+            norm.wait_counter[0] = kCtr * (l - 1) + 3;
             norm.wait_target[0]  = kOutSlices;
-            norm.wait_counter[1] = 7 * (l - 1) + 1;
+            norm.wait_counter[1] = kCtr * (l - 1) + 1;
             norm.wait_target[1]  = kInSlices;
         }
         tape.push_back(norm);
 
+        MkInstr gat{};
+        gat.op            = MkOp::Bf16Gemv;
+        gat.task_counter  = kCtr * l + 10;
+        gat.slice_count   = kGatRows / kGatSlice;
+        gat.done_counter  = kCtr * l + 4;
+        gat.done2_counter = kMkNone;
+        for (int w = 0; w < kMkMaxWaits; ++w) { gat.wait_counter[w] = kMkNone; }
+        gat.ptr[0]          = d_h;
+        gat.ptr[1]          = d_gw[l];
+        gat.out[0]          = d_g;
+        gat.dim[0]          = 0;
+        gat.dim[1]          = kGatSlice;
+        gat.dim[2]          = kHidden;
+        gat.wait_counter[0] = kCtr * l;
+        gat.wait_target[0]  = 1;
+        tape.push_back(gat);
+
         MkInstr in = make_decode(d_h, d_in_codes[l], d_in_scales[l], d_u, 0, kRowSlice,
                                  kHidden, false);
-        in.task_counter    = 7 * l + 5;
+        in.task_counter    = kCtr * l + 8;
         in.slice_count     = kInSlices;
-        in.done_counter    = 7 * l + 1;
-        in.done2_counter   = 7 * l + 2;
+        in.done_counter    = kCtr * l + 1;
+        in.done2_counter   = kCtr * l + 2;
         in.done2_limit     = kHeadSlices;
-        in.wait_counter[0] = 7 * l;
+        in.wait_counter[0] = kCtr * l;
         in.wait_target[0]  = 1;
         tape.push_back(in);
 
-        MkInstr out_i = make_decode(d_u, d_out_codes[l], d_out_scales[l], d_x, 0, kRowSlice,
+        MkInstr gn{};
+        gn.op            = MkOp::GatedNorm128;
+        gn.task_counter  = kCtr * l + 11;
+        gn.slice_count   = 1;
+        gn.done_counter  = kCtr * l + 5;
+        gn.done2_counter = kMkNone;
+        for (int w = 0; w < kMkMaxWaits; ++w) { gn.wait_counter[w] = kMkNone; }
+        gn.ptr[0]          = d_u;
+        gn.ptr[1]          = d_norm_w[l];
+        gn.ptr[2]          = d_u + kOutK;
+        gn.out[0]          = d_gn;
+        gn.dim[0]          = 0;
+        gn.dim[1]          = kOutK / 128;   // 32 rows of d=128
+        gn.dim[2]          = pack_eps(kEps);
+        gn.wait_counter[0] = kCtr * l + 2;
+        gn.wait_target[0]  = kHeadSlices;
+        gn.wait_counter[1] = kCtr * l + 4;
+        gn.wait_target[1]  = kGatRows / kGatSlice;
+        tape.push_back(gn);
+
+        MkInstr sg{};
+        sg.op            = MkOp::SigmoidMul;
+        sg.task_counter  = kCtr * l + 12;
+        sg.slice_count   = 1;
+        sg.done_counter  = kCtr * l + 6;
+        sg.done2_counter = kMkNone;
+        for (int w = 0; w < kMkMaxWaits; ++w) { sg.wait_counter[w] = kMkNone; }
+        sg.ptr[0]          = d_gn;
+        sg.ptr[1]          = d_g;
+        sg.out[0]          = d_sg;
+        sg.dim[0]          = 0;
+        sg.dim[1]          = kOutK;
+        sg.wait_counter[0] = kCtr * l + 5;
+        sg.wait_target[0]  = 1;
+        tape.push_back(sg);
+
+        MkInstr out_i = make_decode(d_sg, d_out_codes[l], d_out_scales[l], d_x, 0, kRowSlice,
                                     kOutK, true);
-        out_i.task_counter    = 7 * l + 6;
+        out_i.task_counter    = kCtr * l + 9;
         out_i.slice_count     = kOutSlices;
-        out_i.done_counter    = 7 * l + 3;
-        out_i.wait_counter[0] = 7 * l + 2;
-        out_i.wait_target[0]  = kHeadSlices;
+        out_i.done_counter    = kCtr * l + 3;
+        out_i.wait_counter[0] = kCtr * l + 6;
+        out_i.wait_target[0]  = 1;
         tape.push_back(out_i);
     }
 
@@ -212,7 +281,7 @@ int main() {
                      cudaMemcpyHostToDevice));
 
     std::uint32_t* d_counters = nullptr;
-    const int counter_count   = 7 * kLayers;
+    const int counter_count   = kCtr * kLayers;
     CHECK(cudaMalloc(&d_counters, counter_count * sizeof(std::uint32_t)));
 
     // ---- run helpers ----------------------------------------------------------
@@ -223,11 +292,42 @@ int main() {
     auto run_ref = [&](cudaStream_t stream) {
         for (int l = 0; l < kLayers; ++l) {
             mk_ref_rmsnorm_kernel<<<1, kMkThreads, 0, stream>>>(make_norm(l));
+            {
+                MkInstr gat{};
+                gat.op     = MkOp::Bf16Gemv;
+                gat.ptr[0] = d_h;
+                gat.ptr[1] = d_gw[l];
+                gat.out[0] = d_g;
+                gat.dim[0] = 0;
+                gat.dim[1] = kGatSlice;
+                gat.dim[2] = kHidden;
+                mk_ref_generic_kernel<<<kGatRows / kGatSlice, kMkThreads, 0, stream>>>(gat);
+            }
             mk_ref_w8_decode_kernel<<<kInSlices, kMkThreads, 0, stream>>>(
                 make_decode(d_h, d_in_codes[l], d_in_scales[l], d_u, 0, kRowSlice, kHidden,
                             false));
+            {
+                MkInstr gn{};
+                gn.op     = MkOp::GatedNorm128;
+                gn.ptr[0] = d_u;
+                gn.ptr[1] = d_norm_w[l];
+                gn.ptr[2] = d_u + kOutK;
+                gn.out[0] = d_gn;
+                gn.dim[0] = 0;
+                gn.dim[1] = kOutK / 128;
+                gn.dim[2] = pack_eps(kEps);
+                mk_ref_generic_kernel<<<1, kMkThreads, 0, stream>>>(gn);
+                MkInstr sg{};
+                sg.op     = MkOp::SigmoidMul;
+                sg.ptr[0] = d_gn;
+                sg.ptr[1] = d_g;
+                sg.out[0] = d_sg;
+                sg.dim[0] = 0;
+                sg.dim[1] = kOutK;
+                mk_ref_generic_kernel<<<1, kMkThreads, 0, stream>>>(sg);
+            }
             mk_ref_w8_decode_kernel<<<kOutSlices, kMkThreads, 0, stream>>>(
-                make_decode(d_u, d_out_codes[l], d_out_scales[l], d_x, 0, kRowSlice, kOutK,
+                make_decode(d_sg, d_out_codes[l], d_out_scales[l], d_x, 0, kRowSlice, kOutK,
                             true));
         }
     };
@@ -296,9 +396,10 @@ int main() {
     const double us_mk0 = 1e3 * ms_mk0 / iters;
     const double us_mk1 = 1e3 * ms_mk1 / iters;
     const double gb     = kLayers * (static_cast<double>(in_code_bytes) + out_code_bytes +
-                                 2.0 * (in_scale_count + out_scale_count)) /
+                                 2.0 * (in_scale_count + out_scale_count) +
+                                 2.0 * kGatRows * kHidden) /
                       1e9;
-    const int boundaries = kLayers * 3;
+    const int boundaries = kLayers * 6;
     std::printf("traffic: %.2f GB/pass\n", gb);
     std::printf("ref (per-op kernels):     %8.2f us/pass  (%.0f GB/s)\n", us_ref,
                 gb / us_ref * 1e6);
