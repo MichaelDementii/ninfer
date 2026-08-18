@@ -679,6 +679,18 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     if (!replay_records) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
+    MtpWindowRig* resolve_rig = nullptr;
+    if (adaptive_spec && lanes.size() == 1 && lanes[0] < max_concurrency) {
+        const std::uint32_t pw = sequences[lanes[0]].adaptive.pending_window;
+        if (pw != 0) {
+            for (MtpWindowRig& rig : mtp_window_rigs) {
+                if (rig.window == pw) { resolve_rig = &rig; }
+            }
+            if (resolve_rig == nullptr) {
+                throw std::logic_error("adaptive pending window has no rig");
+            }
+        }
+    }
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
@@ -721,7 +733,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
     const auto tail_started = Clock::now();
     try {
-        ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
+        ops::gdn_replay_fold(resolve_rig ? *resolve_rig->records : *replay_records,
+                             decoder->linear_attention.all_layers_view(),
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
@@ -732,7 +745,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             Tensor selected;
             Tensor destinations;
             if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
-                qwen3_6::MtpDecodeState& frame = *io.mtp_decode;
+                qwen3_6::MtpDecodeState& frame =
+                    resolve_rig ? *resolve_rig->frame : *io.mtp_decode;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
@@ -1298,6 +1312,71 @@ void ProgramImplCore::prepare_graphs() {
                     mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
             }
         }
+
+        const char* adaptive_env = std::getenv("NINFER_SPEC_ADAPTIVE");
+        adaptive_spec            = adaptive_env != nullptr && adaptive_env[0] == '1';
+        if (adaptive_spec) {
+            for (std::uint32_t w = 1; w <= draft_window; ++w) {
+                if (w == draft_window) { continue; }
+                mtp_window_rigs.emplace_back();
+                MtpWindowRig& rig = mtp_window_rigs.back();
+                rig.window        = w;
+
+                ninfer::LayoutBuilder rig_builder;
+                qwen3_6::RoundStateLayout rig_round = qwen3_6::begin_round_state_layout(
+                    rig_builder,
+                    qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
+                                            .output_rows    = TextConfig::output_rows,
+                                            .batch_capacity = 1,
+                                            .draft_window   = w,
+                                            .enable_mtp     = true,
+                                            .enable_dflash  = false});
+                qwen3_6::complete_round_state_layout(rig_builder, rig_round);
+                const GdnReplayRecordLayout rig_records_layout = plan_gdn_replay_records(
+                    rig_builder, GdnReplayRecordSpec{
+                                     .layers          = TextConfig::gdn_layers(),
+                                     .record_capacity = static_cast<std::int32_t>(max_concurrency),
+                                     .width           = static_cast<std::int32_t>(w + 1U),
+                                     .conv_channels   = TextConfig::convolution_dim,
+                                     .qk_heads        = TextConfig::gdn_key_heads,
+                                     .value_heads     = TextConfig::gdn_value_heads,
+                                     .key_dim         = TextConfig::gdn_key_head_dim,
+                                     .value_dim       = TextConfig::gdn_value_head_dim,
+                                 });
+                rig.bytes = rig_builder.finish(kArenaAlign, "adaptive MTP rig");
+                CUDA_CHECK(cudaMalloc(&rig.backing, rig.bytes));
+                CUDA_CHECK(cudaMemset(rig.backing, 0, rig.bytes));
+                if (!rig_round.mtp_decode) {
+                    throw std::logic_error("adaptive rig layout lacks MTP decode state");
+                }
+                rig.frame.emplace(DeviceSpan{rig.backing, rig.bytes}, *rig_round.mtp_decode, 1, w);
+                rig.records.emplace(DeviceSpan{rig.backing, rig.bytes}, rig_records_layout);
+
+                schedule::ExecutionCore rig_core = execution_core();
+                rig_core.replay_records = &*rig.records;
+                schedule::MtpBatchContext rig_state{
+                    rig_core,          decoder->text_kv, *decoder->mtp_cache(), *rig.frame,
+                    *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+                schedule::mtp_decode_batch(rig_state, 1, w,
+                                           mtp_gqa_envelopes(code_warm.max, w, capacity), nullptr);
+                device.synchronize();
+
+                rig.graphs.profiles.reserve(planned_profiles.size());
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    rig.graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = rig.graphs.profiles.back();
+                    profile.batch_size             = 1;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class         = planned.topology_class;
+                    schedule::capture_mtp_decode_batch(rig_state, 1, w,
+                                                       mtp_gqa_envelopes(planned.max, w, capacity),
+                                                       profile.definition);
+                }
+            }
+        }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
@@ -1348,6 +1427,10 @@ void ProgramImplCore::prepare_graphs() {
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
+        for (MtpWindowRig& rig : mtp_window_rigs) {
+            instantiate_graph_family(rig.graphs, "MTP adaptive rig", device,
+                                     prepare_representative);
+        }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
@@ -1843,7 +1926,63 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    const std::uint32_t width      = draft_window + 1;
+    // Adaptive window selection (single-lane batches): an EMA bandit over the per-window
+    // rigs, seeded by a round-robin cold start and epsilon exploration. Speculative decoding
+    // is lossless, so the committed token sequence is identical under any window policy;
+    // only the tokens-per-second changes.
+    std::uint32_t window     = draft_window;
+    MtpWindowRig* window_rig = nullptr;
+    if (adaptive_spec && lanes.size() == 1 && lanes[0] < max_concurrency) {
+        AdaptiveSpecState& ad = sequences[lanes[0]].adaptive;
+        const std::uint32_t n = draft_window;
+        std::uint32_t pick;
+        static const char* force_env      = std::getenv("NINFER_SPEC_FORCE_W");
+        static const std::uint32_t forced = force_env ? std::atoi(force_env) : 0;
+        if (forced >= 1 && forced <= n) {
+            pick = forced;
+            ad.current = pick;
+            window = pick;
+            if (window != draft_window) {
+                for (MtpWindowRig& rig : mtp_window_rigs) {
+                    if (rig.window == window) { window_rig = &rig; }
+                }
+                if (window_rig == nullptr) { window = draft_window; }
+            }
+            goto adaptive_selected;
+        }
+        if (ad.rounds < 2 * n) {
+            pick = (ad.rounds % n) + 1;
+        } else {
+            ad.rng ^= ad.rng << 13;
+            ad.rng ^= ad.rng >> 17;
+            ad.rng ^= ad.rng << 5;
+            if (ad.rng % 100 < 6) {
+                pick = (ad.rng >> 8) % n + 1;
+            } else {
+                std::uint32_t best  = ad.current == 0 ? n : ad.current;
+                float best_tps      = ad.ema_tps[best - 1];
+                for (std::uint32_t w = 1; w <= n; ++w) {
+                    if (ad.tries[w - 1] == 0) { continue; }
+                    if (ad.ema_tps[w - 1] > best_tps * 1.03f) {
+                        best     = w;
+                        best_tps = ad.ema_tps[w - 1];
+                    }
+                }
+                pick = best;
+            }
+        }
+        ad.current = pick;
+        window     = pick;
+        if (window != draft_window) {
+            for (MtpWindowRig& rig : mtp_window_rigs) {
+                if (rig.window == window) { window_rig = &rig; }
+            }
+            if (window_rig == nullptr) { window = draft_window; }
+        }
+    adaptive_selected:;
+    }
+
+    const std::uint32_t width      = window + 1;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -1871,14 +2010,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
+        DecodeGraphFamily& family         = window_rig ? window_rig->graphs : mtp_graphs;
         schedule::MtpGqaEnvelopes envelopes =
-            mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_gqa_envelopes(maximum_frontier, window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
+            executable = &install_graph_profile(family, profile, "MTP batch");
+            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, window, capacity);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1889,7 +2029,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                std::min({sequence.mtp_draft_count, window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -1897,8 +2037,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                mtp_host_ingress->current_drafts[row * draft_window + j] =
+            for (std::uint32_t j = 0; j < window; ++j) {
+                mtp_host_ingress->current_drafts[row * window + j] =
                     j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
@@ -1912,22 +2052,24 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1,
-                                    std::min(capacity, frontier + extent + draft_window));
+                                    std::min(capacity, frontier + extent + window));
         }
 
+        GdnReplayRecords* round_records =
+            window_rig ? &*window_rig->records : (replay_records ? &*replay_records : nullptr);
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
-                                                  replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  round_records, io, prefill_hidden, prefill_chunk,
+                                                  proposal_head},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
-                                                 *io.mtp_decode,
+                                                 window_rig ? *window_rig->frame : *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   draft_window, envelopes, executable);
+                                   window, envelopes, executable);
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -1941,7 +2083,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
-                next_i > static_cast<std::int32_t>(draft_window) ||
+                next_i > static_cast<std::int32_t>(window) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {
@@ -1963,6 +2105,17 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            if (adaptive_spec && lanes.size() == 1) {
+                AdaptiveSpecState& ad = sequence.adaptive;
+                const float tps = static_cast<float>(count_i) /
+                                  static_cast<float>(std::max(seconds, 1e-6));
+                const std::size_t slot = window - 1;
+                ad.ema_tps[slot] =
+                    ad.tries[slot] == 0 ? tps : 0.85f * ad.ema_tps[slot] + 0.15f * tps;
+                ad.tries[slot] += 1;
+                ad.rounds += 1;
+                ad.pending_window = window_rig ? window : 0;
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,

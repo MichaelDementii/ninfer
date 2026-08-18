@@ -150,7 +150,17 @@ struct DecodeGraphFamily {
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
+struct AdaptiveSpecState {
+    std::array<float, 16> ema_tps{};
+    std::array<std::uint32_t, 16> tries{};
+    std::uint32_t rounds         = 0;
+    std::uint32_t current        = 0;
+    std::uint32_t pending_window = 0;  // window of the round awaiting resolution; 0 = main path
+    std::uint32_t rng            = 0x9e3779b9u;
+};
+
 struct SequenceState {
+    AdaptiveSpecState adaptive{};
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
     Tensor rewrite_checkpoint_hidden;
@@ -276,6 +286,20 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+
+    // Adaptive speculation: one rig per alternative MTP draft window (single-lane batches).
+    // Each rig owns a batch-capacity-1 round-state arena and a graph family captured at that
+    // window; the configured draft_window keeps using the main state and mtp_graphs.
+    struct MtpWindowRig {
+        std::uint32_t window = 0;
+        void* backing        = nullptr;
+        std::size_t bytes    = 0;
+        std::optional<qwen3_6::MtpDecodeState> frame;
+        std::optional<GdnReplayRecords> records;
+        DecodeGraphFamily graphs;
+    };
+    std::vector<MtpWindowRig> mtp_window_rigs;
+    bool adaptive_spec = false;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
