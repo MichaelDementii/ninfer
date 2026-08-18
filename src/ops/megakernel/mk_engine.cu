@@ -1,3 +1,5 @@
+#define NINFER_MK_PROF 1
+
 #include "ops/megakernel/mk_engine.h"
 
 #include "ops/megakernel/mk_core.cuh"
@@ -150,7 +152,10 @@ struct Recorder {
     void push(MkInstr instr) {
         instr.task_counter = alloc_ctr();
         pending.push_back(instr);
-        if (rounds_done == 0) { tape_ops.push_back(instr.op); }
+        // Host mirror of the tape arena: pushes land in arena order across ALL
+        // rounds (eager + capture), so profiling can attribute every offset —
+        // replays accumulate into the CAPTURE round's tape region.
+        tape_ops.push_back(instr.op);
         ++classes_this_round;
     }
 };
@@ -158,6 +163,36 @@ struct Recorder {
 Recorder& rec() {
     static Recorder r;
     return r;
+}
+
+void prof_dump_at_exit() {
+    Recorder& r = rec();
+    if (r.wait_ns == nullptr) { return; }
+    cudaDeviceSynchronize();
+    const std::size_t n = r.tape_ops.size();
+    if (n == 0) { return; }
+    std::vector<unsigned long long> wait_h(n);
+    std::vector<unsigned long long> exec_h(n);
+    cudaMemcpy(wait_h.data(), r.wait_ns, n * sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(exec_h.data(), r.exec_ns, n * sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+    double ws[32] = {};
+    double es[32] = {};
+    for (std::size_t i = 0; i < n; ++i) {
+        const int op = static_cast<int>(r.tape_ops[i]) & 31;
+        ws[op] += static_cast<double>(wait_h[i]);
+        es[op] += static_cast<double>(exec_h[i]);
+    }
+    std::fprintf(stderr,
+                 "[megakernel prof atexit] per-op CTA-clock sums (us at 2.4GHz), "
+                 "tape_ops=%zu tape_used=%zu:\n",
+                 n, r.tape_used);
+    for (int op = 0; op < 32; ++op) {
+        if (ws[op] + es[op] == 0.0) { continue; }
+        std::fprintf(stderr, "  op%-2d wait %14.0f exec %14.0f\n", op, ws[op] / 2400.0,
+                     es[op] / 2400.0);
+    }
 }
 
 } // namespace
@@ -173,6 +208,13 @@ bool mk_engine_enabled() {
 void mk_begin_round(cudaStream_t stream) {
     Recorder& r = rec();
     r.init();
+    if (r.prof) {
+        static const bool registered = [] {
+            std::atexit(prof_dump_at_exit);
+            return true;
+        }();
+        (void)registered;
+    }
     r.ctr_next            = 0;
     r.prev_out_ctr        = kMkNone;
     r.prev_in_ctr         = kMkNone;
@@ -258,18 +300,18 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     in.out[0]          = r.ws.qc;
     in.out[1]          = r.ws.kc;
     in.dim[0]          = 0;
-    in.dim[1]          = kRowSlice;
-    in.slice_count     = kInSlices;
+    in.dim[1]          = 2 * kRowSlice;
+    in.slice_count     = kInSlices / 2;
     in.done_counter    = r.alloc_ctr();
     in.done2_counter   = r.alloc_ctr();
-    in.done2_limit     = kHeadSlices;
+    in.done2_limit     = kHeadSlices / 2;
     in.wait_counter[0] = c_norm;
     in.wait_target[0]  = 1;
     const std::uint32_t c_in      = in.done_counter;
     const std::uint32_t c_in_head = in.done2_counter;
     r.push(in);
     r.prev_in_ctr = c_in;
-    r.prev_in_cnt = kInSlices;
+    r.prev_in_cnt = kInSlices / 2;
 
     MkInstr gg         = r.blank();
     gg.op              = MkOp::GdnGating;
@@ -307,7 +349,7 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     rc.slice_count     = kRecSlices;
     rc.done_counter    = r.alloc_ctr();
     rc.wait_counter[0] = c_in_head;
-    rc.wait_target[0]  = kHeadSlices;
+    rc.wait_target[0]  = kHeadSlices / 2;
     rc.wait_counter[1] = c_gg;
     rc.wait_target[1]  = 1;
     const std::uint32_t c_rec = rc.done_counter;
@@ -326,7 +368,7 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     gn.wait_counter[0] = c_rec;
     gn.wait_target[0]  = kRecSlices;
     gn.wait_counter[1] = c_in;
-    gn.wait_target[1]  = kInSlices;
+    gn.wait_target[1]  = kInSlices / 2;
     const std::uint32_t c_gn = gn.done_counter;
     r.push(gn);
 

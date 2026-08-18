@@ -1026,8 +1026,9 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
 // gate_up + silu*up. Tasks = 9 paths x js j-values, distributed over ALL 16
 // warps (each dot is warp-local, so any warp may own any task with identical
 // FP order).
-__device__ inline void mk_body_moe_d3(const MkInstr& instr) {
-    const auto* x             = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+__device__ inline void mk_body_moe_d3(const MkInstr& instr, MkShared& shared) {
+    (void)shared;
+    const auto* x = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
     const auto* ids           = static_cast<const int*>(instr.ptr[1]);
     const auto* routed_codes  = static_cast<const std::uint8_t*>(instr.ptr[2]);
     const auto* routed_scales = static_cast<const std::uint8_t*>(instr.ptr[4]);
@@ -1196,7 +1197,7 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         mk_body_moe_d2(instr, shared);
         return;
     case MkOp::MoeD3:
-        mk_body_moe_d3(instr);
+        mk_body_moe_d3(instr, shared);
         return;
     case MkOp::MoeD4:
         mk_body_moe_d4(instr, shared);
@@ -1223,7 +1224,7 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_ref_generic_kernel(MkInstr i
 // exact future assignment is unknown; the CTA's grid rank approximates its
 // first-wave slice.
 __device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned rank) {
-    if (instr.op != MkOp::W8DecodeK) { return; }
+    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8DecodeConv) { return; }
     if (rank >= instr.slice_count) { return; }
     const auto* codes        = static_cast<const char*>(instr.ptr[1]);
     const std::int64_t row0  = instr.dim[0] + static_cast<std::int64_t>(rank) * instr.dim[1];

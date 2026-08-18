@@ -141,6 +141,9 @@ union MkShared {
         float selected_logits[8];  // top-8 selector scratch (single warp)
     } d2;
     struct {
+        alignas(16) __nv_bfloat16 x[2048];   // d3 activation staging (engine x_shared)
+    } d3;
+    struct {
         float paths[9][32];        // rank-ordered FP32 down epilogue, 32 rows/slice
     } d4;
     MkInstr instr_broadcast;
