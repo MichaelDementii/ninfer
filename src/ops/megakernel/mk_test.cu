@@ -67,10 +67,10 @@ constexpr int kRouterRows = kExperts + 1;
 constexpr int kTopK       = 8;
 constexpr int kMoeInter   = 512;
 constexpr int kD1Slices   = (kRouterRows + 1) / 2;      // 129 (2 rows per CTA)
-constexpr int kD3JSlice   = 16;
-constexpr int kD3Slices   = kMoeInter / kD3JSlice;      // 32
-constexpr int kD4RowSlice = 16;
-constexpr int kD4Slices   = kHidden / kD4RowSlice;      // 128
+constexpr int kD3JSlice   = 4;
+constexpr int kD3Slices   = kMoeInter / kD3JSlice;      // 128
+constexpr int kD4RowSlice = 8;
+constexpr int kD4Slices   = kHidden / kD4RowSlice;      // 256
 constexpr int kCtr        = 25;   // 13 dep + 12 pop counters per layer
 
 __global__ void fill_codes_kernel(std::uint8_t* data, std::size_t n, std::uint32_t seed) {
@@ -447,14 +447,9 @@ int main() {
         gat.done_counter    = kCtr * l + 4;
         gat.wait_counter[0] = kCtr * l;
         gat.wait_target[0]  = 1;
+        gat.dim[6] = 1;
         tape.push_back(gat);
 
-        MkInstr gg         = make_gg(l);
-        gg.task_counter    = kCtr * l + 24;
-        gg.done_counter    = kCtr * l + 12;
-        gg.wait_counter[0] = kCtr * l + 4;
-        gg.wait_target[0]  = kGatRows / kGatSlice;
-        tape.push_back(gg);
 
         MkInstr in         = make_inconv(l);
         in.task_counter    = kCtr * l + 15;
@@ -466,6 +461,13 @@ int main() {
         in.wait_target[0]  = 1;
         tape.push_back(in);
 
+        MkInstr gg         = make_gg(l);
+        gg.task_counter    = kCtr * l + 24;
+        gg.done_counter    = kCtr * l + 12;
+        gg.wait_counter[0] = kCtr * l + 4;
+        gg.wait_target[0]  = kGatRows / kGatSlice;
+        tape.push_back(gg);
+
         MkInstr rec         = make_rec(l);
         rec.task_counter    = kCtr * l + 16;
         rec.slice_count     = kRecSlices;
@@ -474,6 +476,7 @@ int main() {
         rec.wait_target[0]  = kHeadSlices;
         rec.wait_counter[1] = kCtr * l + 12;
         rec.wait_target[1]  = 1;
+        rec.dim[6] = 1;
         tape.push_back(rec);
 
         MkInstr gn         = make_gn(l);
@@ -491,6 +494,7 @@ int main() {
         out_i.done_counter    = kCtr * l + 3;
         out_i.wait_counter[0] = kCtr * l + 6;
         out_i.wait_target[0]  = 1;
+        out_i.dim[6] = 1;
         tape.push_back(out_i);
 
         MkInstr norm2         = make_norm2(l);
@@ -506,6 +510,7 @@ int main() {
         d1.done_counter    = kCtr * l + 8;
         d1.wait_counter[0] = kCtr * l + 7;
         d1.wait_target[0]  = 1;
+        d1.dim[6] = 1;
         tape.push_back(d1);
 
         MkInstr d2         = make_d2();
@@ -521,6 +526,7 @@ int main() {
         d3.done_counter    = kCtr * l + 10;
         d3.wait_counter[0] = kCtr * l + 9;
         d3.wait_target[0]  = 1;
+        d3.dim[6] = 1;
         tape.push_back(d3);
 
         MkInstr d4         = make_d4(l);
@@ -529,6 +535,7 @@ int main() {
         d4.done_counter    = kCtr * l + 11;
         d4.wait_counter[0] = kCtr * l + 10;
         d4.wait_target[0]  = kD3Slices;
+        d4.dim[6] = 1;
         tape.push_back(d4);
     }
 
@@ -575,7 +582,8 @@ int main() {
     };
     auto run_mk = [&](cudaStream_t stream, int prefetch) {
         CHECK(cudaMemsetAsync(d_counters, 0, counter_count * sizeof(std::uint32_t), stream));
-        mk_interpreter_kernel<<<2 * n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, prefetch);
+        mk_interpreter_kernel<<<n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, prefetch,
+                                                               nullptr, nullptr);
     };
 
     cudaStream_t stream;
@@ -636,6 +644,35 @@ int main() {
     };
     const float ms_mk0 = time_mk(0);
     const float ms_mk1 = time_mk(1);
+
+    // ---- per-class attribution (one instrumented pass) ------------------------
+    unsigned long long *d_wait_ns, *d_exec_ns;
+    CHECK(cudaMalloc(&d_wait_ns, tape.size() * sizeof(unsigned long long)));
+    CHECK(cudaMalloc(&d_exec_ns, tape.size() * sizeof(unsigned long long)));
+    CHECK(cudaMemset(d_wait_ns, 0, tape.size() * sizeof(unsigned long long)));
+    CHECK(cudaMemset(d_exec_ns, 0, tape.size() * sizeof(unsigned long long)));
+    reset_all();
+    CHECK(cudaMemsetAsync(d_counters, 0, counter_count * sizeof(std::uint32_t), stream));
+    mk_interpreter_kernel<<<n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, 1, d_wait_ns,
+                                                           d_exec_ns);
+    CHECK(cudaStreamSynchronize(stream));
+    std::vector<unsigned long long> wait_h(tape.size()), exec_h(tape.size());
+    CHECK(cudaMemcpy(wait_h.data(), d_wait_ns, tape.size() * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(exec_h.data(), d_exec_ns, tape.size() * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost));
+    const char* class_names[12] = {"norm",  "gating", "gg",     "in+conv", "recurrent", "gnorm",
+                                   "out",   "norm2",  "moe_d1", "moe_d2",  "moe_d3",    "moe_d4"};
+    double wait_sum[12] = {}, exec_sum[12] = {};
+    for (std::size_t i = 0; i < tape.size(); ++i) {
+        wait_sum[i % 12] += static_cast<double>(wait_h[i]);
+        exec_sum[i % 12] += static_cast<double>(exec_h[i]);
+    }
+    std::printf("per-class totals, summed over 170 CTAs x 48 layers (us at 2.4GHz):\n");
+    for (int c = 0; c < 12; ++c) {
+        std::printf("  %-10s wait %9.0f  exec %9.0f\n", class_names[c], wait_sum[c] / 2400.0,
+                    exec_sum[c] / 2400.0);
+    }
 
     const double us_ref = 1e3 * ms_ref / iters;
     const double us_mk0 = 1e3 * ms_mk0 / iters;

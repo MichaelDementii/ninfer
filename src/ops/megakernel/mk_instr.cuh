@@ -1016,6 +1016,23 @@ __device__ inline void mk_body_moe_d3(const MkInstr& instr) {
     for (int task = warp; task < tasks; task += kMkThreads / 32) {
         const int path = task / js;
         const int j    = j0 + (task - path * js);
+        // Warm the NEXT task's expert rows in L2 while this task's FMAs run:
+        // d3 is latency-bound on random expert reads, not bandwidth-bound.
+        const int next = task + kMkThreads / 32;
+        if (instr.dim[7] != 0 && next < tasks) {
+            const int npath = next / js;
+            const int nj    = j0 + (next - npath * js);
+            const std::int64_t nrow =
+                npath < moe::kTopK
+                    ? static_cast<std::int64_t>(ids[npath]) * (2 * moe::kIntermediate) + nj
+                    : nj;
+            const auto* base = npath < moe::kTopK
+                                   ? routed_codes + nrow * (moe::kHidden / 64) * 32
+                                   : shared_codes + nrow * (moe::kHidden / 32) * 32;
+            if (lane < 16) {
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(base + lane * 128));
+            }
+        }
         float gate     = 0.0f;
         float up       = 0.0f;
         if (path < moe::kTopK) {
@@ -1059,6 +1076,21 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
         const int path = task / rows;
         const int rr   = task - path * rows;
         const int row  = row0 + rr;
+        const int next = task + kMkThreads / 32;
+        if (instr.dim[7] != 0 && next < tasks) {
+            const int npath = next / rows;
+            const int nrow  = row0 + (next - npath * rows);
+            const auto* base =
+                npath < moe::kTopK
+                    ? routed_codes + (static_cast<std::int64_t>(ids[npath]) * moe::kHidden +
+                                      nrow) *
+                                         ((moe::kIntermediate / 64) * 32)
+                    : shared_codes +
+                          static_cast<std::int64_t>(nrow) * ((moe::kIntermediate / 32) * 32);
+            if (lane < 2) {
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(base + lane * 128));
+            }
+        }
         float scaled;
         if (path < moe::kTopK) {
             const int expert = ids[path];
@@ -1170,11 +1202,13 @@ __device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned
 
 __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
     const MkStream* __restrict__ streams, std::uint32_t* __restrict__ counters,
-    int enable_prefetch) {
+    int enable_prefetch, unsigned long long* __restrict__ wait_ns,
+    unsigned long long* __restrict__ exec_ns) {
     __shared__ MkShared shared;
     __shared__ std::uint32_t slice_shared;
     const MkStream stream = streams[blockIdx.x];
     for (std::uint32_t i = 0; i < stream.count; ++i) {
+        const unsigned long long t_enter = wait_ns != nullptr ? clock64() : 0;
         __shared__ __align__(16) MkInstr instr_s;
         // cooperative broadcast of the descriptor through shared memory
         {
@@ -1187,11 +1221,14 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
         }
         if (enable_prefetch != 0) { mk_prefetch_slice(instr_s, blockIdx.x); }
         mk_wait_phase(instr_s, counters);
+        const unsigned long long t_ready = wait_ns != nullptr ? clock64() : 0;
         // First pop; afterwards the done-post of slice N and the pop of slice N+1
         // share one thread-0 critical section (2 barriers per slice, not 3).
         if (threadIdx.x == 0) { slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u); }
         __syncthreads();
         std::uint32_t idx = slice_shared;
+        std::uint32_t done_local = 0;
+        const bool batch_post    = instr_s.dim[6] != 0;
         while (idx < instr_s.slice_count) {
             // No in-loop prefetch: with DRAM already saturated by demand streaming,
             // extra prefetch instructions only add memory-pipe pressure (measured
@@ -1202,17 +1239,31 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             mk_execute(local, shared);
             __syncthreads();
             if (threadIdx.x == 0) {
-                __threadfence();
-                if (instr_s.done_counter != kMkNone) {
-                    atomicAdd(&counters[instr_s.done_counter], 1u);
-                }
-                if (instr_s.done2_counter != kMkNone && idx < instr_s.done2_limit) {
-                    atomicAdd(&counters[instr_s.done2_counter], 1u);
+                if (batch_post) {
+                    ++done_local;
+                } else {
+                    __threadfence();
+                    if (instr_s.done_counter != kMkNone) {
+                        atomicAdd(&counters[instr_s.done_counter], 1u);
+                    }
+                    if (instr_s.done2_counter != kMkNone && idx < instr_s.done2_limit) {
+                        atomicAdd(&counters[instr_s.done2_counter], 1u);
+                    }
                 }
                 slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u);
             }
             __syncthreads();
             idx = slice_shared;
+        }
+        if (batch_post && threadIdx.x == 0 && done_local != 0 &&
+            instr_s.done_counter != kMkNone) {
+            __threadfence();
+            atomicAdd(&counters[instr_s.done_counter], done_local);
+        }
+        if (wait_ns != nullptr && threadIdx.x == 0) {
+            const unsigned long long t_done = clock64();
+            atomicAdd(&wait_ns[i], t_ready - t_enter);
+            atomicAdd(&exec_ns[i], t_done - t_ready);
         }
     }
 }
