@@ -124,8 +124,11 @@ int main() {
     // ---- instruction builders -------------------------------------------------
     auto make_norm = [&](int l) {
         MkInstr instr{};
-        instr.op           = MkOp::RmsNorm2048;
-        instr.done_counter = kMkNone;
+        instr.op            = MkOp::RmsNorm2048;
+        instr.task_counter  = kMkNone;
+        instr.slice_count   = 1;
+        instr.done_counter  = kMkNone;
+        instr.done2_counter = kMkNone;
         for (int w = 0; w < kMkMaxWaits; ++w) { instr.wait_counter[w] = kMkNone; }
         instr.ptr[0] = d_x;
         instr.ptr[1] = d_norm_w[l];
@@ -138,8 +141,11 @@ int main() {
                            __nv_bfloat16* dst, std::int64_t row0, std::int64_t rows,
                            std::int64_t k, bool residual) {
         MkInstr instr{};
-        instr.op           = MkOp::W8DecodeK;
-        instr.done_counter = kMkNone;
+        instr.op            = MkOp::W8DecodeK;
+        instr.task_counter  = kMkNone;
+        instr.slice_count   = 1;
+        instr.done_counter  = kMkNone;
+        instr.done2_counter = kMkNone;
         for (int w = 0; w < kMkMaxWaits; ++w) { instr.wait_counter[w] = kMkNone; }
         instr.ptr[0] = x;
         instr.ptr[1] = codes;
@@ -152,63 +158,61 @@ int main() {
         return instr;
     };
 
-    // ---- tapes ----------------------------------------------------------------
-    // counters per layer: c_norm=3l (target 1), c_in=3l+1 (target kInSlices),
-    // c_out=3l+2 (target kOutSlices)
-    std::vector<std::vector<MkInstr>> tapes(static_cast<std::size_t>(n_sm));
-    int rr = 0;   // round-robin cursor
+    // ---- tape (identical for every SM: 3 task classes per layer) --------------
+    // counters per layer l (7 each): dep c_norm=7l, c_in=7l+1, c_in_head=7l+2,
+    // c_out=7l+3; pop counters 7l+4 (norm), 7l+5 (in), 7l+6 (out).
+    // Chunked dependency: out-proj reads only u[0 : kOutK], i.e. the first
+    // kOutK/kRowSlice = 256 in-proj slices -> waits c_in_head instead of c_in.
+    // norm(l+1) then must ALSO wait for the full c_in(l) (tail slices still read
+    // h while it would be overwritten).
+    constexpr int kHeadSlices = kOutK / kRowSlice;   // 256
+    std::vector<MkInstr> tape;
     for (int l = 0; l < kLayers; ++l) {
-        MkInstr norm      = make_norm(l);
-        norm.done_counter = 3 * l;
+        MkInstr norm       = make_norm(l);
+        norm.task_counter  = 7 * l + 4;
+        norm.done_counter  = 7 * l;
         if (l > 0) {
-            norm.wait_counter[0] = 3 * (l - 1) + 2;
+            norm.wait_counter[0] = 7 * (l - 1) + 3;
             norm.wait_target[0]  = kOutSlices;
+            norm.wait_counter[1] = 7 * (l - 1) + 1;
+            norm.wait_target[1]  = kInSlices;
         }
-        tapes[static_cast<std::size_t>(rr++ % n_sm)].push_back(norm);
-        for (int s = 0; s < kInSlices; ++s) {
-            MkInstr in = make_decode(d_h, d_in_codes[l], d_in_scales[l], d_u,
-                                     static_cast<std::int64_t>(s) * kRowSlice, kRowSlice,
-                                     kHidden, false);
-            in.done_counter    = 3 * l + 1;
-            in.wait_counter[0] = 3 * l;
-            in.wait_target[0]  = 1;
-            tapes[static_cast<std::size_t>(rr++ % n_sm)].push_back(in);
-        }
-        for (int s = 0; s < kOutSlices; ++s) {
-            MkInstr out_i = make_decode(d_u, d_out_codes[l], d_out_scales[l], d_x,
-                                        static_cast<std::int64_t>(s) * kRowSlice, kRowSlice,
-                                        kOutK, true);
-            out_i.done_counter    = 3 * l + 2;
-            out_i.wait_counter[0] = 3 * l + 1;
-            out_i.wait_target[0]  = kInSlices;
-            tapes[static_cast<std::size_t>(rr++ % n_sm)].push_back(out_i);
-        }
+        tape.push_back(norm);
+
+        MkInstr in = make_decode(d_h, d_in_codes[l], d_in_scales[l], d_u, 0, kRowSlice,
+                                 kHidden, false);
+        in.task_counter    = 7 * l + 5;
+        in.slice_count     = kInSlices;
+        in.done_counter    = 7 * l + 1;
+        in.done2_counter   = 7 * l + 2;
+        in.done2_limit     = kHeadSlices;
+        in.wait_counter[0] = 7 * l;
+        in.wait_target[0]  = 1;
+        tape.push_back(in);
+
+        MkInstr out_i = make_decode(d_u, d_out_codes[l], d_out_scales[l], d_x, 0, kRowSlice,
+                                    kOutK, true);
+        out_i.task_counter    = 7 * l + 6;
+        out_i.slice_count     = kOutSlices;
+        out_i.done_counter    = 7 * l + 3;
+        out_i.wait_counter[0] = 7 * l + 2;
+        out_i.wait_target[0]  = kHeadSlices;
+        tape.push_back(out_i);
     }
 
-    std::vector<MkInstr> flat;
-    std::vector<MkStream> streams(static_cast<std::size_t>(n_sm));
-    std::vector<std::size_t> offsets(static_cast<std::size_t>(n_sm));
-    for (int s = 0; s < n_sm; ++s) {
-        offsets[static_cast<std::size_t>(s)] = flat.size();
-        streams[static_cast<std::size_t>(s)].count =
-            static_cast<std::uint32_t>(tapes[static_cast<std::size_t>(s)].size());
-        flat.insert(flat.end(), tapes[static_cast<std::size_t>(s)].begin(),
-                    tapes[static_cast<std::size_t>(s)].end());
-    }
     MkInstr* d_tape = nullptr;
-    CHECK(cudaMalloc(&d_tape, flat.size() * sizeof(MkInstr)));
-    CHECK(cudaMemcpy(d_tape, flat.data(), flat.size() * sizeof(MkInstr),
+    CHECK(cudaMalloc(&d_tape, tape.size() * sizeof(MkInstr)));
+    CHECK(cudaMemcpy(d_tape, tape.data(), tape.size() * sizeof(MkInstr),
                      cudaMemcpyHostToDevice));
-    for (int s = 0; s < n_sm; ++s) {
-        streams[static_cast<std::size_t>(s)].tape = d_tape + offsets[static_cast<std::size_t>(s)];
-    }
+    std::vector<MkStream> streams(static_cast<std::size_t>(n_sm),
+                                  MkStream{d_tape, static_cast<std::uint32_t>(tape.size())});
     MkStream* d_streams = nullptr;
     CHECK(cudaMalloc(&d_streams, streams.size() * sizeof(MkStream)));
     CHECK(cudaMemcpy(d_streams, streams.data(), streams.size() * sizeof(MkStream),
                      cudaMemcpyHostToDevice));
 
     std::uint32_t* d_counters = nullptr;
-    const int counter_count   = 3 * kLayers;
+    const int counter_count   = 7 * kLayers;
     CHECK(cudaMalloc(&d_counters, counter_count * sizeof(std::uint32_t)));
 
     // ---- run helpers ----------------------------------------------------------

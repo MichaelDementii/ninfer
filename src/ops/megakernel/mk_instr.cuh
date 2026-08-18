@@ -227,15 +227,18 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
 
 // ---- the interpreter -------------------------------------------------------
 
-// While lane 0 spins on dependency counters, every other thread pulls this
-// instruction's WEIGHT bytes into L2 — weights are immutable, so prefetching
-// ahead of the data dependency is always safe, and the DRAM fetch overlaps the
-// wait instead of following it. This is the megakernel-only overlap that the
-// kernel-per-op model cannot express.
-__device__ __forceinline__ void mk_prefetch_weights(const MkInstr& instr) {
-    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8GemvResidual) { return; }
+// While lane 0 spins on dependency counters, the other threads pull one slice's
+// worth of this class's WEIGHT bytes into L2 — weights are immutable, so
+// prefetching ahead of the data dependency is always safe, and the DRAM fetch
+// overlaps the wait instead of following it. With dynamic slice popping the
+// exact future assignment is unknown; the CTA's grid rank approximates its
+// first-wave slice.
+__device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned rank) {
+    if (instr.op != MkOp::W8DecodeK) { return; }
+    if (rank >= instr.slice_count) { return; }
     const auto* codes        = static_cast<const char*>(instr.ptr[1]);
-    const std::int64_t base  = instr.dim[0] * instr.dim[2];
+    const std::int64_t row0  = instr.dim[0] + static_cast<std::int64_t>(rank) * instr.dim[1];
+    const std::int64_t base  = row0 * instr.dim[2];
     const std::int64_t bytes = instr.dim[1] * instr.dim[2];
     for (std::int64_t off = static_cast<std::int64_t>(threadIdx.x) * 128; off < bytes;
          off += static_cast<std::int64_t>(kMkThreads) * 128) {
@@ -247,6 +250,7 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
     const MkStream* __restrict__ streams, std::uint32_t* __restrict__ counters,
     int enable_prefetch) {
     __shared__ MkShared shared;
+    __shared__ std::uint32_t slice_shared;
     const MkStream stream = streams[blockIdx.x];
     for (std::uint32_t i = 0; i < stream.count; ++i) {
         __shared__ __align__(16) MkInstr instr_s;
@@ -259,10 +263,35 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             }
             __syncthreads();
         }
-        if (enable_prefetch != 0) { mk_prefetch_weights(instr_s); }
+        if (enable_prefetch != 0) { mk_prefetch_slice(instr_s, blockIdx.x); }
         mk_wait_phase(instr_s, counters);
-        mk_execute(instr_s, shared);
-        mk_post_phase(instr_s, counters);
+        // First pop; afterwards the done-post of slice N and the pop of slice N+1
+        // share one thread-0 critical section (2 barriers per slice, not 3).
+        if (threadIdx.x == 0) { slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u); }
+        __syncthreads();
+        std::uint32_t idx = slice_shared;
+        while (idx < instr_s.slice_count) {
+            // No in-loop prefetch: with DRAM already saturated by demand streaming,
+            // extra prefetch instructions only add memory-pipe pressure (measured
+            // +10% regression). Prefetch pays off solely inside dependency waits,
+            // where the bus would otherwise idle.
+            MkInstr local = instr_s;
+            local.dim[0] = instr_s.dim[0] + static_cast<std::int64_t>(idx) * instr_s.dim[1];
+            mk_execute(local, shared);
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence();
+                if (instr_s.done_counter != kMkNone) {
+                    atomicAdd(&counters[instr_s.done_counter], 1u);
+                }
+                if (instr_s.done2_counter != kMkNone && idx < instr_s.done2_limit) {
+                    atomicAdd(&counters[instr_s.done2_counter], 1u);
+                }
+                slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u);
+            }
+            __syncthreads();
+            idx = slice_shared;
+        }
     }
 }
 

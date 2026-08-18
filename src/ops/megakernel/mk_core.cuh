@@ -37,9 +37,21 @@ enum class MkOp : std::uint32_t {
     Noop,
 };
 
+// A tape entry describes a TASK CLASS: `slice_count` independent slices popped
+// dynamically by all CTAs through one atomic counter (`task_counter`) — the
+// megakernel's answer to the hardware grid scheduler's load balancing (a static
+// per-SM assignment measured +17.7% slower on 35B shapes: avg 5.28 slices/SM
+// rounds up to 6 on the critical path). Every completed slice posts +1 to
+// `done_counter`; slices with index < done2_limit additionally post +1 to
+// `done2_counter`, giving consumers a chunk-granular dependency (e.g. out-proj
+// only needs the first 256 in-proj slices).
 struct MkInstr {
     MkOp op;
+    std::uint32_t task_counter;                // atomic pop index for this class
+    std::uint32_t slice_count;
     std::uint32_t done_counter;                // kMkNone = do not post
+    std::uint32_t done2_counter;               // kMkNone = unused
+    std::uint32_t done2_limit;                 // slices with idx < limit post done2
     std::uint32_t wait_counter[kMkMaxWaits];   // kMkNone = slot unused
     std::uint32_t wait_target[kMkMaxWaits];
     const void* ptr[kMkMaxPtrs];
@@ -89,5 +101,15 @@ union MkShared {
     // W8 GEMV keeps everything in registers/L2 in v0.1 (no staging yet).
     MkInstr instr_broadcast;
 };
+
+// CTA-wide slice pop: thread 0 takes the next index, everyone joins.
+__device__ __forceinline__ std::uint32_t mk_pop_slice(std::uint32_t* counters,
+                                                      std::uint32_t task_counter,
+                                                      std::uint32_t* slice_shared) {
+    __syncthreads();
+    if (threadIdx.x == 0) { *slice_shared = atomicAdd(&counters[task_counter], 1u); }
+    __syncthreads();
+    return *slice_shared;
+}
 
 } // namespace ninfer::ops::mk
