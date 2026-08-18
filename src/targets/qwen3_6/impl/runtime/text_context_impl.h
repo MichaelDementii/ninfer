@@ -871,6 +871,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                       active_linear_state_slots_ != nullptr)) {
                     return false;
                 }
+                // Bisection aid: NINFER_MK_SKIP=gdn runs GDN mixers natively
+                // (pending tape flushed first to preserve stream order).
+                static const bool skip_gdn = [] {
+                    const char* env = std::getenv("NINFER_MK_SKIP");
+                    return env != nullptr && env[0] == 'g';
+                }();
+                if (skip_gdn) {
+                    ops::mk::mk_flush(ctx_.stream);
+                    return false;
+                }
                 Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
                 Tensor& rec_states  = state_.recurrent.at(static_cast<std::size_t>(gidx));
                 ops::mk::MkGdnMixerArgs args{};
@@ -1018,6 +1028,14 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
                 }
                 const auto& mw = payload.op;
                 if (mw.routed_gate_up.qtype != QType::Q4G64_F16S) { return false; }
+                static const bool skip_moe = [] {
+                    const char* env = std::getenv("NINFER_MK_SKIP");
+                    return env != nullptr && env[0] == 'm';
+                }();
+                if (skip_moe) {
+                    ops::mk::mk_flush(s);
+                    return false;
+                }
                 ops::mk::MkMoeArgs args{};
                 args.x           = x.data;
                 args.post_norm_w = post_norm->data;

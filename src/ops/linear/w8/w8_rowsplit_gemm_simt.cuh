@@ -155,6 +155,11 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     constexpr int kPrefetch    = PipelineStages - 1;
     constexpr int kHighU4Alloc = Schedule::kHighU4 > 0 ? Schedule::kHighU4 : 1;
 
+    // Same release-ASAP trigger the Q4/Q5 twins carry: lets a programmatic
+    // dependent (the megakernel interpreter segment) start its preamble while
+    // this kernel runs; it gates data reads with cudaGridDependencySynchronize.
+    if (threadIdx.x == 0) { cudaTriggerProgrammaticLaunchCompletion(); }
+
     __shared__ __align__(16) uint4 s_nib[RowsPerCta][PipelineStages][Schedule::kNibU4];
     __shared__ __align__(16) uint4 s_hi[RowsPerCta][PipelineStages][kHighU4Alloc];
     __shared__ __align__(16) std::uint32_t s_sc[RowsPerCta][PipelineStages][Schedule::kScaleU32];

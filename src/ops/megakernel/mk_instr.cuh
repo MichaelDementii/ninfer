@@ -20,6 +20,15 @@
 
 #include <cstdint>
 
+#ifdef NINFER_MK_ENGINE
+// Engine-build-only dependencies for the fused gating transplant (the
+// standalone mk_test compile has no include path to ops/common).
+#include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
+#include "ops/common/rowsplit_mma.cuh"
+#endif
+
 namespace ninfer::ops::mk {
 
 __device__ __forceinline__ float mk_warp_reduce_sum(float x) {
@@ -47,7 +56,12 @@ __device__ __forceinline__ float mk_block_reduce_sum_512(float x, float* warp_su
 }
 
 // dim0 = rows; one full CTA per row, rows processed sequentially by this CTA.
-// Matches rmsnorm_d2048_bf16x2_kernel<Offset> with rows folded into a loop.
+// The engine's Offset-epilogue d=2048 route is rmsnorm_cta_bf16x2_kernel
+// <Offset, 256, 6> (the d2048 512-thread kernel is Plain-only): 256 threads
+// each accumulate FOUR pairs (t, t+256, t+512, t+768) sequentially, then a
+// 256-wide block reduce (8 warp partials, width-8 shuffle tree). Threads
+// 256..511 idle through the sum phase; the elementwise scale phase is
+// thread-mapping independent, so all 512 threads share it.
 __device__ inline void mk_body_rmsnorm2048(const MkInstr& instr, MkShared& shared) {
     const auto* x       = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
     const auto* weight  = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
@@ -55,24 +69,44 @@ __device__ inline void mk_body_rmsnorm2048(const MkInstr& instr, MkShared& share
     const std::int64_t rows = instr.dim[0];
     const float eps         = __int_as_float(static_cast<int>(instr.dim[1]));
 
-    constexpr int kBlock       = kMkThreads;
+    constexpr int kCtaBlock    = 256;
     constexpr int kPairsPerRow = 1024;
+    const int tid              = static_cast<int>(threadIdx.x);
+    const int lane             = tid & 31;
+    const int warp             = tid >> 5;
 
     for (std::int64_t row = 0; row < rows; ++row) {
         const std::int64_t row_base = row * kPairsPerRow;
-        const int pair0             = static_cast<int>(threadIdx.x);
-        const int pair1             = pair0 + kBlock;
-        const __nv_bfloat162 value0 = x[row_base + pair0];
-        const __nv_bfloat162 value1 = x[row_base + pair1];
-        const float2 x0             = __bfloat1622float2(value0);
-        const float2 x1             = __bfloat1622float2(value1);
-        const float local_sum       = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
-
-        const float sum = mk_block_reduce_sum_512(local_sum, shared.rms.warp_sums);
-        if (threadIdx.x == 0) { shared.rms.inv = rsqrtf(sum * (1.0f / 2048.0f) + eps); }
+        float sum                   = 0.0f;
+        if (tid < kCtaBlock) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int pair  = tid + k * kCtaBlock;
+                const float2 xf = __bfloat1622float2(x[row_base + pair]);
+                sum += xf.x * xf.x + xf.y * xf.y;
+            }
+        }
+        // block_reduce_sum<256>: warp partials from warps 0..7, width-8 tree.
+        sum = mk_warp_reduce_sum(sum);
+        if (lane == 0 && warp < 8) { shared.rms.warp_sums[warp] = sum; }
+        __syncthreads();
+        if (tid == 0) {
+            // warp_reduce_sum<8> over the 8 partials, replicated serially with
+            // the exact shuffle-tree grouping (offsets 4, 2, 1):
+            // ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)).
+            const float* s = shared.rms.warp_sums;
+            const float t0 = (s[0] + s[4]) + (s[2] + s[6]);
+            const float t1 = (s[1] + s[5]) + (s[3] + s[7]);
+            shared.rms.inv = rsqrtf((t0 + t1) / 2048.0f + eps);
+        }
         __syncthreads();
         const float inv = shared.rms.inv;
 
+        // Scale phase: per-element independent math, all 512 threads.
+        const int pair0 = tid;
+        const int pair1 = tid + kMkThreads;
+        const float2 x0 = __bfloat1622float2(x[row_base + pair0]);
+        const float2 x1 = __bfloat1622float2(x[row_base + pair1]);
         const float2 w0 = __bfloat1622float2(weight[pair0]);
         const float2 w1 = __bfloat1622float2(weight[pair1]);
         out[row_base + pair0] = __floats2bfloat162_rn(x0.x * inv * (w0.x + 1.0f),
@@ -280,8 +314,11 @@ __device__ inline void mk_body_gated_norm128(const MkInstr& instr) {
         const __nv_bfloat162 v1 = x[base + lane + 32];
         xf[0] = __bfloat1622float2(v0);
         xf[1] = __bfloat1622float2(v1);
-        float sum = xf[0].x * xf[0].x + xf[0].y * xf[0].y + xf[1].x * xf[1].x +
-                    xf[1].y * xf[1].y;
+        // Engine route for Gated d=128 is rmsnorm_warp_bf16x2 (the d128 kernel
+        // is Plain-only): its per-lane sum adds PAIRWISE, sum += (x.x²+x.y²)
+        // per k — not one flat four-term chain. Grouping matters at ULP.
+        float sum = xf[0].x * xf[0].x + xf[0].y * xf[0].y;
+        sum += xf[1].x * xf[1].x + xf[1].y * xf[1].y;
         sum             = mk_warp_reduce_sum(sum);
         float inv       = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
         inv             = __shfl_sync(0xffffffffu, inv, 0);
@@ -338,7 +375,13 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int warps = kMkThreads / 32;
 
-    for (std::int64_t r = warp; r < rows; r += warps) {
+    // Consecutive rows per warp (2w, 2w+1 for a 32-row slice): the warp's two
+    // volleys stream adjacent 2KB code rows — DRAM row-buffer friendly, unlike
+    // the strided (w, w+16) walk. Per-row math and order unchanged (bit-exact).
+    const std::int64_t rows_per_warp = (rows + warps - 1) / warps;
+    for (std::int64_t rr = 0; rr < rows_per_warp; ++rr) {
+        const std::int64_t r = static_cast<std::int64_t>(warp) * rows_per_warp + rr;
+        if (r >= rows) { break; }
         const std::int64_t row        = row0 + r;
         const std::uint8_t* code_row  = codes + row * K;
         const std::uint8_t* scale_row = scales + row * kGroupsPerRow * 2;
@@ -497,8 +540,22 @@ __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
         float key[4];
         load_qk_norm(k + static_cast<std::int64_t>(h_qk) * kStateDim, key);
 
-        const float g_val    = g_arr[head];
-        const float beta_val = beta_arr[head];
+        // dim[7] != 0: gating transform folded into this body (kills the gg tape
+        // class and its arrival serialization). ptr[3] = ab (a[0..32), b[32..64)),
+        // ptr[4] = A_log, ptr[7] = dt_bias; identical arithmetic to the gg class
+        // on identical f32 inputs — bit-identical g/beta per head.
+        float g_val;
+        float beta_val;
+        if (instr.dim[7] != 0) {
+            const auto* dt_bias = static_cast<const float*>(instr.ptr[7]);
+            const float av      = g_arr[head] + dt_bias[head];
+            const float sp      = av > 20.0f ? av : log1pf(expf(av));
+            g_val               = -expf(beta_arr[head]) * sp;
+            beta_val            = 1.0f / (1.0f + expf(-g_arr[32 + head]));
+        } else {
+            g_val    = g_arr[head];
+            beta_val = beta_arr[head];
+        }
         const float alpha    = expf(g_val);
 
         float v_local = 0.0f;
@@ -654,16 +711,20 @@ __device__ __forceinline__ void q6_decode_eight(std::uint32_t packed, std::uint1
 
 // dot_two_rows<Q4Codec, 2048>: 8-value lane ownership, four adjacent groups per
 // warp transaction (verbatim engine loop, x read straight from global).
-__device__ __forceinline__ void q4_dot_two_rows(const std::uint8_t* codes,
-                                                const std::uint8_t* scales, int row0, int row1,
-                                                const __nv_bfloat16* x, float& result0,
-                                                float& result1) {
+// __noinline__: the dot gets its own register allocation instead of sharing the
+// interpreter switch's budget — with the full unroll every code/scale load for
+// both rows is issued up front, which is what hides the cold-DRAM latency of
+// random expert rows (the engine hides it with 2-3 CTAs/SM instead).
+__device__ __noinline__ float2 q4_dot_two_rows(const std::uint8_t* codes,
+                                               const std::uint8_t* scales, int row0, int row1,
+                                               const __nv_bfloat16* x) {
     constexpr int kGroups   = kHidden / 64;
     const int lane          = static_cast<int>(threadIdx.x) & 31;
     const int lane_group    = lane >> 3;
     const int lane_in_group = lane & 7;
     float acc0              = 0.0f;
     float acc1              = 0.0f;
+#pragma unroll
     for (int group_base = 0; group_base < kGroups; group_base += 4) {
         const int group           = group_base + lane_group;
         const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
@@ -690,19 +751,21 @@ __device__ __forceinline__ void q4_dot_two_rows(const std::uint8_t* codes,
             acc1 = fmaf(weights1[item], values[item], acc1);
         }
     }
-    result0 = mk_warp_reduce_sum(acc0);
-    result1 = mk_warp_reduce_sum(acc1);
+    return make_float2(mk_warp_reduce_sum(acc0), mk_warp_reduce_sum(acc1));
 }
 
 // dot_two_rows<W8Codec, 2048>: one value per lane per 32-group (verbatim).
-__device__ __forceinline__ void w8_dot_two_rows(const std::uint8_t* codes,
-                                                const std::uint8_t* scales, int row0, int row1,
-                                                const __nv_bfloat16* x, float& result0,
-                                                float& result1) {
+// __noinline__ + unroll: same isolation rationale as q4_dot_two_rows; 64 groups
+// unrolled is too many registers, so unroll by 8 (order of FMAs per acc chain is
+// program order either way — bit-exact).
+__device__ __noinline__ float2 w8_dot_two_rows(const std::uint8_t* codes,
+                                               const std::uint8_t* scales, int row0, int row1,
+                                               const __nv_bfloat16* x) {
     constexpr int kGroups = kHidden / 32;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc0            = 0.0f;
     float acc1            = 0.0f;
+#pragma unroll 8
     for (int group = 0; group < kGroups; ++group) {
         const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
         const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
@@ -718,8 +781,7 @@ __device__ __forceinline__ void w8_dot_two_rows(const std::uint8_t* codes,
         acc0           = fmaf(w0, xv, acc0);
         acc1           = fmaf(w1, xv, acc1);
     }
-    result0 = mk_warp_reduce_sum(acc0);
-    result1 = mk_warp_reduce_sum(acc1);
+    return make_float2(mk_warp_reduce_sum(acc0), mk_warp_reduce_sum(acc1));
 }
 
 // Two j-columns of one expert share every x load: gate/up for j and j+1 in one
@@ -902,16 +964,26 @@ __device__ __forceinline__ float q6_dot_fp32_row(const std::uint8_t* codes,
 __device__ __forceinline__ float w8_dot_fp32_row(const std::uint8_t* codes,
                                                  const std::uint8_t* scales, int row,
                                                  const float* x) {
+    // Engine d4 W8 shared path = dot_fp32_rows' 16-lane PAIR branch (W8Codec has
+    // no kPackedWord8): lane l < 16 owns k = group*32 + 2l, 2l+1, chained fmaf;
+    // lanes 16..31 contribute exact zeros to the same full-width reduce. The
+    // 32-lane single-value pattern gives a different per-lane partial split and
+    // thus ULP-different sums — this was the MoE half's token divergence.
     constexpr int kGroups = kIntermediate / 32;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc             = 0.0f;
-    for (int group = 0; group < kGroups; ++group) {
-        const std::int64_t index = static_cast<std::int64_t>(row) * kGroups + group;
-        const float scale        = __half2float(
-            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + index * 2)));
-        const float w =
-            static_cast<float>(static_cast<std::int8_t>(codes[index * 32 + lane])) * scale;
-        acc = fmaf(w, x[group * 32 + lane], acc);
+    if (lane < 16) {
+        for (int group = 0; group < kGroups; ++group) {
+            const std::int64_t index = static_cast<std::int64_t>(row) * kGroups + group;
+            const float scale        = __half2float(
+                __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + index * 2)));
+            const std::uint8_t* packed = codes + index * 32 + lane * 2;
+            const float w0 = static_cast<float>(static_cast<std::int8_t>(packed[0])) * scale;
+            const float w1 = static_cast<float>(static_cast<std::int8_t>(packed[1])) * scale;
+            const float2 xv = *reinterpret_cast<const float2*>(x + group * 32 + lane * 2);
+            acc             = fmaf(w0, xv.x, acc);
+            acc             = fmaf(w1, xv.y, acc);
+        }
     }
     return mk_warp_reduce_sum(acc);
 }
@@ -954,8 +1026,12 @@ __device__ inline void mk_body_moe_d1(const MkInstr& instr, MkShared& shared) {
 }
 
 // Top-8 select + softmax alpha + shared sigmoid scale: single warp (verbatim
-// sparse_moe_select_top8_warp).
-__device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
+// sparse_moe_select_top8_warp). When done2_counter is set (and counters passed),
+// the ids[] array is published mid-body right after the selection loop: d3 needs
+// ONLY ids, so it starts while this warp still computes softmax/shared-scale.
+// done2_limit stays 0 so the interpreter's per-slice done2 path never fires.
+__device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared,
+                                      std::uint32_t* counters) {
     const auto* scores = static_cast<const float*>(instr.ptr[0]);
     auto* shared_scale = const_cast<float*>(static_cast<const float*>(instr.ptr[1]));
     auto* ids          = static_cast<int*>(instr.out[0]);
@@ -964,25 +1040,28 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
     if (warp != 0) { return; }
     const int lane = static_cast<int>(threadIdx.x) & 31;
 
-    struct Ranked {
-        float value;
-        int id;
-        int origin;
+    // Same selection semantics (value desc, id asc), packed into one monotone
+    // u64 key so each tournament step is one 64-bit shfl+compare instead of
+    // three 32-bit shfls: hi32 = order-flipped float bits (desc), lo32 = ~id
+    // (asc tiebreak). The owner lane is recoverable as id & 31, so no origin
+    // field is needed. Identical comparator => identical ids and logits.
+    const auto key_of = [](float v, int id) {
+        std::uint32_t u = __float_as_uint(v);
+        u               = (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // asc in uint
+        return (static_cast<unsigned long long>(u) << 32) |
+               static_cast<std::uint32_t>(~id);
     };
-    const auto better = [](const Ranked& a, const Ranked& b) {
-        return a.value > b.value || (a.value == b.value && a.id < b.id);
-    };
-    Ranked local[8];
+    unsigned long long local[8];
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
         const int id = lane + item * 32;
-        local[item]  = {scores[id], id, lane};
+        local[item]  = key_of(scores[id], id);
     }
 #pragma unroll
     for (int i = 1; i < 8; ++i) {
-        const Ranked value = local[i];
-        int position       = i;
-        while (position > 0 && better(value, local[position - 1])) {
+        const unsigned long long value = local[i];
+        int position                   = i;
+        while (position > 0 && value > local[position - 1]) {
             local[position] = local[position - 1];
             --position;
         }
@@ -991,24 +1070,28 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
     int cursor = 0;
 #pragma unroll
     for (int rank = 0; rank < moe::kTopK; ++rank) {
-        Ranked candidate = cursor < 8 ? local[cursor] : Ranked{-CUDART_INF_F, 0x7fffffff, lane};
+        unsigned long long candidate =
+            cursor < 8 ? local[cursor] : key_of(-CUDART_INF_F, 0x7fffffff);
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            Ranked other;
-            other.value  = __shfl_down_sync(0xffffffffu, candidate.value, offset);
-            other.id     = __shfl_down_sync(0xffffffffu, candidate.id, offset);
-            other.origin = __shfl_down_sync(0xffffffffu, candidate.origin, offset);
-            if (better(other, candidate)) { candidate = other; }
+            const unsigned long long other =
+                __shfl_down_sync(0xffffffffu, candidate, offset);
+            if (other > candidate) { candidate = other; }
         }
-        candidate.value  = __shfl_sync(0xffffffffu, candidate.value, 0);
-        candidate.id     = __shfl_sync(0xffffffffu, candidate.id, 0);
-        candidate.origin = __shfl_sync(0xffffffffu, candidate.origin, 0);
+        candidate        = __shfl_sync(0xffffffffu, candidate, 0);
+        const int win_id = static_cast<int>(~static_cast<std::uint32_t>(candidate));
         if (lane == 0) {
-            ids[rank]                      = candidate.id;
-            shared.d2.selected_logits[rank] = candidate.value;
+            std::uint32_t u = static_cast<std::uint32_t>(candidate >> 32);
+            u               = (u & 0x80000000u) ? (u & 0x7fffffffu) : ~u;
+            ids[rank]                       = win_id;
+            shared.d2.selected_logits[rank] = __uint_as_float(u);
         }
-        if (lane == candidate.origin) { ++cursor; }
+        if (lane == (win_id & 31)) { ++cursor; }
         __syncwarp();
+    }
+    if (lane == 0 && counters != nullptr && instr.done2_counter != kMkNone) {
+        __threadfence();   // release: publish the ids[] stores made by this lane
+        atomicAdd(&counters[instr.done2_counter], 1u);
     }
     float exponential = 0.0f;
     if (lane < moe::kTopK) {
@@ -1023,9 +1106,15 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared) {
     }
 }
 
-// gate_up + silu*up. Tasks = 9 paths x js j-values, distributed over ALL 16
-// warps (each dot is warp-local, so any warp may own any task with identical
-// FP order).
+// gate_up + silu*up, engine-shaped locality: one slice = 16 CONSECUTIVE
+// j-columns of ONE path, one warp per j — the CTA's 16 warps stream two
+// contiguous 16KB windows (gate rows j0..j0+15, up rows 512+j0..) of a single
+// expert instead of scattering across all nine. dim[3] selects the class:
+//   dim[3]=1: SHARED path only (j = dim0+warp) — needs no ids, so the tape runs
+//     it concurrently with d1/d2, streaming the shared expert's 2MB while the
+//     router/top-8 would otherwise leave the bus idle.
+//   dim[3]=0: routed paths, linear index over 8*512 j's (path = lin>>9).
+// Per-output dot order identical to before — bit-exact.
 __device__ inline void mk_body_moe_d3(const MkInstr& instr, MkShared& shared) {
     (void)shared;
     const auto* x = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
@@ -1035,48 +1124,29 @@ __device__ inline void mk_body_moe_d3(const MkInstr& instr, MkShared& shared) {
     const auto* shared_codes  = static_cast<const std::uint8_t*>(instr.ptr[5]);
     const auto* shared_scales = static_cast<const std::uint8_t*>(instr.ptr[6]);
     auto* act                 = static_cast<float*>(instr.out[0]);
-    const int j0              = static_cast<int>(instr.dim[0]);
-    const int js              = static_cast<int>(instr.dim[1]);
+    const int lin             = static_cast<int>(instr.dim[0]) +
+                    (static_cast<int>(threadIdx.x) >> 5);   // one warp = one j
+    const bool shared_only = instr.dim[3] != 0;
 
-    const int warp  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int tasks = (moe::kTopK + 1) * js;
-
-    for (int task = warp; task < tasks; task += kMkThreads / 32) {
-        const int path = task / js;
-        const int j    = j0 + (task - path * js);
-        // Warm the NEXT task's expert rows in L2 while this task's FMAs run:
-        // d3 is latency-bound on random expert reads, not bandwidth-bound.
-        const int next = task + kMkThreads / 32;
-        if (instr.dim[7] != 0 && next < tasks) {
-            const int npath = next / js;
-            const int nj    = j0 + (next - npath * js);
-            const std::int64_t nrow =
-                npath < moe::kTopK
-                    ? static_cast<std::int64_t>(ids[npath]) * (2 * moe::kIntermediate) + nj
-                    : nj;
-            const auto* base = npath < moe::kTopK
-                                   ? routed_codes + nrow * (moe::kHidden / 64) * 32
-                                   : shared_codes + nrow * (moe::kHidden / 32) * 32;
-            if (lane < 16) {
-                asm volatile("prefetch.global.L2 [%0];" ::"l"(base + lane * 128));
-            }
-        }
-        float gate     = 0.0f;
-        float up       = 0.0f;
-        if (path < moe::kTopK) {
-            const int expert   = ids[path];
-            const int row_base = expert * (2 * moe::kIntermediate);
-            moe::q4_dot_two_rows(routed_codes, routed_scales, row_base + j,
-                                 row_base + moe::kIntermediate + j, x, gate, up);
-        } else {
-            moe::w8_dot_two_rows(shared_codes, shared_scales, j, moe::kIntermediate + j, x,
-                                 gate, up);
-        }
-        if (lane == 0) {
-            act[static_cast<std::int64_t>(path) * moe::kIntermediate + j] =
-                moe::mk_silu(gate) * up;
-        }
+    float2 gate_up;
+    int path;
+    int j;
+    if (shared_only) {
+        path    = moe::kTopK;
+        j       = lin;
+        gate_up = moe::w8_dot_two_rows(shared_codes, shared_scales, j,
+                                       moe::kIntermediate + j, x);
+    } else {
+        path               = lin >> 9;
+        j                  = lin & (moe::kIntermediate - 1);
+        const int expert   = ids[path];
+        const int row_base = expert * (2 * moe::kIntermediate);
+        gate_up = moe::q4_dot_two_rows(routed_codes, routed_scales, row_base + j,
+                                       row_base + moe::kIntermediate + j, x);
+    }
+    if ((static_cast<int>(threadIdx.x) & 31) == 0) {
+        act[static_cast<std::int64_t>(path) * moe::kIntermediate + j] =
+            moe::mk_silu(gate_up.x) * gate_up.y;
     }
 }
 
@@ -1099,48 +1169,36 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
 
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int tasks = (moe::kTopK + 1) * rows;
 
-    for (int task = warp; task < tasks; task += kMkThreads / 32) {
-        const int path = task / rows;
-        const int rr   = task - path * rows;
-        const int row  = row0 + rr;
-        const int next = task + kMkThreads / 32;
-        if (instr.dim[7] != 0 && next < tasks) {
-            const int npath = next / rows;
-            const int nrow  = row0 + (next - npath * rows);
-            const auto* base =
-                npath < moe::kTopK
-                    ? routed_codes + (static_cast<std::int64_t>(ids[npath]) * moe::kHidden +
-                                      nrow) *
-                                         ((moe::kIntermediate / 64) * 32)
-                    : shared_codes +
-                          static_cast<std::int64_t>(nrow) * ((moe::kIntermediate / 32) * 32);
-            if (lane < 2) {
-                asm volatile("prefetch.global.L2 [%0];" ::"l"(base + lane * 128));
+    // Path-major rounds: with rows == 16, round k puts all 16 warps on PATH k,
+    // warp w on row row0+w — the CTA streams one contiguous window of a single
+    // expert's down matrix per round instead of scattering across nine. Per-row
+    // dot order and the rank-ordered epilogue are unchanged (bit-exact).
+    for (int path = 0; path <= moe::kTopK; ++path) {
+        for (int rr = warp; rr < rows; rr += kMkThreads / 32) {
+            const int row = row0 + rr;
+            float scaled;
+            if (path < moe::kTopK) {
+                const int expert = ids[path];
+                const float dot =
+                    instr.dim[5] != 0
+                        ? moe::q6_dot_fp32_row(
+                              routed_codes, routed_high, routed_scales,
+                              expert * moe::kHidden + row,
+                              act + static_cast<std::int64_t>(path) * moe::kIntermediate)
+                        : moe::q5_dot_fp32_row(
+                              routed_codes, routed_high, routed_scales,
+                              expert * moe::kHidden + row,
+                              act + static_cast<std::int64_t>(path) * moe::kIntermediate);
+                scaled = alpha[path] * dot;
+            } else {
+                const float dot = moe::w8_dot_fp32_row(
+                    shared_codes, shared_scales, row,
+                    act + static_cast<std::int64_t>(moe::kTopK) * moe::kIntermediate);
+                scaled = *shared_scale * dot;
             }
+            if (lane == 0) { shared.d4.paths[path][rr] = scaled; }
         }
-        float scaled;
-        if (path < moe::kTopK) {
-            const int expert = ids[path];
-            const float dot =
-                instr.dim[5] != 0
-                    ? moe::q6_dot_fp32_row(
-                          routed_codes, routed_high, routed_scales,
-                          expert * moe::kHidden + row,
-                          act + static_cast<std::int64_t>(path) * moe::kIntermediate)
-                    : moe::q5_dot_fp32_row(
-                          routed_codes, routed_high, routed_scales,
-                          expert * moe::kHidden + row,
-                          act + static_cast<std::int64_t>(path) * moe::kIntermediate);
-            scaled = alpha[path] * dot;
-        } else {
-            const float dot = moe::w8_dot_fp32_row(
-                shared_codes, shared_scales, row,
-                act + static_cast<std::int64_t>(moe::kTopK) * moe::kIntermediate);
-            scaled = *shared_scale * dot;
-        }
-        if (lane == 0) { shared.d4.paths[path][rr] = scaled; }
     }
     __syncthreads();
     for (int rr = warp; rr < rows; rr += kMkThreads / 32) {
@@ -1157,7 +1215,204 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
     __syncthreads();
 }
 
-__device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& shared) {
+#ifdef NINFER_MK_ENGINE
+
+namespace fg {
+constexpr int kHeads       = 32;
+constexpr int kHidden      = 2048;
+constexpr int kBlockN      = 64;
+constexpr int kBlockM      = 16;
+constexpr int kBlockK      = 64;
+constexpr int kStages      = 2;
+constexpr int kSplitK      = 32;
+constexpr int kWarps       = 8;    // author's 35B split-32 specialization
+constexpr int kThreads     = kWarps * 32;
+constexpr int kWarpN       = kBlockN / kWarps;   // 8
+constexpr int kXStage      = kBlockN * kBlockK;  // 4096
+constexpr int kWStage      = kBlockM * kBlockK;  // 1024
+constexpr int kPartialRows = 2 * kHeads;         // 64
+constexpr int kNormOffset  = kSplitK * kPartialRows;   // 2048
+
+__device__ __forceinline__ int swz(int row, int col) {
+    return (col & ~63) + ninfer::ops::detail::gemm_swz64(row, col & 63);
+}
+__device__ __forceinline__ void bar256() { asm volatile("bar.sync 1, 256;" ::: "memory"); }
+} // namespace fg
+
+// Fused gating phase A: one slice = one (split, head-tile) CTA of the author's
+// bf16_gdn_gating_proj_gemm_mma_kernel<Bf16Gdn35Geometry, SplitK=32,
+// FullTokens=false, Warps=8, NormalizeInput=true> at t = 1. The smem swizzle,
+// ldmatrix fragments and mma sequence are transplanted verbatim, so token 0's
+// a/b partials and the per-split norm sums match the engine bit-for-bit.
+// Only warps 0..7 participate (named barrier 1, 256 threads); __noinline__
+// keeps the cp.async/ldmatrix machinery out of the interpreter's regalloc.
+__device__ __noinline__ void mk_fused_gate_a_impl(const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ norm_w,
+                                                  const __nv_bfloat16* __restrict__ a_w,
+                                                  const __nv_bfloat16* __restrict__ b_w,
+                                                  float* __restrict__ partial, int split,
+                                                  int head0, __nv_bfloat16* __restrict__ smem) {
+    using namespace fg;
+    const int tid      = static_cast<int>(threadIdx.x);   // 0..255
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int gid      = lane >> 2;
+    const int lid      = lane & 3;
+    const int kt_begin = split;   // kTilesPerSplit == 1 for 2048/64/32
+    const int k0       = kt_begin * kBlockK;
+
+    __nv_bfloat16* xs  = smem;
+    __nv_bfloat16* aws = xs + kStages * kXStage;
+    __nv_bfloat16* bws = aws + kStages * kWStage;
+
+    // Author's norm slice: warp 0 of row-tile 0 contributes sum(x^2) over this
+    // split's 64 elements (raw x, not the gain-scaled staging values).
+    if (head0 == 0 && warp == 0) {
+        const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+        float sum      = 0.0f;
+        for (int pair = lane; pair < kBlockK / 2; pair += 32) {
+            const float2 v = __bfloat1622float2(x2[kt_begin * (kBlockK / 2) + pair]);
+            sum += v.x * v.x + v.y * v.y;
+        }
+        sum = mk_warp_reduce_sum(sum);
+        if (lane == 0) { partial[kNormOffset + split] = sum; }
+    }
+
+    {   // stage_load(stage 0, kt_begin) — exact body at t = 1
+        for (int vec = tid; vec < kBlockN * (kBlockK / 8); vec += kThreads) {
+            const int token_local = vec / (kBlockK / 8);
+            const int kk          = (vec - token_local * (kBlockK / 8)) * 8;
+            __nv_bfloat16* dst = &xs[token_local * kBlockK + swz(token_local, kk)];
+            if (token_local == 0) {
+                const auto* source = reinterpret_cast<const __nv_bfloat162*>(&x[k0 + kk]);
+                const auto* gain   = reinterpret_cast<const __nv_bfloat162*>(&norm_w[k0 + kk]);
+                auto* target       = reinterpret_cast<__nv_bfloat162*>(dst);
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    const float2 value  = __bfloat1622float2(source[pair]);
+                    const float2 weight = __bfloat1622float2(gain[pair]);
+                    target[pair] = __floats2bfloat162_rn(value.x * (1.0f + weight.x),
+                                                         value.y * (1.0f + weight.y));
+                }
+            } else {
+                *reinterpret_cast<uint4*>(dst) = uint4{0, 0, 0, 0};
+            }
+        }
+        const int weight_vecs = kBlockM * (kBlockK / 8);   // 128
+        for (int all_vec = tid; all_vec < 2 * weight_vecs; all_vec += kThreads) {
+            const bool is_b    = all_vec >= weight_vecs;
+            const int vec      = is_b ? all_vec - weight_vecs : all_vec;
+            const int row      = vec / (kBlockK / 8);
+            const int kk       = (vec - row * (kBlockK / 8)) * 8;
+            __nv_bfloat16* dst = (is_b ? bws : aws) + row * kBlockK + swz(row, kk);
+            const __nv_bfloat16* weight = is_b ? b_w : a_w;
+            cp_async<16, Cache::cg>(
+                dst, &weight[static_cast<std::int64_t>(head0 + row) * kHidden + k0 + kk]);
+        }
+    }
+    cp_commit();
+    cp_commit();   // author's empty second-stage commit
+    cp_wait<kStages - 1>();
+    bar256();
+
+    float a_acc[4] = {};
+    float b_acc[4] = {};
+    const int a_mat    = lane >> 3;
+    const int a_rin    = lane & 7;
+    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    const int x_rin    = lane & 7;
+    const int x_koff   = ((lane >> 3) & 1) << 3;
+
+#pragma unroll
+    for (int ki = 0; ki < kBlockK / 16; ++ki) {
+        unsigned xf0;
+        unsigned xf1;
+        const int xrow = warp * kWarpN + x_rin;
+        const int xcol = ki * 16 + x_koff;
+        ldmatrix_x2(xf0, xf1, smem_addr(&xs[xrow * kBlockK + swz(xrow, xcol)]));
+        unsigned af[4], bf[4];
+        const int arow = a_rowoff;
+        const int acol = ki * 16 + a_coloff;
+        ldmatrix_x4(af[0], af[1], af[2], af[3],
+                    smem_addr(&aws[arow * kBlockK + swz(arow, acol)]));
+        ldmatrix_x4(bf[0], bf[1], bf[2], bf[3],
+                    smem_addr(&bws[arow * kBlockK + swz(arow, acol)]));
+        mma_bf16(a_acc[0], a_acc[1], a_acc[2], a_acc[3], af[0], af[1], af[2], af[3], xf0, xf1);
+        mma_bf16(b_acc[0], b_acc[1], b_acc[2], b_acc[3], bf[0], bf[1], bf[2], bf[3], xf0, xf1);
+    }
+
+    // t == 1: only token-column 0 stores land (warp 0, lid 0 lanes).
+    const int col0 = warp * kWarpN + 2 * lid;
+    if (col0 == 0) {
+        const int row0                              = head0 + gid;
+        const int row1                              = row0 + 8;
+        float* base                                 = partial + split * kPartialRows;
+        base[row0]                                  = a_acc[0];
+        base[kHeads + row0]                         = b_acc[0];
+        base[row1]                                  = a_acc[2];
+        base[kHeads + row1]                         = b_acc[2];
+    }
+    bar256();   // slice reuse: next pop's stage_load must not race these reads
+}
+
+__device__ inline void mk_body_fused_gate_a(const MkInstr& instr, MkShared& shared) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (warp >= fg::kWarps) { return; }
+    const int lin = static_cast<int>(instr.dim[0]);
+    mk_fused_gate_a_impl(static_cast<const __nv_bfloat16*>(instr.ptr[0]),
+                         static_cast<const __nv_bfloat16*>(instr.ptr[1]),
+                         static_cast<const __nv_bfloat16*>(instr.ptr[2]),
+                         static_cast<const __nv_bfloat16*>(instr.ptr[3]),
+                         static_cast<float*>(instr.out[0]), lin & 31, (lin >> 5) * 16,
+                         shared.fg.stage);
+}
+
+// Phase B: the author's post-grid-sync epilogue — ordered split reduction for
+// the norm (s = 0..31), h = x * inv * (1 + w) elementwise, then a/b ordered
+// reduction scaled by inv and the gating transform. Bit-identical to the
+// engine's cooperative handoff.
+__device__ inline void mk_body_fused_gate_b(const MkInstr& instr) {
+    const auto* x       = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
+    const auto* norm_w  = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
+    const auto* partial = static_cast<const float*>(instr.ptr[2]);
+    const auto* a_log   = static_cast<const float*>(instr.ptr[3]);
+    const auto* dt_bias = static_cast<const float*>(instr.ptr[4]);
+    auto* beta          = const_cast<float*>(static_cast<const float*>(instr.ptr[5]));
+    auto* h             = static_cast<__nv_bfloat16*>(instr.out[0]);
+    auto* g             = static_cast<float*>(instr.out[1]);
+    const float eps     = __int_as_float(static_cast<int>(instr.dim[1]));
+
+    const float* norm_partial = partial + fg::kNormOffset;
+    float sum                 = 0.0f;
+#pragma unroll
+    for (int s = 0; s < fg::kSplitK; ++s) { sum += norm_partial[s]; }
+    const float inv = rsqrtf(sum / static_cast<float>(fg::kHidden) + eps);
+
+    for (int i = static_cast<int>(threadIdx.x); i < fg::kHidden; i += kMkThreads) {
+        const float value  = __bfloat162float(x[i]);
+        const float weight = __bfloat162float(norm_w[i]);
+        h[i]               = __float2bfloat16_rn(value * inv * (1.0f + weight));
+    }
+    for (int i = static_cast<int>(threadIdx.x); i < fg::kHeads; i += kMkThreads) {
+        float av = 0.0f;
+        float bv = 0.0f;
+#pragma unroll
+        for (int s = 0; s < fg::kSplitK; ++s) {
+            av += partial[s * fg::kPartialRows + i];
+            bv += partial[s * fg::kPartialRows + fg::kHeads + i];
+        }
+        av *= inv;
+        bv *= inv;
+        g[i]    = -expf(a_log[i]) * softplus(av + dt_bias[i]);
+        beta[i] = sigmoid(bv);
+    }
+}
+
+#endif // NINFER_MK_ENGINE
+
+__device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& shared,
+                                           std::uint32_t* counters) {
     switch (instr.op) {
     case MkOp::RmsNorm2048:
         mk_body_rmsnorm2048(instr, shared);
@@ -1194,13 +1449,23 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         mk_body_moe_d1(instr, shared);
         return;
     case MkOp::MoeD2:
-        mk_body_moe_d2(instr, shared);
+        mk_body_moe_d2(instr, shared, counters);
         return;
     case MkOp::MoeD3:
         mk_body_moe_d3(instr, shared);
         return;
     case MkOp::MoeD4:
         mk_body_moe_d4(instr, shared);
+        return;
+    case MkOp::FusedGateA:
+#ifdef NINFER_MK_ENGINE
+        mk_body_fused_gate_a(instr, shared);
+#endif
+        return;
+    case MkOp::FusedGateB:
+#ifdef NINFER_MK_ENGINE
+        mk_body_fused_gate_b(instr);
+#endif
         return;
     case MkOp::Halt:
     case MkOp::Noop:
@@ -1212,7 +1477,7 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_ref_generic_kernel(MkInstr i
     __shared__ MkShared shared;
     MkInstr local = instr;
     local.dim[0]  = instr.dim[0] + static_cast<std::int64_t>(blockIdx.x) * instr.dim[1];
-    mk_execute(local, shared);
+    mk_execute(local, shared, nullptr);
 }
 
 // ---- the interpreter -------------------------------------------------------
@@ -1224,8 +1489,26 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_ref_generic_kernel(MkInstr i
 // exact future assignment is unknown; the CTA's grid rank approximates its
 // first-wave slice.
 __device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned rank) {
-    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8DecodeConv) { return; }
     if (rank >= instr.slice_count) { return; }
+    if (instr.op == MkOp::FusedGateA) {
+        // Warm this slice's a/b weight tile (16 rows x 64 k each) while waiting
+        // on the previous layer's tail — hides the tile's DRAM latency.
+        const int lin   = static_cast<int>(instr.dim[0]) + static_cast<int>(rank);
+        const int split = lin & 31;
+        const int head0 = (lin >> 5) * 16;
+        const auto* aw  = static_cast<const char*>(instr.ptr[2]);
+        const auto* bw  = static_cast<const char*>(instr.ptr[3]);
+        const int row   = static_cast<int>(threadIdx.x) & 15;
+        const std::int64_t off =
+            (static_cast<std::int64_t>(head0 + row) * 2048 + split * 64) * 2;
+        if (threadIdx.x < 16) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(aw + off));
+        } else if (threadIdx.x < 32) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(bw + off));
+        }
+        return;
+    }
+    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8DecodeConv) { return; }
     const auto* codes        = static_cast<const char*>(instr.ptr[1]);
     const std::int64_t row0  = instr.dim[0] + static_cast<std::int64_t>(rank) * instr.dim[1];
     const std::int64_t base  = row0 * instr.dim[2];
@@ -1236,12 +1519,28 @@ __device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned
     }
 }
 
+__device__ __forceinline__ unsigned long long mk_globaltimer() {
+    unsigned long long gt;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gt));
+    return gt;
+}
+
+// Prof-v2 wall-span attribution (all pointers null outside prof mode):
+//   span_min/span_max: per tape index, first work-start / last slice-end in
+//   globaltimer ns (reset to ~0/0 each round by begin_round's memset nodes, so
+//   after a run they hold the LAST round's timeline — graph replays included).
+//   seg_stamp: [seg] = min kernel entry, [32+seg] = max kernel exit per segment.
 __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
     const MkStream* __restrict__ streams, std::uint32_t* __restrict__ counters,
     int enable_prefetch, unsigned long long* __restrict__ wait_ns,
-    unsigned long long* __restrict__ exec_ns) {
+    unsigned long long* __restrict__ exec_ns, unsigned long long* __restrict__ span_min,
+    unsigned long long* __restrict__ span_max, unsigned long long* __restrict__ seg_stamp,
+    int seg_idx) {
     __shared__ MkShared shared;
     __shared__ std::uint32_t slice_shared;
+    if (seg_stamp != nullptr && threadIdx.x == 0) {
+        atomicMin(&seg_stamp[seg_idx], mk_globaltimer());
+    }
     const MkStream stream = streams[blockIdx.x];
     for (std::uint32_t i = 0; i < stream.count; ++i) {
         const unsigned long long t_enter = wait_ns != nullptr ? clock64() : 0;
@@ -1256,8 +1555,18 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             __syncthreads();
         }
         if (enable_prefetch != 0) { mk_prefetch_slice(instr_s, blockIdx.x); }
+        if (i == 0) {
+            // PDL: when this segment is launched as a programmatic dependent of
+            // the attention island's last kernel (which triggers at its head),
+            // everything above — tape broadcast, first-class weight prefetch —
+            // overlapped the island. Data reads gate here on its full completion.
+            // No-op for eager launches without upstream dependencies.
+            cudaGridDependencySynchronize();
+        }
         mk_wait_phase(instr_s, counters);
         const unsigned long long t_ready = wait_ns != nullptr ? clock64() : 0;
+        unsigned long long gt_ready      = 0;
+        if (span_min != nullptr && threadIdx.x == 0) { gt_ready = mk_globaltimer(); }
         // First pop; afterwards the done-post of slice N and the pop of slice N+1
         // share one thread-0 critical section (2 barriers per slice, not 3).
         if (threadIdx.x == 0) { slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u); }
@@ -1272,7 +1581,7 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             // where the bus would otherwise idle.
             MkInstr local = instr_s;
             local.dim[0] = instr_s.dim[0] + static_cast<std::int64_t>(idx) * instr_s.dim[1];
-            mk_execute(local, shared);
+            mk_execute(local, shared, counters);
             __syncthreads();
             if (threadIdx.x == 0) {
                 if (batch_post) {
@@ -1300,7 +1609,14 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             const unsigned long long t_done = clock64();
             atomicAdd(&wait_ns[i], t_ready - t_enter);
             atomicAdd(&exec_ns[i], t_done - t_ready);
+            if (span_min != nullptr) {
+                atomicMin(&span_min[i], gt_ready);
+                atomicMax(&span_max[i], mk_globaltimer());
+            }
         }
+    }
+    if (seg_stamp != nullptr && threadIdx.x == 0) {
+        atomicMax(&seg_stamp[32 + seg_idx], mk_globaltimer());
     }
 }
 

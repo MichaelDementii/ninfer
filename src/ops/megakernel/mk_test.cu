@@ -67,11 +67,12 @@ constexpr int kRouterRows = kExperts + 1;
 constexpr int kTopK       = 8;
 constexpr int kMoeInter   = 512;
 constexpr int kD1Slices   = (kRouterRows + 1) / 2;      // 129 (2 rows per CTA)
-constexpr int kD3JSlice   = 4;
-constexpr int kD3Slices   = kMoeInter / kD3JSlice;      // 128
-constexpr int kD4RowSlice = 8;
+constexpr int kD3JBlock       = 16;   // consecutive j per slice, one warp per j
+constexpr int kD3SharedSlices = kMoeInter / kD3JBlock;            // 32
+constexpr int kD3RoutedSlices = 8 * kMoeInter / kD3JBlock;        // 256
+constexpr int kD4RowSlice = 16;
 constexpr int kD4Slices   = kHidden / kD4RowSlice;      // 256
-constexpr int kCtr        = 25;   // 13 dep + 12 pop counters per layer
+constexpr int kCtr        = 27;   // 14 dep + 13 pop counters per layer (d3 split)
 
 __global__ void fill_codes_kernel(std::uint8_t* data, std::size_t n, std::uint32_t seed) {
     const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -392,7 +393,7 @@ int main() {
         instr.dim[1]  = 1;
         return instr;
     };
-    auto make_d3 = [&](int l) {
+    auto make_d3 = [&](int l, bool shared_only) {
         MkInstr instr = blank();
         instr.op      = MkOp::MoeD3;
         instr.ptr[0]  = d_h2;
@@ -403,7 +404,8 @@ int main() {
         instr.ptr[6]  = d_sgu_scales[l];
         instr.out[0]  = d_act;
         instr.dim[0]  = 0;
-        instr.dim[1]  = kD3JSlice;
+        instr.dim[1]  = kD3JBlock;
+        instr.dim[3]  = shared_only ? 1 : 0;
         return instr;
     };
     auto make_d4 = [&](int l) {
@@ -520,9 +522,18 @@ int main() {
         d2.wait_target[0]  = kD1Slices;
         tape.push_back(d2);
 
-        MkInstr d3         = make_d3(l);
+        MkInstr d3s        = make_d3(l, true);
+        d3s.task_counter   = kCtr * l + 25;
+        d3s.slice_count    = kD3SharedSlices;
+        d3s.done_counter   = kCtr * l + 24;
+        d3s.wait_counter[0] = kCtr * l + 7;
+        d3s.wait_target[0]  = 1;
+        d3s.dim[6] = 1;
+        tape.push_back(d3s);
+
+        MkInstr d3         = make_d3(l, false);
         d3.task_counter    = kCtr * l + 22;
-        d3.slice_count     = kD3Slices;
+        d3.slice_count     = kD3RoutedSlices;
         d3.done_counter    = kCtr * l + 10;
         d3.wait_counter[0] = kCtr * l + 9;
         d3.wait_target[0]  = 1;
@@ -534,7 +545,11 @@ int main() {
         d4.slice_count     = kD4Slices;
         d4.done_counter    = kCtr * l + 11;
         d4.wait_counter[0] = kCtr * l + 10;
-        d4.wait_target[0]  = kD3Slices;
+        d4.wait_target[0]  = kD3RoutedSlices;
+        d4.wait_counter[1] = kCtr * l + 24;
+        d4.wait_target[1]  = kD3SharedSlices;
+        d4.wait_counter[2] = kCtr * l + 9;
+        d4.wait_target[2]  = 1;
         d4.dim[6] = 1;
         tape.push_back(d4);
     }
@@ -576,14 +591,16 @@ int main() {
             mk_ref_rmsnorm_kernel<<<1, kMkThreads, 0, stream>>>(make_norm2(l));
             mk_ref_generic_kernel<<<kD1Slices, kMkThreads, 0, stream>>>(make_d1(l));
             mk_ref_generic_kernel<<<1, kMkThreads, 0, stream>>>(make_d2());
-            mk_ref_generic_kernel<<<kD3Slices, kMkThreads, 0, stream>>>(make_d3(l));
+            mk_ref_generic_kernel<<<kD3SharedSlices, kMkThreads, 0, stream>>>(make_d3(l, true));
+            mk_ref_generic_kernel<<<kD3RoutedSlices, kMkThreads, 0, stream>>>(make_d3(l, false));
             mk_ref_generic_kernel<<<kD4Slices, kMkThreads, 0, stream>>>(make_d4(l));
         }
     };
     auto run_mk = [&](cudaStream_t stream, int prefetch) {
         CHECK(cudaMemsetAsync(d_counters, 0, counter_count * sizeof(std::uint32_t), stream));
         mk_interpreter_kernel<<<n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, prefetch,
-                                                               nullptr, nullptr);
+                                                               nullptr, nullptr, nullptr,
+                                                               nullptr, nullptr, 0);
     };
 
     cudaStream_t stream;
@@ -654,7 +671,8 @@ int main() {
     reset_all();
     CHECK(cudaMemsetAsync(d_counters, 0, counter_count * sizeof(std::uint32_t), stream));
     mk_interpreter_kernel<<<n_sm, kMkThreads, 0, stream>>>(d_streams, d_counters, 1, d_wait_ns,
-                                                           d_exec_ns);
+                                                           d_exec_ns, nullptr, nullptr,
+                                                           nullptr, 0);
     CHECK(cudaStreamSynchronize(stream));
     std::vector<unsigned long long> wait_h(tape.size()), exec_h(tape.size());
     CHECK(cudaMemcpy(wait_h.data(), d_wait_ns, tape.size() * sizeof(unsigned long long),

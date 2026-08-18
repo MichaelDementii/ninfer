@@ -70,6 +70,12 @@ enum class MkOp : std::uint32_t {
                      // ptr2=shared_scale, ptr3=act, ptr4..6=routed Q5 codes/high/scales,
                      // ptr7=shared W8 codes, out1=shared W8 scales, out0=destination(x);
                      // dim0=row0, dim1=rows
+    FusedGateA,      // author's fused norm+gating mma, one slice = one (split, head
+                     // tile) CTA at t=1: ptr0=x, ptr1=norm_w, ptr2=a_w, ptr3=b_w,
+                     // out0=partial (32x64 a/b + 32 norm sums); dim0=lin slice
+    FusedGateB,      // split reduce in author's order: ptr0=x, ptr1=norm_w,
+                     // ptr2=partial, ptr3=A_log, ptr4=dt_bias, ptr5=beta out,
+                     // out0=h (bf16 2048), out1=g; dim1=eps bits
     Noop,
 };
 
@@ -146,6 +152,10 @@ union MkShared {
     struct {
         float paths[9][32];        // rank-ordered FP32 down epilogue, 32 rows/slice
     } d4;
+    struct {
+        // fused gating stages: 2 x (64x64 x tile + 2 x 16x64 weight tiles) bf16
+        alignas(16) __nv_bfloat16 stage[2 * (64 * 64 + 2 * 16 * 64)];
+    } fg;
     MkInstr instr_broadcast;
 };
 
