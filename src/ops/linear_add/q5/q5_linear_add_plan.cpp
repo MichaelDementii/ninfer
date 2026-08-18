@@ -46,11 +46,9 @@ constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kK4096Routes{{
+constexpr std::array<RouteSpec, 4> kK4096Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{2, 48}, Q5LinearAddScheduleId::SplitKMmaExactTResidual},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
@@ -97,6 +95,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.gemv.residual";
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::SplitKMmaExactTResidual:
+        return "linear_add.q5.mma.splitk.exact.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         return "linear_add.q5.mma.r64.c16.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
@@ -155,6 +155,9 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::SplitKMmaExactTResidual:
+        q5_linear_add_splitk_mma_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
