@@ -150,6 +150,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     std::int32_t split_count, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
+    if (threadIdx.x == 0) { cudaTriggerProgrammaticLaunchCompletion(); }
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
