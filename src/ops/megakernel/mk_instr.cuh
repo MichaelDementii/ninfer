@@ -198,7 +198,7 @@ __device__ __forceinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restric
             const float scale = __half2float(__ushort_as_half(scale_bits));
 
             const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
-            const uint2 packed = *reinterpret_cast<const uint2*>(code_row + phase_k);
+            const uint2 packed = __ldcs(reinterpret_cast<const uint2*>(code_row + phase_k));
             float weights[kValuesPerLane];
 #pragma unroll
             for (int word_index = 0; word_index < 2; ++word_index) {
@@ -399,7 +399,7 @@ __device__ __forceinline__ void mk_w8_decode_conv_rows(
             scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
             const float scale = __half2float(__ushort_as_half(scale_bits));
             const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
-            const uint2 packed = *reinterpret_cast<const uint2*>(code_row + phase_k);
+            const uint2 packed = __ldcs(reinterpret_cast<const uint2*>(code_row + phase_k));
             float weights[kValuesPerLane];
 #pragma unroll
             for (int word_index = 0; word_index < 2; ++word_index) {
@@ -1271,7 +1271,7 @@ __device__ __forceinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict
             scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
             const float scale = __half2float(__ushort_as_half(scale_bits));
             const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
-            const uint2 packed = *reinterpret_cast<const uint2*>(code_row + phase_k);
+            const uint2 packed = __ldcs(reinterpret_cast<const uint2*>(code_row + phase_k));
             float weights[kValuesPerLane];
 #pragma unroll
             for (int word_index = 0; word_index < 2; ++word_index) {
