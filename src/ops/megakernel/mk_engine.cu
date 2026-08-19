@@ -419,6 +419,7 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     in.done_counter    = r.alloc_ctr();
     in.done2_counter   = r.alloc_ctr();
     in.done2_limit     = kHeadSlices / 2;
+    in.dim[6]          = 1;
     in.wait_counter[0] = c_norm;
     in.wait_target[0]  = 1;
     const std::uint32_t c_in      = in.done_counter;

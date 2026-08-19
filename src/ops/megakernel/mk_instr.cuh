@@ -1815,13 +1815,23 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
         if (threadIdx.x == 0) { slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u); }
         __syncthreads();
         std::uint32_t idx = slice_shared;
-        std::uint32_t done_local = 0;
+        std::uint32_t done_local  = 0;
+        std::uint32_t done2_local = 0;
         const bool batch_post    = instr_s.dim[6] != 0;
         while (idx < instr_s.slice_count) {
             // No in-loop prefetch: with DRAM already saturated by demand streaming,
             // extra prefetch instructions only add memory-pipe pressure (measured
             // +10% regression). Prefetch pays off solely inside dependency waits,
             // where the bus would otherwise idle.
+            if (threadIdx.x == 0 && done2_local != 0 && idx >= instr_s.done2_limit) {
+                // Monotonic popping: a CTA that reached the tail region can never
+                // claim another head slice, so its done2 share is final. Posting
+                // BEFORE this tail slice runs keeps the head-chunk consumers on the
+                // per-slice release timing while paying one fence+atomic per CTA.
+                __threadfence();
+                atomicAdd(&counters[instr_s.done2_counter], done2_local);
+                done2_local = 0;
+            }
             MkInstr local = instr_s;
             local.dim[0] = instr_s.dim[0] + static_cast<std::int64_t>(idx) * instr_s.dim[1];
             mk_execute(local, shared, counters);
@@ -1829,6 +1839,9 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             if (threadIdx.x == 0) {
                 if (batch_post) {
                     ++done_local;
+                    if (instr_s.done2_counter != kMkNone && idx < instr_s.done2_limit) {
+                        ++done2_local;
+                    }
                 } else {
                     __threadfence();
                     if (instr_s.done_counter != kMkNone) {
@@ -1843,10 +1856,15 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             __syncthreads();
             idx = slice_shared;
         }
-        if (batch_post && threadIdx.x == 0 && done_local != 0 &&
-            instr_s.done_counter != kMkNone) {
+        if (batch_post && threadIdx.x == 0 &&
+            (done_local != 0 || done2_local != 0)) {
             __threadfence();
-            atomicAdd(&counters[instr_s.done_counter], done_local);
+            if (done2_local != 0 && instr_s.done2_counter != kMkNone) {
+                atomicAdd(&counters[instr_s.done2_counter], done2_local);
+            }
+            if (done_local != 0 && instr_s.done_counter != kMkNone) {
+                atomicAdd(&counters[instr_s.done_counter], done_local);
+            }
         }
         if (wait_ns != nullptr && threadIdx.x == 0) {
             const unsigned long long t_done = clock64();
