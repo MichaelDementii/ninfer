@@ -1329,16 +1329,41 @@ __device__ __forceinline__ void mk_body_attn_qkv(const MkInstr& instr) {
 // Engine route for Offset d=256 is rmsnorm_warp_bf16x2<Offset,512>: one warp per
 // row, four bf16x2 pairs per lane (lane + k*32, k = 0..3), PAIRWISE += sums,
 // inv = rsqrtf(sum/d + eps), out-of-place epilogue x*inv*(w+1).
+// rope_fixed_kernel<Text1D, 16, 2> at T = 1: the engine's exact frequency table,
+// sincosf per pair, in-place half-rotation of qn (16 heads) and kn (2 heads).
+__device__ __constant__ float mk_rope_inv_freq[32] = {
+    1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
+    8.058421878e-02F, 4.869675252e-02F, 2.942727176e-02F, 1.778279410e-02F, 1.074607828e-02F,
+    6.493816316e-03F, 3.924189758e-03F, 2.371373706e-03F, 1.433012570e-03F, 8.659643234e-04F,
+    5.232991147e-04F, 3.162277660e-04F, 1.910952975e-04F, 1.154781985e-04F, 6.978305849e-05F,
+    4.216965034e-05F, 2.548296748e-05F, 1.539926526e-05F, 9.305720409e-06F, 5.623413252e-06F,
+    3.398208329e-06F, 2.053525026e-06F, 1.240937761e-06F, 7.498942093e-07F, 4.531583638e-07F,
+    2.738419634e-07F, 1.654817100e-07F,
+};
+
 __device__ inline void mk_body_norm_qk(const MkInstr& instr) {
     const auto* x      = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
     const auto* weight = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
     auto* out          = static_cast<__nv_bfloat162*>(instr.out[0]);
     const std::int64_t rows = instr.dim[0];
     const float eps         = __int_as_float(static_cast<int>(instr.dim[1]));
+    const bool rope         = instr.dim[3] != 0;
 
     constexpr int kPairs = 128;   // d = 256
     const int lane       = static_cast<int>(threadIdx.x) & 31;
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
+
+    // Fused rotary tail: same per-pair angles as mk_body_rope_qk / rope_fixed.
+    // Lane l < 16 holds the "first" bf162 of rotation pair (l), lane l+16 holds
+    // its "second" (k = 0 chunk covers dims 0..63 = the rotary window).
+    float c0 = 0.0f, c1 = 0.0f, s0 = 0.0f, s1 = 0.0f;
+    if (rope) {
+        const auto* positions = static_cast<const std::int32_t*>(instr.ptr[2]);
+        const float pos       = static_cast<float>(positions[0]);
+        const int p           = (lane & 15) * 2;
+        sincosf(pos * mk_rope_inv_freq[p], &s0, &c0);
+        sincosf(pos * mk_rope_inv_freq[p + 1], &s1, &c1);
+    }
 
     for (std::int64_t row = warp; row < rows; row += kMkThreads / 32) {
         const std::int64_t row_base = row * kPairs;
@@ -1354,28 +1379,37 @@ __device__ inline void mk_body_norm_qk(const MkInstr& instr) {
         sum       = mk_warp_reduce_sum(sum);
         float inv = lane == 0 ? rsqrtf(sum / 256.0f + eps) : 0.0f;
         inv       = __shfl_sync(0xffffffffu, inv, 0);
+        __nv_bfloat162 rounded[4];
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const int pair  = lane + k * 32;
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
-            out[row_base + pair] = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
-                                                         xf.y * inv * (wf.y + 1.0f));
+            rounded[k] = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
+                                               xf.y * inv * (wf.y + 1.0f));
+        }
+        if (rope) {
+            const unsigned mine_u    = *reinterpret_cast<const unsigned*>(&rounded[0]);
+            const unsigned partner_u = __shfl_xor_sync(0xffffffffu, mine_u, 16);
+            __nv_bfloat162 partner;
+            *reinterpret_cast<unsigned*>(&partner) = partner_u;
+            const float2 first  = __bfloat1622float2(lane < 16 ? rounded[0] : partner);
+            const float2 second = __bfloat1622float2(lane < 16 ? partner : rounded[0]);
+            if (lane < 16) {
+                rounded[0] = __floats2bfloat162_rn(first.x * c0 - second.x * s0,
+                                                   first.y * c1 - second.y * s1);
+            } else {
+                rounded[0] = __floats2bfloat162_rn(second.x * c0 + first.x * s0,
+                                                   second.y * c1 + first.y * s1);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            out[row_base + lane + k * 32] = rounded[k];
         }
     }
 }
 
-// rope_fixed_kernel<Text1D, 16, 2> at T = 1: the engine's exact frequency table,
-// sincosf per pair, in-place half-rotation of qn (16 heads) and kn (2 heads).
-__device__ __constant__ float mk_rope_inv_freq[32] = {
-    1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
-    8.058421878e-02F, 4.869675252e-02F, 2.942727176e-02F, 1.778279410e-02F, 1.074607828e-02F,
-    6.493816316e-03F, 3.924189758e-03F, 2.371373706e-03F, 1.433012570e-03F, 8.659643234e-04F,
-    5.232991147e-04F, 3.162277660e-04F, 1.910952975e-04F, 1.154781985e-04F, 6.978305849e-05F,
-    4.216965034e-05F, 2.548296748e-05F, 1.539926526e-05F, 9.305720409e-06F, 5.623413252e-06F,
-    3.398208329e-06F, 2.053525026e-06F, 1.240937761e-06F, 7.498942093e-07F, 4.531583638e-07F,
-    2.738419634e-07F, 1.654817100e-07F,
-};
 
 __device__ inline void mk_body_rope_qk(const MkInstr& instr, MkShared& shared) {
     const auto* positions = static_cast<const std::int32_t*>(instr.ptr[0]);

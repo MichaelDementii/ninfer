@@ -699,6 +699,8 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nq.out[0]          = a.qn;
     nq.dim[0]          = 16;
     nq.dim[1]          = pack_f32(a.rms_eps);
+    nq.ptr[2]          = a.rope_positions;
+    nq.dim[3]          = 1;   // fused rotary tail
     nq.done_counter    = r.alloc_ctr();
     nq.wait_counter[0] = c_qkv;
     nq.wait_target[0]  = qkv.slice_count;
@@ -712,23 +714,15 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nk.out[0]          = a.kn;
     nk.dim[0]          = 2;
     nk.dim[1]          = pack_f32(a.rms_eps);
+    nk.ptr[2]          = a.rope_positions;
+    nk.dim[3]          = 1;   // fused rotary tail
     nk.done_counter    = r.alloc_ctr();
     nk.wait_counter[0] = c_qkv;
     nk.wait_target[0]  = qkv.slice_count;
     const std::uint32_t c_nk = nk.done_counter;
     r.push(nk);
-
-    MkInstr rope         = r.blank();
-    rope.op              = MkOp::RopeQK;
-    rope.ptr[0]          = a.rope_positions;
-    rope.out[0]          = a.qn;
-    rope.out[1]          = a.kn;
-    rope.done_counter    = r.alloc_ctr();
-    rope.wait_counter[0] = c_nq;
-    rope.wait_target[0]  = 1;
-    rope.wait_counter[1] = c_nk;
-    rope.wait_target[1]  = 1;
-    r.push(rope);
+    (void)c_nq;
+    (void)c_nk;
 }
 
 void mk_record_attn_post(const MkAttnArgs& a) {
