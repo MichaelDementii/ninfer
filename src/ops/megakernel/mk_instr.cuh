@@ -163,7 +163,7 @@ __device__ inline void mk_body_w8_gemv_residual(const MkInstr& instr) {
 // stops hoisting the full 8-phase load volley the standalone 78-reg engine
 // kernel enjoys; isolation restores the volley.
 template <int K>
-__device__ __noinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restrict__ x,
+__device__ __forceinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restrict__ x,
                                                const std::uint8_t* __restrict__ codes,
                                                const std::uint8_t* __restrict__ scales,
                                                __nv_bfloat16* __restrict__ out,
@@ -357,7 +357,7 @@ __device__ __forceinline__ float mk_warp_xor_sum(float x) {
 // verbatim engine math per row. Rows [0,8192): conv+silu -> q/k/v split, state
 // (s0,s1,s2) <- (s1,s2,p). Rows [8192,12288): plain bf16 store to z.
 // __noinline__ for the same regalloc-isolation reason as mk_w8_decode_rows.
-__device__ __noinline__ void mk_w8_decode_conv_rows(
+__device__ __forceinline__ void mk_w8_decode_conv_rows(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, const __nv_bfloat16* __restrict__ conv_w,
     __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ vc,
@@ -1232,7 +1232,7 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
 
 // w8_k2048 row dot (identical phase loop to mk_w8_decode_rows) + the engine's
 // W8SplitOutput4<4096,512,4096,512> routing: q, k, gate, v in weight-row order.
-__device__ __noinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict__ x,
+__device__ __forceinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict__ x,
                                               const std::uint8_t* __restrict__ codes,
                                               const std::uint8_t* __restrict__ scales,
                                               __nv_bfloat16* __restrict__ q,
