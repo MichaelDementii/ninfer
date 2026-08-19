@@ -150,6 +150,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     std::int32_t split_count, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
+    if (threadIdx.x == 0) { cudaTriggerProgrammaticLaunchCompletion(); }
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
@@ -256,11 +257,6 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
     out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
-    // Release-at-tail: the dependent interpreter (a full-SM flood) may only
-    // launch as this grid drains - a head trigger let 170 spinning 512-thread
-    // CTAs starve the reducer's own unscheduled blocks (variance, Tranche-1
-    // spin-block mechanism).
-    if (threadIdx.x == 0) { cudaTriggerProgrammaticLaunchCompletion(); }
 }
 
 } // namespace ninfer::ops

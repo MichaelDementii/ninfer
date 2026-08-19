@@ -20,22 +20,14 @@ namespace ninfer::ops::mk {
 namespace {
 
 constexpr int kRowSlice   = 16;
-// Warp-pop quanta: one slice = one warp's unit of work.
-constexpr int kInQuantum  = 32;                   // rows per CTA slice (v0.6c)
-constexpr int kInSlices   = 12288 / kInQuantum;   // 384
-constexpr int kHeadSlices = 8192 / kInQuantum;    // 256 (done2 chunk limit)
-constexpr int kOutQuantum = 16;
-constexpr int kOutSlices  = 2048 / kOutQuantum;   // 128
-constexpr int kQkvQuantum = 32;
-constexpr int kQkvSlices  = 9216 / kQkvQuantum;   // 288
-constexpr int kRecQuantum = 16;
-constexpr int kRecSlices  = (32 * 32) / kRecQuantum;   // 64
-constexpr int kD1Slices   = 129;                  // 2 router rows per slice (CTA)
-constexpr int kD3Quantum  = 16;                   // j per CTA slice (one per warp)
-constexpr int kD3SharedSlices = 512 / kD3Quantum;       // 32
-constexpr int kD3RoutedSlices = (8 * 512) / kD3Quantum; // 256
-constexpr int kD4Slices   = 2048 / 16;            // 128: path-major rounds (CTA)
-constexpr int kGnSlices   = 2;                    // 16 rows per slice
+constexpr int kInSlices   = 12288 / kRowSlice;   // 768
+constexpr int kHeadSlices = 8192 / kRowSlice;    // 512
+constexpr int kOutSlices  = 2048 / kRowSlice;    // 128
+constexpr int kRecSlices  = (32 * 32) / 16;      // 64
+constexpr int kD1Slices   = 129;                 // 2 router rows per slice
+constexpr int kD3SharedSlices = 512 / 16;        // 32: shared path, no ids needed
+constexpr int kD3RoutedSlices = (8 * 512) / 16;  // 256: 16 consecutive j of one path
+constexpr int kD4Slices   = 2048 / 16;           // 128: path-major rounds, warp per row
 
 #define MK_CHECK(call)                                                                   \
     do {                                                                                 \
@@ -52,21 +44,6 @@ std::int64_t pack_f32(float v) {
     std::memcpy(&bits, &v, sizeof(bits));
     return static_cast<std::int64_t>(bits);
 }
-
-static bool mk_warppop_enabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("NINFER_MK_WARPPOP");
-        return env != nullptr && env[0] == '1';   // opt-in: falsified at v0.6 (I$)
-    }();
-    return enabled;
-}
-
-// Applies the warp-local bit only when the model is enabled (bisection without
-// rebuilds); the CTA protocol handles the same tapes when disabled.
-static std::int64_t mk_warp_flags(std::int64_t flags) {
-    return mk_warppop_enabled() ? flags : (flags & ~2LL);
-}
-
 
 struct Workspace {
     __nv_bfloat16* h    = nullptr;   // 2048
@@ -86,7 +63,6 @@ struct Workspace {
     float* act          = nullptr;   // 9*512
     int* ids            = nullptr;   // 8
     float* fgp          = nullptr;   // fused gating partials: 32x64 a/b + 32 norm
-    float* invs         = nullptr;   // per-class inv cells (norm/fgb splits)
 };
 
 struct Recorder {
@@ -155,7 +131,6 @@ struct Recorder {
         MK_CHECK(cudaMalloc(&ws.act, 9 * 512 * sizeof(float)));
         MK_CHECK(cudaMalloc(&ws.ids, 8 * sizeof(int)));
         MK_CHECK(cudaMalloc(&ws.fgp, (32 * 64 + 32) * sizeof(float)));
-        MK_CHECK(cudaMalloc(&ws.invs, 256 * sizeof(float)));
         MK_CHECK(cudaMalloc(&counters, counter_capacity * sizeof(std::uint32_t)));
         // Preallocate the tape/stream arenas: cudaMalloc is forbidden while a
         // stream is capturing, and flushes happen inside graph capture.
@@ -176,53 +151,6 @@ struct Recorder {
         ready = true;
     }
 
-    // Split rmsnorm2048: reduce (1 slice, exact 256-thread tree -> inv cell) +
-    // scale (4 elementwise slices). Returns the SCALE done-counter; consumers
-    // wait it with target kNormScaleSlices.
-    static constexpr int kNormScaleSlices = 4;
-    std::uint32_t push_norm2048(const void* x, const void* w, float eps, void* out,
-                                std::uint32_t wait0, std::uint32_t wait0_target,
-                                std::uint32_t wait1, std::uint32_t wait1_target) {
-        float* inv = alloc_inv();
-
-        MkInstr nr      = blank();
-        nr.op           = MkOp::RmsNorm2048;
-        nr.ptr[0]       = x;
-        nr.ptr[1]       = w;
-        nr.ptr[6]       = inv;
-        nr.out[0]       = out;
-        nr.dim[1]       = pack_f32(eps);
-        nr.dim[3]       = 0;
-        nr.done_counter = alloc_ctr();
-        if (wait0 != kMkNone) {
-            nr.wait_counter[0] = wait0;
-            nr.wait_target[0]  = wait0_target;
-        }
-        if (wait1 != kMkNone) {
-            nr.wait_counter[1] = wait1;
-            nr.wait_target[1]  = wait1_target;
-        }
-        const std::uint32_t c_r = nr.done_counter;
-        push(nr);
-
-        MkInstr ns         = blank();
-        ns.op              = MkOp::RmsNorm2048;
-        ns.ptr[0]          = x;
-        ns.ptr[1]          = w;
-        ns.ptr[6]          = inv;
-        ns.out[0]          = out;
-        ns.dim[0]          = 0;
-        ns.dim[1]          = 1024 / kNormScaleSlices;   // pairs per slice
-        ns.dim[3]          = 1;
-        ns.dim[6]          = mk_warp_flags(3);
-        ns.slice_count     = kNormScaleSlices;
-        ns.done_counter    = alloc_ctr();
-        ns.wait_counter[0] = c_r;
-        ns.wait_target[0]  = 1;
-        push(ns);
-        return ns.done_counter;
-    }
-
     MkInstr blank() {
         MkInstr instr{};
         instr.op            = MkOp::Noop;
@@ -239,12 +167,6 @@ struct Recorder {
             throw std::runtime_error("megakernel: counter arena exhausted");
         }
         return ctr_next++;
-    }
-
-    std::uint32_t inv_next = 0;
-    float* alloc_inv() {
-        if (inv_next >= 256) { throw std::runtime_error("megakernel: inv arena exhausted"); }
-        return ws.invs + inv_next++;
     }
 
     void push(MkInstr instr) {
@@ -344,7 +266,6 @@ void mk_begin_round(cudaStream_t stream) {
         (void)registered;
     }
     r.ctr_next            = 0;
-    r.inv_next            = 0;
     r.prev_out_ctr        = kMkNone;
     r.prev_in_ctr         = kMkNone;
     r.prev_d4_ctr         = kMkNone;
@@ -411,55 +332,41 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
         const std::uint32_t c_fga = fga.done_counter;
         r.push(fga);
 
-        // FGB split: reduce (inv + g/beta, 1 slice) + h-scale (4 elementwise
-        // slices) — the whole grid no longer parks behind one CTA's 2048-wide
-        // epilogue. rec only needs g/beta => it gates on the reduce phase.
-        float* fgb_inv = r.alloc_inv();
-
-        MkInstr fbr         = r.blank();
-        fbr.op              = MkOp::FusedGateB;
-        fbr.ptr[0]          = a.x;
-        fbr.ptr[1]          = a.input_norm_w;
-        fbr.ptr[2]          = r.ws.fgp;
-        fbr.ptr[3]          = a.a_log;
-        fbr.ptr[4]          = a.dt_bias;
-        fbr.ptr[5]          = r.ws.betaf;
-        fbr.ptr[6]          = fgb_inv;
-        fbr.out[0]          = r.ws.h;
-        fbr.out[1]          = r.ws.gf;
-        fbr.dim[1]          = pack_f32(a.rms_eps);
-        fbr.dim[3]          = 0;
-        fbr.done_counter    = r.alloc_ctr();
-        fbr.wait_counter[0] = c_fga;
-        fbr.wait_target[0]  = 64;
-        const std::uint32_t c_fgb_r = fbr.done_counter;
-        r.push(fbr);
-
-        MkInstr fbs         = r.blank();
-        fbs.op              = MkOp::FusedGateB;
-        fbs.ptr[0]          = a.x;
-        fbs.ptr[1]          = a.input_norm_w;
-        fbs.ptr[2]          = r.ws.fgp;
-        fbs.ptr[3]          = a.a_log;
-        fbs.ptr[4]          = a.dt_bias;
-        fbs.ptr[5]          = r.ws.betaf;
-        fbs.ptr[6]          = fgb_inv;
-        fbs.out[0]          = r.ws.h;
-        fbs.out[1]          = r.ws.gf;
-        fbs.dim[0]          = 0;
-        fbs.dim[1]          = 2048 / 4;   // elems per slice (also the advance)
-        fbs.dim[3]          = 1;
-        fbs.dim[6]          = mk_warp_flags(3);
-        fbs.slice_count     = 4;
-        fbs.done_counter    = r.alloc_ctr();
-        fbs.wait_counter[0] = c_fgb_r;
-        fbs.wait_target[0]  = 1;
-        c_norm              = fbs.done_counter;   // gates h (consumers use target 4)
-        c_gb                = c_fgb_r;            // reuse: rec's g/beta gate
-        r.push(fbs);
+        MkInstr fgb         = r.blank();
+        fgb.op              = MkOp::FusedGateB;
+        fgb.ptr[0]          = a.x;
+        fgb.ptr[1]          = a.input_norm_w;
+        fgb.ptr[2]          = r.ws.fgp;
+        fgb.ptr[3]          = a.a_log;
+        fgb.ptr[4]          = a.dt_bias;
+        fgb.ptr[5]          = r.ws.betaf;
+        fgb.out[0]          = r.ws.h;
+        fgb.out[1]          = r.ws.gf;
+        fgb.dim[1]          = pack_f32(a.rms_eps);
+        fgb.done_counter    = r.alloc_ctr();
+        fgb.wait_counter[0] = c_fga;
+        fgb.wait_target[0]  = 64;
+        c_norm              = fgb.done_counter;   // gates h AND g/beta
+        r.push(fgb);
     } else {
-        c_norm = r.push_norm2048(a.x, a.input_norm_w, a.rms_eps, r.ws.h, r.prev_d4_ctr,
-                                 r.prev_d4_cnt, r.prev_in_ctr, r.prev_in_cnt);
+        MkInstr norm      = r.blank();
+        norm.op           = MkOp::RmsNorm2048;
+        norm.ptr[0]       = a.x;
+        norm.ptr[1]       = a.input_norm_w;
+        norm.out[0]       = r.ws.h;
+        norm.dim[0]       = 1;
+        norm.dim[1]       = pack_f32(a.rms_eps);
+        norm.done_counter = r.alloc_ctr();
+        if (r.prev_d4_ctr != kMkNone) {
+            norm.wait_counter[0] = r.prev_d4_ctr;
+            norm.wait_target[0]  = r.prev_d4_cnt;
+        }
+        if (r.prev_in_ctr != kMkNone) {
+            norm.wait_counter[1] = r.prev_in_ctr;
+            norm.wait_target[1]  = r.prev_in_cnt;
+        }
+        c_norm = norm.done_counter;
+        r.push(norm);
 
         MkInstr ga         = r.blank();
         ga.op              = MkOp::Bf16Gemv;
@@ -473,7 +380,7 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
         ga.dim[6]          = 1;
         ga.done_counter    = r.alloc_ctr();
         ga.wait_counter[0] = c_norm;
-        ga.wait_target[0]  = Recorder::kNormScaleSlices;
+        ga.wait_target[0]  = 1;
         c_ga               = ga.done_counter;
         r.push(ga);
 
@@ -489,12 +396,10 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
         gb.dim[6]          = 1;
         gb.done_counter    = r.alloc_ctr();
         gb.wait_counter[0] = c_norm;
-        gb.wait_target[0]  = Recorder::kNormScaleSlices;
+        gb.wait_target[0]  = 1;
         c_gb               = gb.done_counter;
         r.push(gb);
     }
-    // h consumers wait the scale phase: 4 slices in both gating paths.
-    const std::uint32_t h_target = fused_gating ? 4 : Recorder::kNormScaleSlices;
 
     MkInstr in         = r.blank();
     in.op              = MkOp::W8DecodeConv;
@@ -509,19 +414,18 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     in.out[0]          = r.ws.qc;
     in.out[1]          = r.ws.kc;
     in.dim[0]          = 0;
-    in.dim[1]          = kInQuantum;
-    in.dim[6]          = mk_warp_flags(3);   // batched done + boundary-batched done2
-    in.slice_count     = kInSlices;
+    in.dim[1]          = 2 * kRowSlice;
+    in.slice_count     = kInSlices / 2;
     in.done_counter    = r.alloc_ctr();
     in.done2_counter   = r.alloc_ctr();
-    in.done2_limit     = kHeadSlices;
+    in.done2_limit     = kHeadSlices / 2;
     in.wait_counter[0] = c_norm;
-    in.wait_target[0]  = h_target;
+    in.wait_target[0]  = 1;
     const std::uint32_t c_in      = in.done_counter;
     const std::uint32_t c_in_head = in.done2_counter;
     r.push(in);
     r.prev_in_ctr = c_in;
-    r.prev_in_cnt = kInSlices;
+    r.prev_in_cnt = kInSlices / 2;
 
     // Fused path: rec reads FGB's engine-exact g/beta arrays directly.
     // Legacy path: gating transform folded into the recurrent body (dim[7]=1)
@@ -546,17 +450,17 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     rc.out[0]          = r.ws.o;
     rc.out[1]          = a.rec_state;
     rc.dim[0]          = 0;
-    rc.dim[1]          = kRecQuantum;
+    rc.dim[1]          = 16;
     rc.dim[2]          = pack_f32(a.gdn_scale);
     rc.dim[3]          = a.rec_slot_stride;
-    rc.dim[6]          = mk_warp_flags(3);
+    rc.dim[6]          = 1;
     rc.slice_count     = kRecSlices;
     rc.done_counter    = r.alloc_ctr();
     rc.wait_counter[0] = c_in_head;
-    rc.wait_target[0]  = kHeadSlices;
+    rc.wait_target[0]  = kHeadSlices / 2;
     if (fused_gating) {
-        // g/beta are written by the FGB reduce phase (c_gb aliases it).
-        rc.wait_counter[1] = c_gb;
+        // c_norm (= FGB) already gates in+conv upstream; g/beta share it.
+        rc.wait_counter[1] = c_norm;
         rc.wait_target[1]  = 1;
     } else {
         rc.wait_counter[1] = c_ga;
@@ -576,14 +480,11 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     gn.dim[0]          = 0;
     gn.dim[1]          = 32;
     gn.dim[2]          = pack_f32(a.rms_eps);
-    gn.dim[1]          = 32 / kGnSlices;   // 16 rows
-    gn.slice_count     = kGnSlices;
-    gn.dim[6]          = mk_warp_flags(3);
     gn.done_counter    = r.alloc_ctr();
     gn.wait_counter[0] = c_rec;
     gn.wait_target[0]  = kRecSlices;
     gn.wait_counter[1] = c_in;
-    gn.wait_target[1]  = kInSlices;
+    gn.wait_target[1]  = kInSlices / 2;
     const std::uint32_t c_gn = gn.done_counter;
     r.push(gn);
 
@@ -594,14 +495,14 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
     out.ptr[2]          = a.out_scales;
     out.out[0]          = a.x;
     out.dim[0]          = 0;
-    out.dim[1]          = kOutQuantum;
+    out.dim[1]          = kRowSlice;
     out.dim[2]          = 4096;
     out.dim[3]          = 1;
-    out.dim[6]          = mk_warp_flags(3);
+    out.dim[6]          = 1;
     out.slice_count     = kOutSlices;
     out.done_counter    = r.alloc_ctr();
     out.wait_counter[0] = c_gn;
-    out.wait_target[0]  = kGnSlices;
+    out.wait_target[0]  = 1;
     r.push(out);
     r.prev_out_ctr = out.done_counter;
     r.prev_out_cnt = kOutSlices;
@@ -610,8 +511,20 @@ void mk_record_gdn_mixer(const MkGdnMixerArgs& a) {
 void mk_record_moe(const MkMoeArgs& a) {
     Recorder& r = rec();
 
-    const std::uint32_t c_norm2 = r.push_norm2048(a.x, a.post_norm_w, a.rms_eps, r.ws.h2,
-                                                  r.prev_out_ctr, r.prev_out_cnt, kMkNone, 0);
+    MkInstr norm2      = r.blank();
+    norm2.op           = MkOp::RmsNorm2048;
+    norm2.ptr[0]       = a.x;
+    norm2.ptr[1]       = a.post_norm_w;
+    norm2.out[0]       = r.ws.h2;
+    norm2.dim[0]       = 1;
+    norm2.dim[1]       = pack_f32(a.rms_eps);
+    norm2.done_counter = r.alloc_ctr();
+    if (r.prev_out_ctr != kMkNone) {
+        norm2.wait_counter[0] = r.prev_out_ctr;
+        norm2.wait_target[0]  = r.prev_out_cnt;
+    }
+    const std::uint32_t c_norm2 = norm2.done_counter;
+    r.push(norm2);
 
     MkInstr d1         = r.blank();
     d1.op              = MkOp::MoeD1;
@@ -624,7 +537,7 @@ void mk_record_moe(const MkMoeArgs& a) {
     d1.slice_count     = kD1Slices;
     d1.done_counter    = r.alloc_ctr();
     d1.wait_counter[0] = c_norm2;
-    d1.wait_target[0]  = Recorder::kNormScaleSlices;
+    d1.wait_target[0]  = 1;
     const std::uint32_t c_d1 = d1.done_counter;
     r.push(d1);
 
@@ -637,13 +550,13 @@ void mk_record_moe(const MkMoeArgs& a) {
     d3s.ptr[6]          = a.sgu_scales;
     d3s.out[0]          = r.ws.act;
     d3s.dim[0]          = 0;
-    d3s.dim[1]          = kD3Quantum;
+    d3s.dim[1]          = 16;
     d3s.dim[3]          = 1;   // shared-only class
-    d3s.dim[6]          = mk_warp_flags(3);
+    d3s.dim[6]          = 1;
     d3s.slice_count     = kD3SharedSlices;
     d3s.done_counter    = r.alloc_ctr();
     d3s.wait_counter[0] = c_norm2;
-    d3s.wait_target[0]  = Recorder::kNormScaleSlices;
+    d3s.wait_target[0]  = 1;
     const std::uint32_t c_d3s = d3s.done_counter;
     r.push(d3s);
 
@@ -680,9 +593,9 @@ void mk_record_moe(const MkMoeArgs& a) {
     d3.ptr[4]          = a.rgu_scales;
     d3.out[0]          = r.ws.act;
     d3.dim[0]          = 0;
-    d3.dim[1]          = kD3Quantum;
+    d3.dim[1]          = 16;
     d3.dim[3]          = 0;   // routed paths, linear j over 8*512
-    d3.dim[6]          = mk_warp_flags(3);
+    d3.dim[6]          = 1;
     d3.slice_count     = kD3RoutedSlices;
     d3.done_counter    = r.alloc_ctr();
     d3.wait_counter[0] = c_d2_ids;
@@ -734,10 +647,25 @@ bool mk_attn_enabled() {
 void mk_record_attn_pre(const MkAttnArgs& a) {
     Recorder& r = rec();
 
-    // Input norm: same engine cta<256,6> Offset body the MoE norm2 uses (split).
-    const std::uint32_t c_norm = r.push_norm2048(a.x, a.input_norm_w, a.rms_eps, r.ws.h,
-                                                 r.prev_d4_ctr, r.prev_d4_cnt, r.prev_in_ctr,
-                                                 r.prev_in_cnt);
+    // Input norm: same engine cta<256,6> Offset body the MoE norm2 uses.
+    MkInstr norm      = r.blank();
+    norm.op           = MkOp::RmsNorm2048;
+    norm.ptr[0]       = a.x;
+    norm.ptr[1]       = a.input_norm_w;
+    norm.out[0]       = r.ws.h;
+    norm.dim[0]       = 1;
+    norm.dim[1]       = pack_f32(a.rms_eps);
+    norm.done_counter = r.alloc_ctr();
+    if (r.prev_d4_ctr != kMkNone) {
+        norm.wait_counter[0] = r.prev_d4_ctr;
+        norm.wait_target[0]  = r.prev_d4_cnt;
+    }
+    if (r.prev_in_ctr != kMkNone) {
+        norm.wait_counter[1] = r.prev_in_ctr;
+        norm.wait_target[1]  = r.prev_in_cnt;
+    }
+    const std::uint32_t c_norm = norm.done_counter;
+    r.push(norm);
 
     MkInstr qkv         = r.blank();
     qkv.op              = MkOp::AttnQkv;
@@ -749,13 +677,13 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     qkv.ptr[5]          = a.gate;
     qkv.ptr[6]          = a.v;
     qkv.dim[0]          = 0;
-    qkv.dim[1]          = kQkvQuantum;
+    qkv.dim[1]          = 2 * kRowSlice;
     qkv.dim[2]          = 2048;   // prefetch-gate pattern (codes row stride)
-    qkv.dim[6]          = mk_warp_flags(3);
-    qkv.slice_count     = kQkvSlices;
+    qkv.dim[6]          = 1;
+    qkv.slice_count     = 9216 / (2 * kRowSlice);
     qkv.done_counter    = r.alloc_ctr();
     qkv.wait_counter[0] = c_norm;
-    qkv.wait_target[0]  = Recorder::kNormScaleSlices;
+    qkv.wait_target[0]  = 1;
     const std::uint32_t c_qkv = qkv.done_counter;
     r.push(qkv);
     // The next mk classes after the island (siggate/o-proj) are stream-ordered
@@ -768,11 +696,8 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nq.ptr[0]          = a.q;
     nq.ptr[1]          = a.q_norm_w;
     nq.out[0]          = a.qn;
-    nq.dim[0]          = 0;
-    nq.dim[1]          = 4;   // rows per warp pop (slice advance)
-    nq.dim[2]          = pack_f32(a.rms_eps);
-    nq.dim[6]          = mk_warp_flags(3);
-    nq.slice_count     = 4;
+    nq.dim[0]          = 16;
+    nq.dim[1]          = pack_f32(a.rms_eps);
     nq.done_counter    = r.alloc_ctr();
     nq.wait_counter[0] = c_qkv;
     nq.wait_target[0]  = qkv.slice_count;
@@ -784,11 +709,8 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nk.ptr[0]          = a.k;
     nk.ptr[1]          = a.k_norm_w;
     nk.out[0]          = a.kn;
-    nk.dim[0]          = 0;
-    nk.dim[1]          = 2;
-    nk.dim[2]          = pack_f32(a.rms_eps);
-    nk.dim[6]          = mk_warp_flags(3);
-    nk.slice_count     = 1;
+    nk.dim[0]          = 2;
+    nk.dim[1]          = pack_f32(a.rms_eps);
     nk.done_counter    = r.alloc_ctr();
     nk.wait_counter[0] = c_qkv;
     nk.wait_target[0]  = qkv.slice_count;
@@ -802,7 +724,7 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     rope.out[1]          = a.kn;
     rope.done_counter    = r.alloc_ctr();
     rope.wait_counter[0] = c_nq;
-    rope.wait_target[0]  = 4;
+    rope.wait_target[0]  = 1;
     rope.wait_counter[1] = c_nk;
     rope.wait_target[1]  = 1;
     r.push(rope);

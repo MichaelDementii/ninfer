@@ -55,59 +55,34 @@ __device__ __forceinline__ float mk_block_reduce_sum_512(float x, float* warp_su
     return x;
 }
 
-// Scale phase of the split d2048 Offset norm: per-element math over a
-// contiguous pair range; thread mapping is CTA-wide or warp-wide (dim[4]).
-__device__ __forceinline__ void mk_body_rmsnorm2048_scale(const MkInstr& instr) {
-    const auto* x       = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
-    const auto* weight  = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
-    const auto* inv_ptr = static_cast<const float*>(instr.ptr[6]);
-    auto* out           = static_cast<__nv_bfloat162*>(instr.out[0]);
-    const float inv          = *inv_ptr;
-    const std::int64_t pair0 = instr.dim[0];
-    const std::int64_t pairs = instr.dim[1];
-    const int tid            = static_cast<int>(threadIdx.x);
-    const int t0             = instr.dim[4] != 0 ? (tid & 31) : tid;
-    const int tstride        = instr.dim[4] != 0 ? 32 : kMkThreads;
-    for (std::int64_t p = pair0 + t0; p < pair0 + pairs; p += tstride) {
-        const float2 xf = __bfloat1622float2(x[p]);
-        const float2 wf = __bfloat1622float2(weight[p]);
-        out[p] = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f), xf.y * inv * (wf.y + 1.0f));
-    }
-}
-
+// dim0 = rows; one full CTA per row, rows processed sequentially by this CTA.
 // The engine's Offset-epilogue d=2048 route is rmsnorm_cta_bf16x2_kernel
 // <Offset, 256, 6> (the d2048 512-thread kernel is Plain-only): 256 threads
 // each accumulate FOUR pairs (t, t+256, t+512, t+768) sequentially, then a
-// 256-wide block reduce (8 warp partials, width-8 shuffle tree).
-// Split against the single-CTA-serializer disease — dim[3] selects:
-//   dim[3]=0 (reduce): the exact 256-thread sum tree; publishes inv to ptr[6].
-//     One slice; the wall cost the rest of the grid waits on is ~1.2us.
-//   dim[3]=1 (scale): out = x*inv*(w+1) over this slice's contiguous PAIR
-//     range (dim[0]=pair0 via advance, dim[1]=pairs per slice) — per-element
-//     math, any slicing is bit-exact.
+// 256-wide block reduce (8 warp partials, width-8 shuffle tree). Threads
+// 256..511 idle through the sum phase; the elementwise scale phase is
+// thread-mapping independent, so all 512 threads share it.
 __device__ inline void mk_body_rmsnorm2048(const MkInstr& instr, MkShared& shared) {
     const auto* x       = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
     const auto* weight  = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
-    auto* inv_cell      = const_cast<float*>(static_cast<const float*>(instr.ptr[6]));
     auto* out           = static_cast<__nv_bfloat162*>(instr.out[0]);
-    const float eps     = __int_as_float(static_cast<int>(instr.dim[1]));
+    const std::int64_t rows = instr.dim[0];
+    const float eps         = __int_as_float(static_cast<int>(instr.dim[1]));
 
-    constexpr int kCtaBlock = 256;
-    const int tid           = static_cast<int>(threadIdx.x);
-    const int lane          = tid & 31;
-    const int warp          = tid >> 5;
+    constexpr int kCtaBlock    = 256;
+    constexpr int kPairsPerRow = 1024;
+    const int tid              = static_cast<int>(threadIdx.x);
+    const int lane             = tid & 31;
+    const int warp             = tid >> 5;
 
-    if (instr.dim[3] != 0) {
-        mk_body_rmsnorm2048_scale(instr);
-        return;
-    }
-    {
-        float sum = 0.0f;
+    for (std::int64_t row = 0; row < rows; ++row) {
+        const std::int64_t row_base = row * kPairsPerRow;
+        float sum                   = 0.0f;
         if (tid < kCtaBlock) {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const int pair  = tid + k * kCtaBlock;
-                const float2 xf = __bfloat1622float2(x[pair]);
+                const float2 xf = __bfloat1622float2(x[row_base + pair]);
                 sum += xf.x * xf.x + xf.y * xf.y;
             }
         }
@@ -116,15 +91,29 @@ __device__ inline void mk_body_rmsnorm2048(const MkInstr& instr, MkShared& share
         if (lane == 0 && warp < 8) { shared.rms.warp_sums[warp] = sum; }
         __syncthreads();
         if (tid == 0) {
-            // warp_reduce_sum<8> replicated serially with the exact tree
-            // grouping: ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)).
+            // warp_reduce_sum<8> over the 8 partials, replicated serially with
+            // the exact shuffle-tree grouping (offsets 4, 2, 1):
+            // ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)).
             const float* s = shared.rms.warp_sums;
             const float t0 = (s[0] + s[4]) + (s[2] + s[6]);
             const float t1 = (s[1] + s[5]) + (s[3] + s[7]);
-            *inv_cell      = rsqrtf((t0 + t1) / 2048.0f + eps);
+            shared.rms.inv = rsqrtf((t0 + t1) / 2048.0f + eps);
         }
         __syncthreads();
-        return;
+        const float inv = shared.rms.inv;
+
+        // Scale phase: per-element independent math, all 512 threads.
+        const int pair0 = tid;
+        const int pair1 = tid + kMkThreads;
+        const float2 x0 = __bfloat1622float2(x[row_base + pair0]);
+        const float2 x1 = __bfloat1622float2(x[row_base + pair1]);
+        const float2 w0 = __bfloat1622float2(weight[pair0]);
+        const float2 w1 = __bfloat1622float2(weight[pair1]);
+        out[row_base + pair0] = __floats2bfloat162_rn(x0.x * inv * (w0.x + 1.0f),
+                                                      x0.y * inv * (w0.y + 1.0f));
+        out[row_base + pair1] = __floats2bfloat162_rn(x1.x * inv * (w1.x + 1.0f),
+                                                      x1.y * inv * (w1.y + 1.0f));
+        __syncthreads();
     }
 }
 
@@ -174,12 +163,12 @@ __device__ inline void mk_body_w8_gemv_residual(const MkInstr& instr) {
 // stops hoisting the full 8-phase load volley the standalone 78-reg engine
 // kernel enjoys; isolation restores the volley.
 template <int K>
-__device__ __forceinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restrict__ x,
+__device__ __noinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restrict__ x,
                                                const std::uint8_t* __restrict__ codes,
                                                const std::uint8_t* __restrict__ scales,
                                                __nv_bfloat16* __restrict__ out,
                                                std::int64_t row0, std::int64_t rows,
-                                               bool residual, int vwarp, int vwarps) {
+                                               bool residual) {
     constexpr int kGroup             = 32;
     constexpr int kGroupsPerRow      = K / kGroup;
     constexpr int kValuesPerLane     = 8;
@@ -189,8 +178,10 @@ __device__ __forceinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restric
     constexpr unsigned kFullWarpMask = 0xffffffffu;
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
 
-    for (std::int64_t r = vwarp; r < rows; r += vwarps) {
+    for (std::int64_t r = warp; r < rows; r += warps) {
         const std::int64_t row        = row0 + r;
         const std::uint8_t* code_row  = codes + row * K;
         const std::uint8_t* scale_row = scales + row * kGroupsPerRow * 2;
@@ -251,13 +242,11 @@ __device__ __forceinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restric
 
 template <int K>
 __device__ __forceinline__ void mk_body_w8_decode(const MkInstr& instr) {
-    const int vw  = instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5);
-    const int vws = instr.dim[4] != 0 ? 1 : (kMkThreads / 32);
     mk_w8_decode_rows<K>(static_cast<const __nv_bfloat16*>(instr.ptr[0]),
                          static_cast<const std::uint8_t*>(instr.ptr[1]),
                          static_cast<const std::uint8_t*>(instr.ptr[2]),
                          static_cast<__nv_bfloat16*>(instr.out[0]), instr.dim[0], instr.dim[1],
-                         instr.dim[3] != 0, vw, vws);
+                         instr.dim[3] != 0);
 }
 
 // Small control projection: bf16 W[rows x k] @ x, one warp per output row.
@@ -325,8 +314,8 @@ __device__ inline void mk_body_gated_norm128(const MkInstr& instr) {
     const float eps         = __int_as_float(static_cast<int>(instr.dim[2]));
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int warp  = instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5);
-    const int warps = instr.dim[4] != 0 ? 1 : (kMkThreads / 32);
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
 
     for (std::int64_t r = warp; r < rows; r += warps) {
         const std::int64_t base = (row0 + r) * 64;   // 64 bf16x2 pairs per d=128 row
@@ -368,13 +357,13 @@ __device__ __forceinline__ float mk_warp_xor_sum(float x) {
 // verbatim engine math per row. Rows [0,8192): conv+silu -> q/k/v split, state
 // (s0,s1,s2) <- (s1,s2,p). Rows [8192,12288): plain bf16 store to z.
 // __noinline__ for the same regalloc-isolation reason as mk_w8_decode_rows.
-__device__ __forceinline__ void mk_w8_decode_conv_rows(
+__device__ __noinline__ void mk_w8_decode_conv_rows(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, const __nv_bfloat16* __restrict__ conv_w,
     __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ vc,
     __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ qc,
     __nv_bfloat16* __restrict__ kc, const std::int32_t* __restrict__ slots, std::int64_t row0,
-    std::int64_t rows, int vwarp, int vwarps) {
+    std::int64_t rows) {
     constexpr int K                  = 2048;
     constexpr int kChannels          = 8192;
     constexpr int kGroupsPerRow      = K / 32;
@@ -385,11 +374,15 @@ __device__ __forceinline__ void mk_w8_decode_conv_rows(
     constexpr unsigned kFullWarpMask = 0xffffffffu;
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
 
-    // Consecutive rows per (virtual) warp; per-row math and order unchanged.
-    const std::int64_t rows_per_warp = (rows + vwarps - 1) / vwarps;
+    // Consecutive rows per warp (2w, 2w+1 for a 32-row slice): the warp's two
+    // volleys stream adjacent 2KB code rows — DRAM row-buffer friendly, unlike
+    // the strided (w, w+16) walk. Per-row math and order unchanged (bit-exact).
+    const std::int64_t rows_per_warp = (rows + warps - 1) / warps;
     for (std::int64_t rr = 0; rr < rows_per_warp; ++rr) {
-        const std::int64_t r = static_cast<std::int64_t>(vwarp) * rows_per_warp + rr;
+        const std::int64_t r = static_cast<std::int64_t>(warp) * rows_per_warp + rr;
         if (r >= rows) { break; }
         const std::int64_t row        = row0 + r;
         const std::uint8_t* code_row  = codes + row * K;
@@ -483,9 +476,7 @@ __device__ __forceinline__ void mk_body_w8_decode_conv(const MkInstr& instr) {
         const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[5])),
         const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[6])),
         static_cast<__nv_bfloat16*>(instr.out[0]), static_cast<__nv_bfloat16*>(instr.out[1]),
-        static_cast<const std::int32_t*>(instr.ptr[7]), instr.dim[0], instr.dim[1],
-        instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5),
-        instr.dim[4] != 0 ? 1 : (kMkThreads / 32));
+        static_cast<const std::int32_t*>(instr.ptr[7]), instr.dim[0], instr.dim[1]);
 }
 
 // Gated delta net T=1: verbatim per-warp math of recurrent_bf16_direct_kernel
@@ -509,8 +500,8 @@ __device__ inline void mk_body_gdn_recurrent(const MkInstr& instr) {
 
     constexpr int kStateDim = 128;
     const int lane          = static_cast<int>(threadIdx.x) & 31;
-    const int warp          = instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5);
-    const int warps         = instr.dim[4] != 0 ? 1 : (kMkThreads / 32);
+    const int warp          = static_cast<int>(threadIdx.x) >> 5;
+    const int warps         = kMkThreads / 32;
     const int dqk_base      = lane * 4;
 
     const std::int64_t read_slot_off =
@@ -1137,42 +1128,38 @@ __device__ inline void mk_body_moe_d2(const MkInstr& instr, MkShared& shared,
 //     router/top-8 would otherwise leave the bus idle.
 //   dim[3]=0: routed paths, linear index over 8*512 j's (path = lin>>9).
 // Per-output dot order identical to before — bit-exact.
-__device__ inline void mk_body_moe_d3(const MkInstr& instr) {
+__device__ inline void mk_body_moe_d3(const MkInstr& instr, MkShared& shared) {
+    (void)shared;
     const auto* x = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
     const auto* ids           = static_cast<const int*>(instr.ptr[1]);
     const auto* routed_codes  = static_cast<const std::uint8_t*>(instr.ptr[2]);
     const auto* routed_scales = static_cast<const std::uint8_t*>(instr.ptr[4]);
     const auto* shared_codes  = static_cast<const std::uint8_t*>(instr.ptr[5]);
     const auto* shared_scales = static_cast<const std::uint8_t*>(instr.ptr[6]);
-    auto* act              = static_cast<float*>(instr.out[0]);
+    auto* act                 = static_cast<float*>(instr.out[0]);
+    const int lin             = static_cast<int>(instr.dim[0]) +
+                    (static_cast<int>(threadIdx.x) >> 5);   // one warp = one j
     const bool shared_only = instr.dim[3] != 0;
-    const bool warp_mode   = instr.dim[4] != 0;
-    const int lin0         = static_cast<int>(instr.dim[0]);
-    const int count        = warp_mode ? static_cast<int>(instr.dim[1]) : 1;
-    const int lane         = static_cast<int>(threadIdx.x) & 31;
 
-    for (int l = 0; l < count; ++l) {
-        const int lin = warp_mode ? lin0 + l : lin0 + (static_cast<int>(threadIdx.x) >> 5);
-        float2 gate_up;
-        int path;
-        int j;
-        if (shared_only) {
-            path    = moe::kTopK;
-            j       = lin;
-            gate_up = moe::w8_dot_two_rows(shared_codes, shared_scales, j,
-                                           moe::kIntermediate + j, x);
-        } else {
-            path               = lin >> 9;
-            j                  = lin & (moe::kIntermediate - 1);
-            const int expert   = ids[path];
-            const int row_base = expert * (2 * moe::kIntermediate);
-            gate_up = moe::q4_dot_two_rows(routed_codes, routed_scales, row_base + j,
-                                           row_base + moe::kIntermediate + j, x);
-        }
-        if (lane == 0) {
-            act[static_cast<std::int64_t>(path) * moe::kIntermediate + j] =
-                moe::mk_silu(gate_up.x) * gate_up.y;
-        }
+    float2 gate_up;
+    int path;
+    int j;
+    if (shared_only) {
+        path    = moe::kTopK;
+        j       = lin;
+        gate_up = moe::w8_dot_two_rows(shared_codes, shared_scales, j,
+                                       moe::kIntermediate + j, x);
+    } else {
+        path               = lin >> 9;
+        j                  = lin & (moe::kIntermediate - 1);
+        const int expert   = ids[path];
+        const int row_base = expert * (2 * moe::kIntermediate);
+        gate_up = moe::q4_dot_two_rows(routed_codes, routed_scales, row_base + j,
+                                       row_base + moe::kIntermediate + j, x);
+    }
+    if ((static_cast<int>(threadIdx.x) & 31) == 0) {
+        act[static_cast<std::int64_t>(path) * moe::kIntermediate + j] =
+            moe::mk_silu(gate_up.x) * gate_up.y;
     }
 }
 
@@ -1245,14 +1232,14 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
 
 // w8_k2048 row dot (identical phase loop to mk_w8_decode_rows) + the engine's
 // W8SplitOutput4<4096,512,4096,512> routing: q, k, gate, v in weight-row order.
-__device__ __forceinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict__ x,
+__device__ __noinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict__ x,
                                               const std::uint8_t* __restrict__ codes,
                                               const std::uint8_t* __restrict__ scales,
                                               __nv_bfloat16* __restrict__ q,
                                               __nv_bfloat16* __restrict__ k,
                                               __nv_bfloat16* __restrict__ gate,
                                               __nv_bfloat16* __restrict__ v, std::int64_t row0,
-                                              std::int64_t rows, int vwarp, int vwarps) {
+                                              std::int64_t rows) {
     constexpr int K                  = 2048;
     constexpr int kGroupsPerRow      = K / 32;
     constexpr int kValuesPerLane     = 8;
@@ -1262,10 +1249,12 @@ __device__ __forceinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict
     constexpr unsigned kFullWarpMask = 0xffffffffu;
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
 
-    const std::int64_t rows_per_warp = (rows + vwarps - 1) / vwarps;
+    const std::int64_t rows_per_warp = (rows + warps - 1) / warps;
     for (std::int64_t rr = 0; rr < rows_per_warp; ++rr) {
-        const std::int64_t r = static_cast<std::int64_t>(vwarp) * rows_per_warp + rr;
+        const std::int64_t r = static_cast<std::int64_t>(warp) * rows_per_warp + rr;
         if (r >= rows) { break; }
         const std::int64_t row        = row0 + r;
         const std::uint8_t* code_row  = codes + row * K;
@@ -1334,9 +1323,7 @@ __device__ __forceinline__ void mk_body_attn_qkv(const MkInstr& instr) {
                      static_cast<__nv_bfloat16*>(instr.out[1]),
                      const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[5])),
                      const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[6])),
-                     instr.dim[0], instr.dim[1],
-                     instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5),
-                     instr.dim[4] != 0 ? 1 : (kMkThreads / 32));
+                     instr.dim[0], instr.dim[1]);
 }
 
 // Engine route for Offset d=256 is rmsnorm_warp_bf16x2<Offset,512>: one warp per
@@ -1346,16 +1333,14 @@ __device__ inline void mk_body_norm_qk(const MkInstr& instr) {
     const auto* x      = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
     const auto* weight = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
     auto* out          = static_cast<__nv_bfloat162*>(instr.out[0]);
-    const std::int64_t row0 = instr.dim[0];   // slice advance: idx * dim[1]
-    const std::int64_t rows = instr.dim[1];
-    const float eps         = __int_as_float(static_cast<int>(instr.dim[2]));
+    const std::int64_t rows = instr.dim[0];
+    const float eps         = __int_as_float(static_cast<int>(instr.dim[1]));
 
     constexpr int kPairs = 128;   // d = 256
     const int lane       = static_cast<int>(threadIdx.x) & 31;
-    const int warp       = instr.dim[4] != 0 ? 0 : (static_cast<int>(threadIdx.x) >> 5);
-    const int vwarps     = instr.dim[4] != 0 ? 1 : (kMkThreads / 32);
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
 
-    for (std::int64_t row = row0 + warp; row < row0 + rows; row += vwarps) {
+    for (std::int64_t row = warp; row < rows; row += kMkThreads / 32) {
         const std::int64_t row_base = row * kPairs;
         __nv_bfloat162 values[4];
         float sum = 0.0f;
@@ -1611,14 +1596,10 @@ __device__ inline void mk_body_fused_gate_a(const MkInstr& instr, MkShared& shar
                          shared.fg.stage);
 }
 
-// Phase B, split against the single-CTA-serializer disease. dim[3] selects:
-//   dim[3]=0 (reduce): ordered split reduction (s = 0..31) -> inv is published
-//     to out-f32 (ptr[6]) plus the gating transform g/beta. Tiny, 1 slice.
-//   dim[3]=1 (scale): h = x * inv * (1 + w) elementwise over this slice's
-//     contiguous range — per-element math, any slicing is bit-exact. dim[0] =
-//     elem0, dim[4] = elems per slice; inv read from ptr[6].
-// The engine's cooperative epilogue computes identical values; only the thread
-// mapping differs (per-element independence).
+// Phase B: the author's post-grid-sync epilogue — ordered split reduction for
+// the norm (s = 0..31), h = x * inv * (1 + w) elementwise, then a/b ordered
+// reduction scaled by inv and the gating transform. Bit-identical to the
+// engine's cooperative handoff.
 __device__ inline void mk_body_fused_gate_b(const MkInstr& instr) {
     const auto* x       = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
     const auto* norm_w  = static_cast<const __nv_bfloat16*>(instr.ptr[1]);
@@ -1626,43 +1607,33 @@ __device__ inline void mk_body_fused_gate_b(const MkInstr& instr) {
     const auto* a_log   = static_cast<const float*>(instr.ptr[3]);
     const auto* dt_bias = static_cast<const float*>(instr.ptr[4]);
     auto* beta          = const_cast<float*>(static_cast<const float*>(instr.ptr[5]));
-    auto* inv_cell      = const_cast<float*>(static_cast<const float*>(instr.ptr[6]));
     auto* h             = static_cast<__nv_bfloat16*>(instr.out[0]);
     auto* g             = static_cast<float*>(instr.out[1]);
     const float eps     = __int_as_float(static_cast<int>(instr.dim[1]));
 
-    if (instr.dim[3] == 0) {
-        const float* norm_partial = partial + fg::kNormOffset;
-        float sum                 = 0.0f;
+    const float* norm_partial = partial + fg::kNormOffset;
+    float sum                 = 0.0f;
 #pragma unroll
-        for (int s = 0; s < fg::kSplitK; ++s) { sum += norm_partial[s]; }
-        const float inv = rsqrtf(sum / static_cast<float>(fg::kHidden) + eps);
-        if (threadIdx.x == 0) { *inv_cell = inv; }
-        for (int i = static_cast<int>(threadIdx.x); i < fg::kHeads; i += kMkThreads) {
-            float av = 0.0f;
-            float bv = 0.0f;
-#pragma unroll
-            for (int s = 0; s < fg::kSplitK; ++s) {
-                av += partial[s * fg::kPartialRows + i];
-                bv += partial[s * fg::kPartialRows + fg::kHeads + i];
-            }
-            av *= inv;
-            bv *= inv;
-            g[i]    = -expf(a_log[i]) * softplus(av + dt_bias[i]);
-            beta[i] = sigmoid(bv);
-        }
-        return;
-    }
-    const float inv          = *inv_cell;
-    const std::int64_t elem0 = instr.dim[0];
-    const std::int64_t count = instr.dim[1];   // doubles as the slice advance
-    const int t0             = instr.dim[4] != 0 ? (static_cast<int>(threadIdx.x) & 31)
-                                                 : static_cast<int>(threadIdx.x);
-    const int tstride        = instr.dim[4] != 0 ? 32 : kMkThreads;
-    for (std::int64_t i = elem0 + t0; i < elem0 + count; i += tstride) {
+    for (int s = 0; s < fg::kSplitK; ++s) { sum += norm_partial[s]; }
+    const float inv = rsqrtf(sum / static_cast<float>(fg::kHidden) + eps);
+
+    for (int i = static_cast<int>(threadIdx.x); i < fg::kHidden; i += kMkThreads) {
         const float value  = __bfloat162float(x[i]);
         const float weight = __bfloat162float(norm_w[i]);
         h[i]               = __float2bfloat16_rn(value * inv * (1.0f + weight));
+    }
+    for (int i = static_cast<int>(threadIdx.x); i < fg::kHeads; i += kMkThreads) {
+        float av = 0.0f;
+        float bv = 0.0f;
+#pragma unroll
+        for (int s = 0; s < fg::kSplitK; ++s) {
+            av += partial[s * fg::kPartialRows + i];
+            bv += partial[s * fg::kPartialRows + fg::kHeads + i];
+        }
+        av *= inv;
+        bv *= inv;
+        g[i]    = -expf(a_log[i]) * softplus(av + dt_bias[i]);
+        beta[i] = sigmoid(bv);
     }
 }
 
@@ -1709,7 +1680,7 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         mk_body_moe_d2(instr, shared, counters);
         return;
     case MkOp::MoeD3:
-        mk_body_moe_d3(instr);
+        mk_body_moe_d3(instr, shared);
         return;
     case MkOp::MoeD4:
         mk_body_moe_d4(instr, shared);
@@ -1747,137 +1718,6 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_ref_generic_kernel(MkInstr i
     MkInstr local = instr;
     local.dim[0]  = instr.dim[0] + static_cast<std::int64_t>(blockIdx.x) * instr.dim[1];
     mk_execute(local, shared, nullptr);
-}
-
-// ---- warp-autonomous execution (dim[6] bit 1) -------------------------------
-// A warp walks these classes on its own: instruction fields straight from the
-// tape (L1), per-warp dependency spin, per-warp slice pops, ZERO CTA barriers.
-// dim[4]=1 switches body partitioning to single-virtual-warp mode; per-output
-// math and order never change (bit-exact) — only which warp runs each output.
-__device__ __forceinline__ void mk_execute_warp_slice(const MkInstr& base, std::int64_t idx) {
-    MkInstr local = base;   // SROA: only referenced fields materialize
-    local.dim[0]  = base.dim[0] + idx * base.dim[1];
-    local.dim[4]  = 1;
-    switch (local.op) {
-    case MkOp::W8DecodeK:
-        if (local.dim[2] == 2048) {
-            mk_body_w8_decode<2048>(local);
-        } else {
-            mk_body_w8_decode<4096>(local);
-        }
-        return;
-    case MkOp::RmsNorm2048:
-        mk_body_rmsnorm2048_scale(local);   // only scale phases are warp-local
-        return;
-#ifdef NINFER_MK_ENGINE
-    case MkOp::FusedGateB:
-        mk_body_fused_gate_b(local);        // only the scale phase is warp-local
-        return;
-#endif
-    case MkOp::W8DecodeConv:
-        mk_body_w8_decode_conv(local);
-        return;
-    case MkOp::AttnQkv:
-        mk_body_attn_qkv(local);
-        return;
-    case MkOp::GdnRecurrent:
-        mk_body_gdn_recurrent(local);
-        return;
-    case MkOp::GatedNorm128:
-        mk_body_gated_norm128(local);
-        return;
-    case MkOp::NormQK:
-        mk_body_norm_qk(local);
-        return;
-    case MkOp::MoeD3:
-        mk_body_moe_d3(local);
-        return;
-    default:
-        return;
-    }
-}
-
-// While this warp's lane 0 spins on the class dependencies, the other lanes
-// warm the warp's likely first slice of weight bytes in L2.
-__device__ __forceinline__ void mk_warp_prefetch(const MkInstr& in, unsigned wrank) {
-    if (in.op != MkOp::W8DecodeK && in.op != MkOp::W8DecodeConv && in.op != MkOp::AttnQkv) {
-        return;
-    }
-    if (wrank >= in.slice_count) { return; }
-    const auto* codes        = static_cast<const char*>(in.ptr[1]);
-    const std::int64_t row0  = in.dim[0] + static_cast<std::int64_t>(wrank) * in.dim[1];
-    const std::int64_t base  = row0 * in.dim[2];
-    const std::int64_t bytes = in.dim[1] * in.dim[2];
-    const int lane           = static_cast<int>(threadIdx.x) & 31;
-    for (std::int64_t off = static_cast<std::int64_t>(lane) * 128; off < bytes;
-         off += 32 * 128) {
-        asm volatile("prefetch.global.L2 [%0];" ::"l"(codes + base + off));
-    }
-}
-
-__device__ __forceinline__ void mk_run_warp_class(const MkInstr& in,
-                                                  std::uint32_t* __restrict__ counters,
-                                                  unsigned wrank) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    if (lane == 0) {
-#pragma unroll
-        for (int w = 0; w < kMkMaxWaits; ++w) {
-            const std::uint32_t cidx = in.wait_counter[w];
-            if (cidx == kMkNone) { continue; }
-            const std::uint32_t target = in.wait_target[w];
-            const volatile std::uint32_t* cell =
-                reinterpret_cast<const volatile std::uint32_t*>(&counters[cidx]);
-            while (*cell < target) { __nanosleep(128); }
-        }
-    } else if (wrank < static_cast<unsigned>(gridDim.x)) {
-        // Prefetch budget stays at one warm-up stream per SM (the CTA-protocol
-        // volume): letting all ~2.7K warps prefetch their rank slice floods L2
-        // with ~90MB of hints per waiting class and starves demand traffic.
-        mk_warp_prefetch(in, wrank);
-    }
-    __syncwarp();
-    __threadfence();   // acquire for producer stores
-
-    const bool batch          = (in.dim[6] & 1) != 0;
-    std::uint32_t done_local  = 0;
-    std::uint32_t done2_local = 0;
-    for (;;) {
-        std::uint32_t idx = 0;
-        if (lane == 0) { idx = atomicAdd(&counters[in.task_counter], 1u); }
-        idx = __shfl_sync(0xffffffffu, idx, 0);
-        if (idx >= in.slice_count) { break; }
-        mk_execute_warp_slice(in, idx);
-        __syncwarp();
-        if (lane == 0) {
-            ++done_local;
-            if (in.done2_counter != kMkNone && idx < in.done2_limit) { ++done2_local; }
-            // Flush the head-chunk batch as soon as this warp crosses the chunk
-            // boundary: consumers of done2 wait for ALL head slices, so batched
-            // posting keeps the chunk semantics exact while collapsing the
-            // per-slice atomic storm.
-            if (done2_local != 0 && idx + 1 >= in.done2_limit) {
-                __threadfence();
-                atomicAdd(&counters[in.done2_counter], done2_local);
-                done2_local = 0;
-            }
-            if (!batch) {
-                __threadfence();
-                if (in.done_counter != kMkNone) { atomicAdd(&counters[in.done_counter], 1u); }
-                --done_local;
-            }
-        }
-        __syncwarp();
-    }
-    if (lane == 0) {
-        __threadfence();
-        if (done2_local != 0 && in.done2_counter != kMkNone) {
-            atomicAdd(&counters[in.done2_counter], done2_local);
-        }
-        if (done_local != 0 && in.done_counter != kMkNone) {
-            atomicAdd(&counters[in.done_counter], done_local);
-        }
-    }
-    __syncwarp();
 }
 
 // ---- the interpreter -------------------------------------------------------
@@ -1944,19 +1784,8 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
     if (seg_stamp != nullptr && threadIdx.x == 0) {
         atomicMin(&seg_stamp[seg_idx], mk_globaltimer());
     }
-    // PDL: wait for the preceding island's writes once, before any data read.
-    // No-op for launches without upstream dependencies (eager mode).
-    cudaGridDependencySynchronize();
     const MkStream stream = streams[blockIdx.x];
-    const unsigned wrank  = blockIdx.x * (kMkThreads / 32) + (threadIdx.x >> 5);
     for (std::uint32_t i = 0; i < stream.count; ++i) {
-        // Warp-local classes (dim[6] bit 1): each warp walks them autonomously —
-        // no smem broadcast, no CTA barriers; warps reconverge at the next
-        // CTA-level class's first __syncthreads.
-        if ((static_cast<std::uint32_t>(stream.tape[i].dim[6]) & 2u) != 0) {
-            mk_run_warp_class(stream.tape[i], counters, wrank);
-            continue;
-        }
         const unsigned long long t_enter = wait_ns != nullptr ? clock64() : 0;
         __shared__ __align__(16) MkInstr instr_s;
         // cooperative broadcast of the descriptor through shared memory
@@ -1969,6 +1798,14 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             __syncthreads();
         }
         if (enable_prefetch != 0) { mk_prefetch_slice(instr_s, blockIdx.x); }
+        if (i == 0) {
+            // PDL: when this segment is launched as a programmatic dependent of
+            // the attention island's last kernel (which triggers at its head),
+            // everything above — tape broadcast, first-class weight prefetch —
+            // overlapped the island. Data reads gate here on its full completion.
+            // No-op for eager launches without upstream dependencies.
+            cudaGridDependencySynchronize();
+        }
         mk_wait_phase(instr_s, counters);
         const unsigned long long t_ready = wait_ns != nullptr ? clock64() : 0;
         unsigned long long gt_ready      = 0;
@@ -1978,9 +1815,8 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
         if (threadIdx.x == 0) { slice_shared = atomicAdd(&counters[instr_s.task_counter], 1u); }
         __syncthreads();
         std::uint32_t idx = slice_shared;
-        std::uint32_t done_local  = 0;
-        std::uint32_t done2_local = 0;
-        const bool batch_post     = (instr_s.dim[6] & 1) != 0;
+        std::uint32_t done_local = 0;
+        const bool batch_post    = instr_s.dim[6] != 0;
         while (idx < instr_s.slice_count) {
             // No in-loop prefetch: with DRAM already saturated by demand streaming,
             // extra prefetch instructions only add memory-pipe pressure (measured
@@ -1993,14 +1829,6 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             if (threadIdx.x == 0) {
                 if (batch_post) {
                     ++done_local;
-                    if (instr_s.done2_counter != kMkNone && idx < instr_s.done2_limit) {
-                        ++done2_local;
-                    }
-                    if (done2_local != 0 && idx + 1 >= instr_s.done2_limit) {
-                        __threadfence();
-                        atomicAdd(&counters[instr_s.done2_counter], done2_local);
-                        done2_local = 0;
-                    }
                 } else {
                     __threadfence();
                     if (instr_s.done_counter != kMkNone) {
@@ -2015,14 +1843,10 @@ __global__ __launch_bounds__(kMkThreads, 1) void mk_interpreter_kernel(
             __syncthreads();
             idx = slice_shared;
         }
-        if (batch_post && threadIdx.x == 0) {
+        if (batch_post && threadIdx.x == 0 && done_local != 0 &&
+            instr_s.done_counter != kMkNone) {
             __threadfence();
-            if (done2_local != 0 && instr_s.done2_counter != kMkNone) {
-                atomicAdd(&counters[instr_s.done2_counter], done2_local);
-            }
-            if (done_local != 0 && instr_s.done_counter != kMkNone) {
-                atomicAdd(&counters[instr_s.done_counter], done_local);
-            }
+            atomicAdd(&counters[instr_s.done_counter], done_local);
         }
         if (wait_ns != nullptr && threadIdx.x == 0) {
             const unsigned long long t_done = clock64();
