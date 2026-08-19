@@ -683,10 +683,15 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     qkv.dim[6]          = 1;
     qkv.slice_count     = 9216 / (2 * kRowSlice);
     qkv.done_counter    = r.alloc_ctr();
+    qkv.done2_counter   = r.alloc_ctr();
+    qkv.done2_limit     = 4608 / (2 * kRowSlice);   // q+k rows chunk
     qkv.wait_counter[0] = c_norm;
     qkv.wait_target[0]  = 1;
-    const std::uint32_t c_qkv = qkv.done_counter;
+    const std::uint32_t c_qkv  = qkv.done_counter;
+    const std::uint32_t c_qkv2 = qkv.done2_counter;
+    const std::uint32_t n_qkv2 = static_cast<std::uint32_t>(qkv.done2_limit);
     r.push(qkv);
+    (void)c_qkv;
     // The next mk classes after the island (siggate/o-proj) are stream-ordered
     // behind the native gqa; nothing chains on qkv across the flush except the
     // in-tape norms below.
@@ -702,8 +707,8 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nq.ptr[2]          = a.rope_positions;
     nq.dim[3]          = 1;   // fused rotary tail
     nq.done_counter    = r.alloc_ctr();
-    nq.wait_counter[0] = c_qkv;
-    nq.wait_target[0]  = qkv.slice_count;
+    nq.wait_counter[0] = c_qkv2;
+    nq.wait_target[0]  = n_qkv2;
     const std::uint32_t c_nq = nq.done_counter;
     r.push(nq);
 
@@ -717,8 +722,8 @@ void mk_record_attn_pre(const MkAttnArgs& a) {
     nk.ptr[2]          = a.rope_positions;
     nk.dim[3]          = 1;   // fused rotary tail
     nk.done_counter    = r.alloc_ctr();
-    nk.wait_counter[0] = c_qkv;
-    nk.wait_target[0]  = qkv.slice_count;
+    nk.wait_counter[0] = c_qkv2;
+    nk.wait_target[0]  = n_qkv2;
     const std::uint32_t c_nk = nk.done_counter;
     r.push(nk);
     (void)c_nq;
