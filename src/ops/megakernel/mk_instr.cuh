@@ -158,16 +158,17 @@ __device__ inline void mk_body_w8_gemv_residual(const MkInstr& instr) {
 // scales broadcast via shfl(lane>>2). Identical per-row FP order -> bit-exact against
 // the engine's decode in-proj path. 16 warps of the interpreter CTA cover
 // dim1 (=16) consecutive rows starting at dim0.
+// __noinline__: own register allocation — inside the interpreter switch the body
+// competes with every other class for the shared budget (122 regs) and ptxas
+// stops hoisting the full 8-phase load volley the standalone 78-reg engine
+// kernel enjoys; isolation restores the volley.
 template <int K>
-__device__ inline void mk_body_w8_decode(const MkInstr& instr) {
-    const auto* x      = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
-    const auto* codes  = static_cast<const std::uint8_t*>(instr.ptr[1]);
-    const auto* scales = static_cast<const std::uint8_t*>(instr.ptr[2]);
-    auto* out          = static_cast<__nv_bfloat16*>(instr.out[0]);
-    const std::int64_t row0 = instr.dim[0];
-    const std::int64_t rows = instr.dim[1];
-    const bool residual     = instr.dim[3] != 0;
-
+__device__ __noinline__ void mk_w8_decode_rows(const __nv_bfloat16* __restrict__ x,
+                                               const std::uint8_t* __restrict__ codes,
+                                               const std::uint8_t* __restrict__ scales,
+                                               __nv_bfloat16* __restrict__ out,
+                                               std::int64_t row0, std::int64_t rows,
+                                               bool residual) {
     constexpr int kGroup             = 32;
     constexpr int kGroupsPerRow      = K / kGroup;
     constexpr int kValuesPerLane     = 8;
@@ -237,6 +238,15 @@ __device__ inline void mk_body_w8_decode(const MkInstr& instr) {
             }
         }
     }
+}
+
+template <int K>
+__device__ __forceinline__ void mk_body_w8_decode(const MkInstr& instr) {
+    mk_w8_decode_rows<K>(static_cast<const __nv_bfloat16*>(instr.ptr[0]),
+                         static_cast<const std::uint8_t*>(instr.ptr[1]),
+                         static_cast<const std::uint8_t*>(instr.ptr[2]),
+                         static_cast<__nv_bfloat16*>(instr.out[0]), instr.dim[0], instr.dim[1],
+                         instr.dim[3] != 0);
 }
 
 // Small control projection: bf16 W[rows x k] @ x, one warp per output row.
@@ -346,22 +356,14 @@ __device__ __forceinline__ float mk_warp_xor_sum(float x) {
 // w8_k2048_decode phase loop + GdnConvEpilogue (T=1, in-place conv state update):
 // verbatim engine math per row. Rows [0,8192): conv+silu -> q/k/v split, state
 // (s0,s1,s2) <- (s1,s2,p). Rows [8192,12288): plain bf16 store to z.
-__device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
-    const auto* x          = static_cast<const __nv_bfloat16*>(instr.ptr[0]);
-    const auto* codes      = static_cast<const std::uint8_t*>(instr.ptr[1]);
-    const auto* scales     = static_cast<const std::uint8_t*>(instr.ptr[2]);
-    const auto* conv_w     = static_cast<const __nv_bfloat16*>(instr.ptr[3]);
-    auto* conv_state       = const_cast<__nv_bfloat16*>(
-        static_cast<const __nv_bfloat16*>(instr.ptr[4]));
-    auto* vc               = const_cast<__nv_bfloat16*>(
-        static_cast<const __nv_bfloat16*>(instr.ptr[5]));
-    auto* z                = const_cast<__nv_bfloat16*>(
-        static_cast<const __nv_bfloat16*>(instr.ptr[6]));
-    auto* qc               = static_cast<__nv_bfloat16*>(instr.out[0]);
-    auto* kc               = static_cast<__nv_bfloat16*>(instr.out[1]);
-    const std::int64_t row0 = instr.dim[0];
-    const std::int64_t rows = instr.dim[1];
-
+// __noinline__ for the same regalloc-isolation reason as mk_w8_decode_rows.
+__device__ __noinline__ void mk_w8_decode_conv_rows(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ vc,
+    __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ qc,
+    __nv_bfloat16* __restrict__ kc, const std::int32_t* __restrict__ slots, std::int64_t row0,
+    std::int64_t rows) {
     constexpr int K                  = 2048;
     constexpr int kChannels          = 8192;
     constexpr int kGroupsPerRow      = K / 32;
@@ -429,8 +431,6 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
 
         if (lane == 0) {
             if (row < kChannels) {
-                const auto* slots =
-                    static_cast<const std::int32_t*>(instr.ptr[7]);   // nullptr => slot 0
                 const std::int64_t slot_off =
                     slots != nullptr
                         ? static_cast<std::int64_t>(slots[0]) * (3LL * kChannels)
@@ -464,6 +464,19 @@ __device__ inline void mk_body_w8_decode_conv(const MkInstr& instr) {
             }
         }
     }
+}
+
+__device__ __forceinline__ void mk_body_w8_decode_conv(const MkInstr& instr) {
+    mk_w8_decode_conv_rows(
+        static_cast<const __nv_bfloat16*>(instr.ptr[0]),
+        static_cast<const std::uint8_t*>(instr.ptr[1]),
+        static_cast<const std::uint8_t*>(instr.ptr[2]),
+        static_cast<const __nv_bfloat16*>(instr.ptr[3]),
+        const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[4])),
+        const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[5])),
+        const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[6])),
+        static_cast<__nv_bfloat16*>(instr.out[0]), static_cast<__nv_bfloat16*>(instr.out[1]),
+        static_cast<const std::int32_t*>(instr.ptr[7]), instr.dim[0], instr.dim[1]);
 }
 
 // Gated delta net T=1: verbatim per-warp math of recurrent_bf16_direct_kernel
@@ -1215,6 +1228,221 @@ __device__ inline void mk_body_moe_d4(const MkInstr& instr, MkShared& shared) {
     __syncthreads();
 }
 
+// ==== attention-island absorption bodies (all engine-route exact) ============
+
+// w8_k2048 row dot (identical phase loop to mk_w8_decode_rows) + the engine's
+// W8SplitOutput4<4096,512,4096,512> routing: q, k, gate, v in weight-row order.
+__device__ __noinline__ void mk_attn_qkv_rows(const __nv_bfloat16* __restrict__ x,
+                                              const std::uint8_t* __restrict__ codes,
+                                              const std::uint8_t* __restrict__ scales,
+                                              __nv_bfloat16* __restrict__ q,
+                                              __nv_bfloat16* __restrict__ k,
+                                              __nv_bfloat16* __restrict__ gate,
+                                              __nv_bfloat16* __restrict__ v, std::int64_t row0,
+                                              std::int64_t rows) {
+    constexpr int K                  = 2048;
+    constexpr int kGroupsPerRow      = K / 32;
+    constexpr int kValuesPerLane     = 8;
+    constexpr int kValuesPerPhase    = 32 * kValuesPerLane;
+    constexpr int kGroupsPerPhase    = kValuesPerPhase / 32;
+    constexpr int kPhases            = K / kValuesPerPhase;
+    constexpr unsigned kFullWarpMask = 0xffffffffu;
+
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = kMkThreads / 32;
+
+    const std::int64_t rows_per_warp = (rows + warps - 1) / warps;
+    for (std::int64_t rr = 0; rr < rows_per_warp; ++rr) {
+        const std::int64_t r = static_cast<std::int64_t>(warp) * rows_per_warp + rr;
+        if (r >= rows) { break; }
+        const std::int64_t row        = row0 + r;
+        const std::uint8_t* code_row  = codes + row * K;
+        const std::uint8_t* scale_row = scales + row * kGroupsPerRow * 2;
+
+        float accumulator = 0.0f;
+#pragma unroll
+        for (int phase = 0; phase < kPhases; ++phase) {
+            unsigned scale_bits = 0;
+            if (lane < kGroupsPerPhase) {
+                scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scale_row + static_cast<std::int64_t>(phase * kGroupsPerPhase + lane) * 2);
+            }
+            scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
+            const float scale = __half2float(__ushort_as_half(scale_bits));
+            const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
+            const uint2 packed = *reinterpret_cast<const uint2*>(code_row + phase_k);
+            float weights[kValuesPerLane];
+#pragma unroll
+            for (int word_index = 0; word_index < 2; ++word_index) {
+                const std::uint32_t word = (&packed.x)[word_index];
+                weights[word_index * 4 + 0] =
+                    static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
+                weights[word_index * 4 + 1] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xffu)) * scale;
+                weights[word_index * 4 + 2] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 16) & 0xffu)) * scale;
+                weights[word_index * 4 + 3] =
+                    static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
+            }
+            const uint4 values = *reinterpret_cast<const uint4*>(x + phase_k);
+            const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.x));
+            const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.y));
+            const float2 x2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.z));
+            const float2 x3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&values.w));
+            accumulator = fmaf(weights[0], x0.x, accumulator);
+            accumulator = fmaf(weights[1], x0.y, accumulator);
+            accumulator = fmaf(weights[2], x1.x, accumulator);
+            accumulator = fmaf(weights[3], x1.y, accumulator);
+            accumulator = fmaf(weights[4], x2.x, accumulator);
+            accumulator = fmaf(weights[5], x2.y, accumulator);
+            accumulator = fmaf(weights[6], x3.x, accumulator);
+            accumulator = fmaf(weights[7], x3.y, accumulator);
+        }
+        accumulator = mk_warp_reduce_sum(accumulator);
+        if (lane == 0) {
+            const __nv_bfloat16 out = __float2bfloat16_rn(accumulator);
+            if (row < 4096) {
+                q[row] = out;
+            } else if (row < 4608) {
+                k[row - 4096] = out;
+            } else if (row < 8704) {
+                gate[row - 4608] = out;
+            } else {
+                v[row - 8704] = out;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void mk_body_attn_qkv(const MkInstr& instr) {
+    mk_attn_qkv_rows(static_cast<const __nv_bfloat16*>(instr.ptr[0]),
+                     static_cast<const std::uint8_t*>(instr.ptr[1]),
+                     static_cast<const std::uint8_t*>(instr.ptr[2]),
+                     static_cast<__nv_bfloat16*>(instr.out[0]),
+                     static_cast<__nv_bfloat16*>(instr.out[1]),
+                     const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[5])),
+                     const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(instr.ptr[6])),
+                     instr.dim[0], instr.dim[1]);
+}
+
+// Engine route for Offset d=256 is rmsnorm_warp_bf16x2<Offset,512>: one warp per
+// row, four bf16x2 pairs per lane (lane + k*32, k = 0..3), PAIRWISE += sums,
+// inv = rsqrtf(sum/d + eps), out-of-place epilogue x*inv*(w+1).
+__device__ inline void mk_body_norm_qk(const MkInstr& instr) {
+    const auto* x      = static_cast<const __nv_bfloat162*>(instr.ptr[0]);
+    const auto* weight = static_cast<const __nv_bfloat162*>(instr.ptr[1]);
+    auto* out          = static_cast<__nv_bfloat162*>(instr.out[0]);
+    const std::int64_t rows = instr.dim[0];
+    const float eps         = __int_as_float(static_cast<int>(instr.dim[1]));
+
+    constexpr int kPairs = 128;   // d = 256
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+
+    for (std::int64_t row = warp; row < rows; row += kMkThreads / 32) {
+        const std::int64_t row_base = row * kPairs;
+        __nv_bfloat162 values[4];
+        float sum = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int pair  = lane + k * 32;
+            values[k]       = x[row_base + pair];
+            const float2 xf = __bfloat1622float2(values[k]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+        sum       = mk_warp_reduce_sum(sum);
+        float inv = lane == 0 ? rsqrtf(sum / 256.0f + eps) : 0.0f;
+        inv       = __shfl_sync(0xffffffffu, inv, 0);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int pair  = lane + k * 32;
+            const float2 xf = __bfloat1622float2(values[k]);
+            const float2 wf = __bfloat1622float2(weight[pair]);
+            out[row_base + pair] = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
+                                                         xf.y * inv * (wf.y + 1.0f));
+        }
+    }
+}
+
+// rope_fixed_kernel<Text1D, 16, 2> at T = 1: the engine's exact frequency table,
+// sincosf per pair, in-place half-rotation of qn (16 heads) and kn (2 heads).
+__device__ __constant__ float mk_rope_inv_freq[32] = {
+    1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
+    8.058421878e-02F, 4.869675252e-02F, 2.942727176e-02F, 1.778279410e-02F, 1.074607828e-02F,
+    6.493816316e-03F, 3.924189758e-03F, 2.371373706e-03F, 1.433012570e-03F, 8.659643234e-04F,
+    5.232991147e-04F, 3.162277660e-04F, 1.910952975e-04F, 1.154781985e-04F, 6.978305849e-05F,
+    4.216965034e-05F, 2.548296748e-05F, 1.539926526e-05F, 9.305720409e-06F, 5.623413252e-06F,
+    3.398208329e-06F, 2.053525026e-06F, 1.240937761e-06F, 7.498942093e-07F, 4.531583638e-07F,
+    2.738419634e-07F, 1.654817100e-07F,
+};
+
+__device__ inline void mk_body_rope_qk(const MkInstr& instr, MkShared& shared) {
+    const auto* positions = static_cast<const std::int32_t*>(instr.ptr[0]);
+    auto* q               = static_cast<__nv_bfloat16*>(instr.out[0]);
+    auto* k               = static_cast<__nv_bfloat16*>(instr.out[1]);
+
+    constexpr int kHalf     = 32;
+    constexpr int kHeadDim  = 256;
+    constexpr int kHalfPair = kHalf / 2;
+    float* cos_cache        = shared.rope.cs;
+    float* sin_cache        = shared.rope.cs + kHalf;
+
+    if (threadIdx.x < kHalf) {
+        const int pair    = static_cast<int>(threadIdx.x);
+        const float angle = static_cast<float>(positions[0]) * mk_rope_inv_freq[pair];
+        sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+    }
+    __syncthreads();
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    float c0 = 0.0f, c1 = 0.0f, s0 = 0.0f, s1 = 0.0f;
+    if (lane < kHalfPair) {
+        const int pair = lane * 2;
+        c0             = cos_cache[pair];
+        c1             = cos_cache[pair + 1];
+        s0             = sin_cache[pair];
+        s1             = sin_cache[pair + 1];
+    }
+    for (int head = warp; head < 16 + 2; head += kMkThreads / 32) {
+        __nv_bfloat16* data = head < 16 ? q : k;
+        const int h         = head < 16 ? head : head - 16;
+        if (lane >= kHalfPair) { continue; }
+        auto* data2         = reinterpret_cast<__nv_bfloat162*>(data + h * kHeadDim);
+        const float2 first  = __bfloat1622float2(data2[lane]);
+        const float2 second = __bfloat1622float2(data2[lane + kHalfPair]);
+        data2[lane] =
+            __floats2bfloat162_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
+        data2[lane + kHalfPair] =
+            __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+    }
+    __syncthreads();
+}
+
+// sigmoid_gate_mul over bf16x8 packs (engine sigmoid_gate_mul_bf16x8_kernel):
+// x[i] *= sigmoid(gate[i]), rounding per pair.
+__device__ inline void mk_body_sig_gate_mul(const MkInstr& instr) {
+    struct Pack {
+        __nv_bfloat162 pair[4];
+    };
+    const auto* gate = static_cast<const Pack*>(instr.ptr[0]);
+    auto* x          = static_cast<Pack*>(instr.out[0]);
+    const std::int64_t packs = instr.dim[0] / 8;
+    const auto sig           = [](float v) { return 1.0f / (1.0f + expf(-v)); };
+    for (std::int64_t i = threadIdx.x; i < packs; i += kMkThreads) {
+        const Pack gv = gate[i];
+        Pack xv       = x[i];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const float r0 = __low2float(xv.pair[p]) * sig(__low2float(gv.pair[p]));
+            const float r1 = __high2float(xv.pair[p]) * sig(__high2float(gv.pair[p]));
+            xv.pair[p]     = __floats2bfloat162_rn(r0, r1);
+        }
+        x[i] = xv;
+    }
+}
+
 #ifdef NINFER_MK_ENGINE
 
 namespace fg {
@@ -1467,6 +1695,18 @@ __device__ __forceinline__ void mk_execute(const MkInstr& instr, MkShared& share
         mk_body_fused_gate_b(instr);
 #endif
         return;
+    case MkOp::AttnQkv:
+        mk_body_attn_qkv(instr);
+        return;
+    case MkOp::NormQK:
+        mk_body_norm_qk(instr);
+        return;
+    case MkOp::RopeQK:
+        mk_body_rope_qk(instr, shared);
+        return;
+    case MkOp::SigGateMul:
+        mk_body_sig_gate_mul(instr);
+        return;
     case MkOp::Halt:
     case MkOp::Noop:
         return;
@@ -1508,7 +1748,10 @@ __device__ __forceinline__ void mk_prefetch_slice(const MkInstr& instr, unsigned
         }
         return;
     }
-    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8DecodeConv) { return; }
+    if (instr.op != MkOp::W8DecodeK && instr.op != MkOp::W8DecodeConv &&
+        instr.op != MkOp::AttnQkv) {
+        return;
+    }
     const auto* codes        = static_cast<const char*>(instr.ptr[1]);
     const std::int64_t row0  = instr.dim[0] + static_cast<std::int64_t>(rank) * instr.dim[1];
     const std::int64_t base  = row0 * instr.dim[2];

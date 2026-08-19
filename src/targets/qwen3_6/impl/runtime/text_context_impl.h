@@ -800,7 +800,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+    const bool mk_attn =
+        ops::mk::mk_engine_enabled() && ops::mk::mk_attn_enabled() && ph == Phase::Verify &&
+        T == 1 && active_sequence_batch_ == 1 && active_valid_columns_ == nullptr;
+    if (!mk_attn) { ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s); }
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -810,20 +813,57 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    if (!mk_attn) {
+        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
+                                      work_, s);
+    }
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    if (!mk_attn) {
+        ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
+        ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::mk::MkAttnArgs mk_args{};
+    // Generic lambda: requires-discard only works in a template context (the
+    // variant payload types differ per target).
+    const auto mk_attn_try_pre = [&](const auto& proj_payload) {
+        if constexpr (requires { proj_payload.query_key_gate_value; }) {
+            const auto& qkgv       = proj_payload.query_key_gate_value;
+            mk_args.x              = x.data;
+            mk_args.input_norm_w   = w.input_norm->data;
+            mk_args.rms_eps        = kCfg.rms_eps;
+            mk_args.qkgv_codes     = qkgv.qdata;
+            mk_args.qkgv_scales    = qkgv.scales;
+            mk_args.q              = q_flat.data;
+            mk_args.gate           = gate_flat.data;
+            mk_args.k              = k_flat.data;
+            mk_args.v              = v_flat.data;
+            mk_args.q_norm_w       = w.q_norm->data;
+            mk_args.k_norm_w       = w.k_norm->data;
+            mk_args.qn             = qn.data;
+            mk_args.kn             = kn.data;
+            mk_args.rope_positions = rope_for_op.data;
+            ops::mk::mk_record_attn_pre(mk_args);
+            return true;
+        } else {
+            return false;
+        }
+    };
+    if (mk_attn) {
+        if (!mk_attn_try_pre(*w.projection)) {
+            throw std::logic_error("mk attn: unexpected attention payloads");
+        }
+        ops::mk::mk_flush(s);
+    } else {
+        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -847,9 +887,16 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
                            s);
     }
-    ops::sigmoid_mul(gate, a, s);
+    if (mk_attn) {
+        mk_args.attn     = a.data;
+        mk_args.o_codes  = w.o_proj->qdata;
+        mk_args.o_scales = w.o_proj->scales;
+        ops::mk::mk_record_attn_post(mk_args);
+    } else {
+        ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    }
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {

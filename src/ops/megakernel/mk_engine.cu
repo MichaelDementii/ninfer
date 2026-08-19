@@ -636,6 +636,136 @@ void mk_record_moe(const MkMoeArgs& a) {
     r.prev_out_ctr = kMkNone;
 }
 
+bool mk_attn_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("NINFER_MK_ATTN");
+        return env == nullptr || env[0] != '0';
+    }();
+    return enabled;
+}
+
+void mk_record_attn_pre(const MkAttnArgs& a) {
+    Recorder& r = rec();
+
+    // Input norm: same engine cta<256,6> Offset body the MoE norm2 uses.
+    MkInstr norm      = r.blank();
+    norm.op           = MkOp::RmsNorm2048;
+    norm.ptr[0]       = a.x;
+    norm.ptr[1]       = a.input_norm_w;
+    norm.out[0]       = r.ws.h;
+    norm.dim[0]       = 1;
+    norm.dim[1]       = pack_f32(a.rms_eps);
+    norm.done_counter = r.alloc_ctr();
+    if (r.prev_d4_ctr != kMkNone) {
+        norm.wait_counter[0] = r.prev_d4_ctr;
+        norm.wait_target[0]  = r.prev_d4_cnt;
+    }
+    if (r.prev_in_ctr != kMkNone) {
+        norm.wait_counter[1] = r.prev_in_ctr;
+        norm.wait_target[1]  = r.prev_in_cnt;
+    }
+    const std::uint32_t c_norm = norm.done_counter;
+    r.push(norm);
+
+    MkInstr qkv         = r.blank();
+    qkv.op              = MkOp::AttnQkv;
+    qkv.ptr[0]          = r.ws.h;
+    qkv.ptr[1]          = a.qkgv_codes;
+    qkv.ptr[2]          = a.qkgv_scales;
+    qkv.out[0]          = a.q;
+    qkv.out[1]          = a.k;
+    qkv.ptr[5]          = a.gate;
+    qkv.ptr[6]          = a.v;
+    qkv.dim[0]          = 0;
+    qkv.dim[1]          = 2 * kRowSlice;
+    qkv.dim[2]          = 2048;   // prefetch-gate pattern (codes row stride)
+    qkv.dim[6]          = 1;
+    qkv.slice_count     = 9216 / (2 * kRowSlice);
+    qkv.done_counter    = r.alloc_ctr();
+    qkv.wait_counter[0] = c_norm;
+    qkv.wait_target[0]  = 1;
+    const std::uint32_t c_qkv = qkv.done_counter;
+    r.push(qkv);
+    // The next mk classes after the island (siggate/o-proj) are stream-ordered
+    // behind the native gqa; nothing chains on qkv across the flush except the
+    // in-tape norms below.
+    r.prev_in_ctr = kMkNone;
+
+    MkInstr nq         = r.blank();
+    nq.op              = MkOp::NormQK;
+    nq.ptr[0]          = a.q;
+    nq.ptr[1]          = a.q_norm_w;
+    nq.out[0]          = a.qn;
+    nq.dim[0]          = 16;
+    nq.dim[1]          = pack_f32(a.rms_eps);
+    nq.done_counter    = r.alloc_ctr();
+    nq.wait_counter[0] = c_qkv;
+    nq.wait_target[0]  = qkv.slice_count;
+    const std::uint32_t c_nq = nq.done_counter;
+    r.push(nq);
+
+    MkInstr nk         = r.blank();
+    nk.op              = MkOp::NormQK;
+    nk.ptr[0]          = a.k;
+    nk.ptr[1]          = a.k_norm_w;
+    nk.out[0]          = a.kn;
+    nk.dim[0]          = 2;
+    nk.dim[1]          = pack_f32(a.rms_eps);
+    nk.done_counter    = r.alloc_ctr();
+    nk.wait_counter[0] = c_qkv;
+    nk.wait_target[0]  = qkv.slice_count;
+    const std::uint32_t c_nk = nk.done_counter;
+    r.push(nk);
+
+    MkInstr rope         = r.blank();
+    rope.op              = MkOp::RopeQK;
+    rope.ptr[0]          = a.rope_positions;
+    rope.out[0]          = a.qn;
+    rope.out[1]          = a.kn;
+    rope.done_counter    = r.alloc_ctr();
+    rope.wait_counter[0] = c_nq;
+    rope.wait_target[0]  = 1;
+    rope.wait_counter[1] = c_nk;
+    rope.wait_target[1]  = 1;
+    r.push(rope);
+}
+
+void mk_record_attn_post(const MkAttnArgs& a) {
+    Recorder& r = rec();
+
+    // First class after the gqa island: gridDepSync at segment head guards the
+    // native writes; no counter waits are needed or possible here.
+    MkInstr sg      = r.blank();
+    sg.op           = MkOp::SigGateMul;
+    sg.ptr[0]       = a.gate;
+    sg.out[0]       = a.attn;
+    sg.dim[0]       = 4096;
+    sg.done_counter = r.alloc_ctr();
+    const std::uint32_t c_sg = sg.done_counter;
+    r.push(sg);
+
+    MkInstr out         = r.blank();
+    out.op              = MkOp::W8DecodeK;
+    out.ptr[0]          = a.attn;
+    out.ptr[1]          = a.o_codes;
+    out.ptr[2]          = a.o_scales;
+    out.out[0]          = a.x;
+    out.dim[0]          = 0;
+    out.dim[1]          = kRowSlice;
+    out.dim[2]          = 4096;
+    out.dim[3]          = 1;
+    out.dim[6]          = 1;
+    out.slice_count     = kOutSlices;
+    out.done_counter    = r.alloc_ctr();
+    out.wait_counter[0] = c_sg;
+    out.wait_target[0]  = 1;
+    r.push(out);
+    r.prev_out_ctr = out.done_counter;
+    r.prev_out_cnt = kOutSlices;
+    r.prev_in_ctr  = kMkNone;
+    r.prev_d4_ctr  = kMkNone;
+}
+
 void mk_flush(cudaStream_t stream) {
     Recorder& r = rec();
     if (r.pending.empty()) { return; }

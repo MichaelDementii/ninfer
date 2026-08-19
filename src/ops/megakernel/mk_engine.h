@@ -62,10 +62,36 @@ struct MkMoeArgs {
     const void* sd_scales;
 };
 
+struct MkAttnArgs {
+    void* x;                       // bf16[2048] residual
+    const void* input_norm_w;      // bf16[2048]
+    float rms_eps;
+    const void* qkgv_codes;        // W8 9216x2048
+    const void* qkgv_scales;
+    void* q;                       // engine workspace views (graph-static)
+    void* gate;                    // bf16[4096]
+    void* k;                       // bf16[512]
+    void* v;                       // bf16[512]
+    const void* q_norm_w;          // bf16[256]
+    const void* k_norm_w;          // bf16[256]
+    void* qn;                      // bf16[4096]
+    void* kn;                      // bf16[512]
+    const void* rope_positions;    // i32 device
+    void* attn;                    // bf16[4096] (gqa output a)
+    const void* o_codes;           // W8 2048x4096
+    const void* o_scales;
+};
+
 // Round lifecycle (called during graph capture only).
 void mk_begin_round(cudaStream_t stream);
 void mk_record_gdn_mixer(const MkGdnMixerArgs& args);
 void mk_record_moe(const MkMoeArgs& args);
+// Attention absorption: pre-classes (norm, qkv split, q/k norms, rope), then the
+// caller flushes and runs the native gqa partial+reduce, then post-classes
+// (sigmoid gate mul, o-proj residual).
+void mk_record_attn_pre(const MkAttnArgs& args);
+void mk_record_attn_post(const MkAttnArgs& args);
+bool mk_attn_enabled();
 void mk_flush(cudaStream_t stream);      // launch interpreter for pending classes
 void mk_end_round(cudaStream_t stream);  // final flush + stats
 

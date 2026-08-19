@@ -76,6 +76,16 @@ enum class MkOp : std::uint32_t {
     FusedGateB,      // split reduce in author's order: ptr0=x, ptr1=norm_w,
                      // ptr2=partial, ptr3=A_log, ptr4=dt_bias, ptr5=beta out,
                      // out0=h (bf16 2048), out1=g; dim1=eps bits
+    AttnQkv,         // w8_k2048 row dot + W8SplitOutput4<4096,512,4096,512> store:
+                     // ptr0=h, ptr1=codes, ptr2=scales, out0=q, out1=k,
+                     // ptr5=gate, ptr6=v; dim0=row0, dim1=rows
+    NormQK,          // engine rmsnorm_warp<Offset,512> at d=256: warp/row, 4 pairs
+                     // per lane, pairwise += sums. ptr0=x, ptr1=w(256), out0=dst;
+                     // dim0=rows, dim1=eps bits
+    RopeQK,          // rope_fixed_kernel<Text1D,16,2> at T=1: ptr0=positions,
+                     // out0=qn (16 heads x 256), out1=kn (2 heads x 256)
+    SigGateMul,      // x[i] *= sigmoid(gate[i]) over bf16x8 packs: ptr0=gate,
+                     // out0=x; dim0=elements
     Noop,
 };
 
@@ -156,6 +166,9 @@ union MkShared {
         // fused gating stages: 2 x (64x64 x tile + 2 x 16x64 weight tiles) bf16
         alignas(16) __nv_bfloat16 stage[2 * (64 * 64 + 2 * 16 * 64)];
     } fg;
+    struct {
+        float cs[64];   // rope cos[32] + sin[32] per-token cache
+    } rope;
     MkInstr instr_broadcast;
 };
 
