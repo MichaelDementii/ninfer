@@ -318,6 +318,8 @@ struct SnapshotAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    const char* prefetch_data;
+    unsigned long long prefetch_bytes;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch = Batched ? static_cast<std::int32_t>(blockIdx.y) : 0;
@@ -678,6 +680,20 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
                                                                   access.active_columns(coord));
+    if (access.prefetch_data != nullptr) {
+        // BASEOPT-16 (R2-3): warm L2 for the layer's out-proj codes; the gated-rms
+        // window that follows leaves the bus idle. Pure cache hint.
+        const unsigned long long linear_block =
+            blockIdx.x +
+            static_cast<unsigned long long>(gridDim.x) *
+                (blockIdx.y + static_cast<unsigned long long>(gridDim.y) * blockIdx.z);
+        const unsigned long long linear =
+            linear_block * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+        const unsigned long long offset = linear * 128ull;
+        if (offset < access.prefetch_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(access.prefetch_data + offset));
+        }
+    }
 }
 
 template <bool Masked>

@@ -945,10 +945,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
+            // BASEOPT-16 (R2-3): the snapshot tail warms L2 for this layer's out-proj
+            // codes; the gated-rms window that follows leaves the bus idle. Decode only.
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                                           /*normalize_qk=*/true, recurrent_states, valid,
                                           *active_linear_state_slots_, *active_linear_state_slots_,
-                                          out_batch, s);
+                                          out_batch, s,
+                                          width == 1 ? w.out_proj->qdata : nullptr,
+                                          std::size_t{2048} * 4096);
         }
     } else {
         Tensor recurrent_state =
