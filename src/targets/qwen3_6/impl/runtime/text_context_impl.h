@@ -916,6 +916,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    const bool fused_post_norm =
+        ph == Phase::Verify && kCfg.gdn_v_heads <= 64 && active_sequence_batch_ == 1 &&
+        (gdn_state_action_ == GdnStateAction::RecordForReplay ? active_sequence_width_ == T
+                                                              : (T == 1 && active_sequence_width_ == 1));
+    const ops::GdnPostNormSpan post_norm =
+        fused_post_norm ? ops::GdnPostNormSpan{z.data, w.gdn_norm->data, on.data, kCfg.rms_eps}
+                        : ops::GdnPostNormSpan{};
     if (ph == Phase::Verify) {
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
         const std::int32_t width = active_sequence_width_;
@@ -934,12 +943,13 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_slots_, records.key,
-                                               records.value, records.gate, out_batch, s);
+                                               records.value, records.gate, out_batch, s,
+                                               post_norm);
         } else {
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                                           /*normalize_qk=*/true, recurrent_states, valid,
                                           *active_linear_state_slots_, *active_linear_state_slots_,
-                                          out_batch, s);
+                                          out_batch, s, post_norm);
         }
     } else {
         Tensor recurrent_state =
@@ -948,9 +958,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                              /*normalize_qk=*/true, work_, recurrent_state, o, s);
     }
 
-    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (!fused_post_norm) { ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s); }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }

@@ -15,6 +15,7 @@
 #include <string>
 
 namespace ninfer::ops {
+
 namespace {
 
 struct Geometry {
@@ -234,13 +235,13 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& beta, float scale, bool normalize_qk,
                               Tensor& ssm_states, const Tensor& valid_columns,
                               const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                              Tensor& out, cudaStream_t stream) {
+                              Tensor& out, cudaStream_t stream, GdnPostNormSpan post_norm) {
     validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                 initial_state_slots, snapshot_base_slots, out);
 
     detail::gated_delta_net::launch_recurrent_snapshot(
         q, k, v, g, beta, scale, normalize_qk, ssm_states, valid_columns, initial_state_slots,
-        snapshot_base_slots, out, stream);
+        snapshot_base_slots, out, stream, post_norm);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
