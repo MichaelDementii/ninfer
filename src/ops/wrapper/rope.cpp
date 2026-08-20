@@ -149,6 +149,7 @@ void qk_norm_rope(const Tensor& positions, int rotary_dim, float theta, const Te
     if (fused_shape) {
         detail::qk_norm_rope_text16x2_launch(positions, q_in, q_weight, q_out, k_in, k_weight,
                                              k_out, eps, stream);
+        rope(positions, rotary_dim, theta, q_out, k_out, stream);
         return;
     }
     rmsnorm(q_in, q_weight, eps, true, q_out, stream);

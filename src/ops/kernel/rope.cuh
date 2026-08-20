@@ -116,12 +116,17 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
-// BASEOPT-7: fused q/k RMS-norm + rotary for the Text 16Q/2K decode geometry. One CTA
-// per token, warp-per-row (16 q heads then 2 k heads). The norm body replicates
-// rmsnorm_warp_bf16x2_kernel (Offset epilogue, same reduction and bf16x2 rounding);
-// the rotation then re-reads the rounded pair, exchanges the partner via shfl_xor(16)
-// and applies apply_rope_head's formulas, so the standalone three-kernel pipeline's
-// double rounding is preserved bit-for-bit.
+// BASEOPT-7: fused q/k RMS-norm for the Text 16Q/2K decode geometry. One CTA per
+// token, warp-per-row (16 q heads then 2 k heads). The norm body replicates
+// rmsnorm_warp_bf16x2_kernel (Offset epilogue, same reduction and bf16x2 rounding)
+// and is bit-exact against the standalone pair of norm kernels.
+//
+// The rotary step is deliberately NOT folded in. An in-kernel rotation that reuses the
+// freshly rounded pair and exchanges its partner through shfl_xor(16) reproduces every
+// formula, coefficient and rounding of apply_rope_head, yet still drifts from the
+// standalone rope kernel by a last-bit amount that surfaces as a diverged token deep
+// inside long greedy generations, and costs 1.1% of MTP throughput through a lower
+// draft acceptance rate. Keeping rope separate costs +10.1 us/token (+0.36%).
 __launch_bounds__(576) __global__ void qk_norm_rope_text16x2_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat162* __restrict__ q_in,
     const __nv_bfloat162* __restrict__ q_weight, __nv_bfloat162* __restrict__ q_out,
@@ -179,16 +184,6 @@ __launch_bounds__(576) __global__ void qk_norm_rope_text16x2_kernel(
         __nv_bfloat162 stored =
             __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0f),
                                   rmsnorm_epilogue<RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0f));
-        if (item == 0) {
-            const float2 vf = __bfloat1622float2(stored);
-            const float px  = __shfl_xor_sync(kFullWarpMask, vf.x, 16);
-            const float py  = __shfl_xor_sync(kFullWarpMask, vf.y, 16);
-            if (lane < 16) {
-                stored = __floats2bfloat162_rn(vf.x * c0 - px * s0, vf.y * c1 - py * s1);
-            } else {
-                stored = __floats2bfloat162_rn(vf.x * c0 + px * s0, vf.y * c1 + py * s1);
-            }
-        }
         out[row_base + pair] = stored;
     }
 }
