@@ -241,6 +241,7 @@ private:
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    void set_next_projection_prefetch(int layer);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);

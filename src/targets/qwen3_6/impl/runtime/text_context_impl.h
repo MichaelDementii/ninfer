@@ -25,6 +25,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
@@ -960,6 +961,23 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
 
+void TextContext::set_next_projection_prefetch(int layer) {
+    // BASEOPT-8: register the next layer's projection codes so the current MoE D4
+    // epilogue can warm L2 for them. Last layer registers nothing.
+    const int next = layer + 1;
+    if (next >= kCfg.n_layers) {
+        ops::set_next_weight_prefetch({});
+        return;
+    }
+    if (ModelConfig::is_full(next)) {
+        ops::set_next_weight_prefetch(Variant::projection_prefetch_span(
+            *full_.at(static_cast<std::size_t>(ModelConfig::full_idx(next))).projection));
+    } else {
+        ops::set_next_weight_prefetch(Variant::projection_prefetch_span(
+            *gdn_.at(static_cast<std::size_t>(ModelConfig::gdn_idx(next))).projection));
+    }
+}
+
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -991,6 +1009,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
+                set_next_projection_prefetch(layer);
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
@@ -1012,6 +1031,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
+                set_next_projection_prefetch(layer);
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
