@@ -13,6 +13,10 @@ namespace ninfer::ops::detail::gated_delta_net {
 inline constexpr int kDvPerWarp = 4;
 inline constexpr int kNumWarps  = 4;
 inline constexpr int kBlockDv   = kNumWarps * kDvPerWarp;
+
+// One ticket per value head for the folded post-mixer norm. atomicInc wraps at gridDim.z - 1, so
+// the counter returns to zero by itself and needs no host-side initialisation.
+__device__ unsigned int g_gdn_post_norm_ticket[64] = {};
 inline constexpr int kQkPerLane = kStateDim / kWarpSize;
 
 static_assert(kStateDim % kWarpSize == 0);
@@ -318,6 +322,10 @@ struct SnapshotAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    const __nv_bfloat162* post_norm_z;
+    const __nv_bfloat162* post_norm_weight;
+    __nv_bfloat162* post_norm_out;
+    float post_norm_eps;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch = Batched ? static_cast<std::int32_t>(blockIdx.y) : 0;
@@ -400,6 +408,10 @@ struct RecordAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    const __nv_bfloat162* post_norm_z;
+    const __nv_bfloat162* post_norm_weight;
+    __nv_bfloat162* post_norm_out;
+    float post_norm_eps;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -678,6 +690,61 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
                                                                   access.active_columns(coord));
+    if (access.post_norm_out != nullptr && gridDim.y == 1) {
+        // The gated RMS-norm that follows this mixer is a small kernel whose cost is launch
+        // latency and a dependent load chain rather than work. Every value head owns exactly
+        // gridDim.z tiles here, so the tile that finishes last for a head normalises that head's
+        // rows itself - one warp per token. The body is the rmsnorm_warp_bf16x2_kernel body at
+        // D = kStateDim: same pair mapping, same accumulation order, same bf16x2 rounding.
+        __shared__ bool post_norm_last;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            const unsigned int ticket =
+                atomicInc(&g_gdn_post_norm_ticket[blockIdx.x], gridDim.z - 1u);
+            post_norm_last = ticket == gridDim.z - 1u;
+        }
+        __syncthreads();
+        if (post_norm_last) {
+            constexpr int kPairs           = kStateDim / 2;
+            constexpr int kMaxPairsPerLane = 4;
+            const int lane                 = static_cast<int>(threadIdx.x);
+            const auto* mixer              = reinterpret_cast<const __nv_bfloat162*>(access.out);
+            for (std::int32_t token = static_cast<std::int32_t>(threadIdx.y); token < access.width;
+                 token += static_cast<std::int32_t>(blockDim.y)) {
+                const std::int64_t row_base =
+                    (static_cast<std::int64_t>(token) * access.heads.H_v + blockIdx.x) * kPairs;
+                __nv_bfloat162 values[kMaxPairsPerLane];
+                float sum = 0.0F;
+#pragma unroll
+                for (int item = 0; item < kMaxPairsPerLane; ++item) {
+                    const int pair = lane + item * kWarpSize;
+                    if (pair < kPairs) {
+                        values[item]    = mixer[row_base + pair];
+                        const float2 xf = __bfloat1622float2(values[item]);
+                        sum += xf.x * xf.x + xf.y * xf.y;
+                    }
+                }
+                sum = warp_reduce_sum(sum);
+                float inv =
+                    lane == 0 ? rsqrtf(sum / static_cast<float>(kStateDim) + access.post_norm_eps)
+                              : 0.0F;
+                inv = __shfl_sync(0xffffffffU, inv, 0);
+#pragma unroll
+                for (int item = 0; item < kMaxPairsPerLane; ++item) {
+                    const int pair = lane + item * kWarpSize;
+                    if (pair < kPairs) {
+                        const float2 xf = __bfloat1622float2(values[item]);
+                        const float2 wf = __bfloat1622float2(access.post_norm_weight[pair]);
+                        const float2 zf = __bfloat1622float2(access.post_norm_z[row_base + pair]);
+                        access.post_norm_out[row_base + pair] =
+                            __floats2bfloat162_rn(xf.x * inv * wf.x * silu(zf.x),
+                                                  xf.y * inv * wf.y * silu(zf.y));
+                    }
+                }
+            }
+        }
+    }
 }
 
 template <bool Masked>
@@ -686,6 +753,61 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
                                                      access.active_columns(coord));
+    if (access.post_norm_out != nullptr && gridDim.y == 1) {
+        // The gated RMS-norm that follows this mixer is a small kernel whose cost is launch
+        // latency and a dependent load chain rather than work. Every value head owns exactly
+        // gridDim.z tiles here, so the tile that finishes last for a head normalises that head's
+        // rows itself - one warp per token. The body is the rmsnorm_warp_bf16x2_kernel body at
+        // D = kStateDim: same pair mapping, same accumulation order, same bf16x2 rounding.
+        __shared__ bool post_norm_last;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            const unsigned int ticket =
+                atomicInc(&g_gdn_post_norm_ticket[blockIdx.x], gridDim.z - 1u);
+            post_norm_last = ticket == gridDim.z - 1u;
+        }
+        __syncthreads();
+        if (post_norm_last) {
+            constexpr int kPairs           = kStateDim / 2;
+            constexpr int kMaxPairsPerLane = 4;
+            const int lane                 = static_cast<int>(threadIdx.x);
+            const auto* mixer              = reinterpret_cast<const __nv_bfloat162*>(access.out);
+            for (std::int32_t token = static_cast<std::int32_t>(threadIdx.y); token < access.width;
+                 token += static_cast<std::int32_t>(blockDim.y)) {
+                const std::int64_t row_base =
+                    (static_cast<std::int64_t>(token) * access.heads.H_v + blockIdx.x) * kPairs;
+                __nv_bfloat162 values[kMaxPairsPerLane];
+                float sum = 0.0F;
+#pragma unroll
+                for (int item = 0; item < kMaxPairsPerLane; ++item) {
+                    const int pair = lane + item * kWarpSize;
+                    if (pair < kPairs) {
+                        values[item]    = mixer[row_base + pair];
+                        const float2 xf = __bfloat1622float2(values[item]);
+                        sum += xf.x * xf.x + xf.y * xf.y;
+                    }
+                }
+                sum = warp_reduce_sum(sum);
+                float inv =
+                    lane == 0 ? rsqrtf(sum / static_cast<float>(kStateDim) + access.post_norm_eps)
+                              : 0.0F;
+                inv = __shfl_sync(0xffffffffU, inv, 0);
+#pragma unroll
+                for (int item = 0; item < kMaxPairsPerLane; ++item) {
+                    const int pair = lane + item * kWarpSize;
+                    if (pair < kPairs) {
+                        const float2 xf = __bfloat1622float2(values[item]);
+                        const float2 wf = __bfloat1622float2(access.post_norm_weight[pair]);
+                        const float2 zf = __bfloat1622float2(access.post_norm_z[row_base + pair]);
+                        access.post_norm_out[row_base + pair] =
+                            __floats2bfloat162_rn(xf.x * inv * wf.x * silu(zf.x),
+                                                  xf.y * inv * wf.y * silu(zf.y));
+                    }
+                }
+            }
+        }
+    }
 }
 
 template <class Geometry>

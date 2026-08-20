@@ -1,3 +1,4 @@
+#include "ninfer/ops/gated_delta_net.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"
@@ -57,7 +58,7 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
                                      Tensor& ssm_states, const Tensor& valid_columns,
                                      const Tensor& initial_state_slots,
                                      const Tensor& snapshot_base_slots, Tensor& out,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, GdnPostNormSpan post_norm) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), Batched ? static_cast<unsigned>(q.ne[3]) : 1U,
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -79,6 +80,10 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
         q.ne[2],
         state_slot_stride,
         scale,
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.gate_z),
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.weight),
+        reinterpret_cast<__nv_bfloat162*>(post_norm.out),
+        post_norm.eps,
     };
     recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
@@ -90,7 +95,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, GdnPostNormSpan post_norm) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -114,6 +119,10 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         q.ne[2],
         state_slot_stride,
         scale,
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.gate_z),
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.weight),
+        reinterpret_cast<__nv_bfloat162*>(post_norm.out),
+        post_norm.eps,
     };
     recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
@@ -182,32 +191,32 @@ void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v
                                const Tensor& beta, float scale, bool normalize_qk,
                                Tensor& ssm_states, const Tensor& valid_columns,
                                const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                               Tensor& out, cudaStream_t stream) {
+                               Tensor& out, cudaStream_t stream, GdnPostNormSpan post_norm) {
     const bool dense_single = q.ne[3] == 1 && valid_columns.data == nullptr;
     if (dense_single && normalize_qk) {
         launch_recurrent_snapshot_fixed<true, false, false>(q, k, v, g, beta, scale, ssm_states,
                                                             valid_columns, initial_state_slots,
-                                                            snapshot_base_slots, out, stream);
+                                                            snapshot_base_slots, out, stream, post_norm);
     } else if (dense_single) {
         launch_recurrent_snapshot_fixed<false, false, false>(q, k, v, g, beta, scale, ssm_states,
                                                              valid_columns, initial_state_slots,
-                                                             snapshot_base_slots, out, stream);
+                                                             snapshot_base_slots, out, stream, post_norm);
     } else if (valid_columns.data == nullptr && normalize_qk) {
         launch_recurrent_snapshot_fixed<true, true, false>(q, k, v, g, beta, scale, ssm_states,
                                                            valid_columns, initial_state_slots,
-                                                           snapshot_base_slots, out, stream);
+                                                           snapshot_base_slots, out, stream, post_norm);
     } else if (valid_columns.data == nullptr) {
         launch_recurrent_snapshot_fixed<false, true, false>(q, k, v, g, beta, scale, ssm_states,
                                                             valid_columns, initial_state_slots,
-                                                            snapshot_base_slots, out, stream);
+                                                            snapshot_base_slots, out, stream, post_norm);
     } else if (normalize_qk) {
         launch_recurrent_snapshot_fixed<true, true, true>(q, k, v, g, beta, scale, ssm_states,
                                                           valid_columns, initial_state_slots,
-                                                          snapshot_base_slots, out, stream);
+                                                          snapshot_base_slots, out, stream, post_norm);
     } else {
         launch_recurrent_snapshot_fixed<false, true, true>(q, k, v, g, beta, scale, ssm_states,
                                                            valid_columns, initial_state_slots,
-                                                           snapshot_base_slots, out, stream);
+                                                           snapshot_base_slots, out, stream, post_norm);
     }
 }
 
@@ -215,15 +224,15 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream) {
+                             Tensor& out, cudaStream_t stream, GdnPostNormSpan post_norm) {
     if (valid_columns.data == nullptr) {
         launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                              initial_state_slots, key_record, value_record,
-                                             gate_record, out, stream);
+                                             gate_record, out, stream, post_norm);
     } else {
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                             initial_state_slots, key_record, value_record,
-                                            gate_record, out, stream);
+                                            gate_record, out, stream, post_norm);
     }
 }
 
