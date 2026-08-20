@@ -841,9 +841,13 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                            *active_gqa_envelope_, work_, a_batch, s);
     } else {
+        // BASEOPT-6: sigmoid gate fused into the attention reduce epilogue (bit-exact:
+        // the bf16 rounding of the reduce result is preserved before the fp32 multiply).
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                           s);
+                           s, &gate);
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+        return;
     }
     ops::sigmoid_mul(gate, a, s);
 
