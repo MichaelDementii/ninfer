@@ -291,6 +291,12 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, stream);
 }
 
+void Variant::post_mixer_fused_norm(const Tensor&, const Tensor&, float,
+                                    const PostMixerWeights&, Tensor&, WorkspaceArena&,
+                                    cudaStream_t) {
+    throw std::logic_error("qwen3_6_27b: fused post-mixer norm is not implemented");
+}
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();

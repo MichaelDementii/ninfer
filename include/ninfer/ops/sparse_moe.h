@@ -73,6 +73,7 @@ void set_next_weight_prefetch(WeightPrefetchSpan span);
  * graph-stable transient storage and carries no state beyond the call.
  */
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
+                const Tensor* pre_norm_weight = nullptr, float pre_norm_eps = 0.0f);
 
 } // namespace ninfer::ops

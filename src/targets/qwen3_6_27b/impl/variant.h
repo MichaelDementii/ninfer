@@ -29,6 +29,8 @@ struct Variant {
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
+    static constexpr bool kFusedPostMixerNorm = false;
+
     static ::ninfer::ops::WeightPrefetchSpan
     projection_prefetch_span(const FullAttentionProjectionWeights&) {
         return {};
@@ -86,6 +88,9 @@ struct Variant {
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream);
+    static void post_mixer_fused_norm(const Tensor& raw_x, const Tensor& pre_norm_weight,
+                                      float eps, const PostMixerWeights& weights, Tensor& residual,
+                                      WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);

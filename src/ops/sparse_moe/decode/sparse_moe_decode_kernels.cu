@@ -53,6 +53,51 @@ __device__ __forceinline__ float dot_bf16_eight(const __nv_bfloat16* a, const __
     return sum;
 }
 
+// Recompute the pre-MoE RMS-norm inside consumer prologs.
+// Bit-exact clone of rmsnorm_cta_bf16x2_kernel<RmsEpilogue::Offset, 256, 6> at
+// d = 2048: same pair ownership (tid + k*256), same warp/block reduction order,
+// same unit-offset epilogue and bf16x2 rounding; the rounded bits land in shared
+// memory instead of global. Threads with tid >= 256 participate in barriers only.
+__device__ __forceinline__ void moe_prenorm_to_shared(const __nv_bfloat162* __restrict__ x2,
+                                                      const __nv_bfloat162* __restrict__ gamma,
+                                                      float eps,
+                                                      __nv_bfloat162* __restrict__ out2,
+                                                      float* __restrict__ warp_sums,
+                                                      float* __restrict__ inv_shared) {
+    const int tid = static_cast<int>(threadIdx.x);
+    __nv_bfloat162 values[4];
+    float sum = 0.0f;
+    if (tid < 256) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int pair  = tid + item * 256;
+            values[item]    = x2[pair];
+            const float2 xf = __bfloat1622float2(values[item]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0 && warp < 8) { warp_sums[warp] = sum; }
+    __syncthreads();
+    float block_sum = tid < 8 ? warp_sums[tid] : 0.0f;
+    if (warp == 0) { block_sum = warp_reduce_sum<8>(block_sum); }
+    if (tid == 0) { *inv_shared = rsqrtf(block_sum / static_cast<float>(2048) + eps); }
+    __syncthreads();
+    const float inv = *inv_shared;
+    if (tid < 256) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int pair  = tid + item * 256;
+            const float2 xf = __bfloat1622float2(values[item]);
+            const float2 wf = __bfloat1622float2(gamma[pair]);
+            out2[pair]      = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
+                                                    xf.y * inv * (wf.y + 1.0f));
+        }
+    }
+}
+
 __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __nv_bfloat16* row) {
     constexpr int kSlice = kHidden / kD1Warps;
     constexpr int kVecs  = kSlice / (32 * 8);
@@ -71,12 +116,25 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores,
                                      const char* __restrict__ shared_down_codes,
-                                     unsigned long long shared_down_bytes) {
+                                     unsigned long long shared_down_bytes,
+                                     const __nv_bfloat162* __restrict__ prenorm_gamma,
+                                     float prenorm_eps) {
     __shared__ float partial[kD1Warps];
-    const int row   = static_cast<int>(blockIdx.x);
-    const int warp  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const float dot = router_row_dot(x, router + static_cast<std::int64_t>(row) * kHidden);
+    __shared__ __align__(16) __nv_bfloat16 x_normed[kHidden];
+    __shared__ float norm_warp_sums[8];
+    __shared__ float norm_inv;
+    const int row  = static_cast<int>(blockIdx.x);
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const __nv_bfloat16* xs = x;
+    if (prenorm_gamma != nullptr) {
+        moe_prenorm_to_shared(reinterpret_cast<const __nv_bfloat162*>(x), prenorm_gamma,
+                              prenorm_eps, reinterpret_cast<__nv_bfloat162*>(x_normed),
+                              norm_warp_sums, &norm_inv);
+        __syncthreads();
+        xs = x_normed;
+    }
+    const float dot = router_row_dot(xs, router + static_cast<std::int64_t>(row) * kHidden);
     if (lane == 0) { partial[warp] = dot; }
     __syncthreads();
     if (warp == 0) {
@@ -241,13 +299,24 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act) {
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act,
+    const __nv_bfloat162* __restrict__ prenorm_gamma, float prenorm_eps) {
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    __shared__ float norm_warp_sums[8];
+    __shared__ float norm_inv;
     if (tid == 0) { pdl::trigger_dependents(); }
-    if (tid < 256) { store_vec(x_shared + tid * 8, load_vec<uint4>(x + tid * 8)); }
+    if (prenorm_gamma == nullptr) {
+        if (tid < 256) { store_vec(x_shared + tid * 8, load_vec<uint4>(x + tid * 8)); }
+    } else {
+        // Raw x arrives here; the norm recompute runs BEFORE the PDL wait,
+        // so it hides inside the d1+d2 window. Warp 8 only joins the barriers.
+        moe_prenorm_to_shared(reinterpret_cast<const __nv_bfloat162*>(x), prenorm_gamma,
+                              prenorm_eps, reinterpret_cast<__nv_bfloat162*>(x_shared),
+                              norm_warp_sums, &norm_inv);
+    }
     __syncthreads();
 
     const int j = static_cast<int>(blockIdx.x);
@@ -503,18 +572,21 @@ __global__ void sparse_moe_d4_token_kernel(
 }
 
 void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
-               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+               const void* prenorm_gamma, float prenorm_eps) {
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
         static_cast<float*>(workspace.scratch.data),
-        static_cast<const char*>(weights.shared_down.qdata), 2048ull * 512ull);
+        static_cast<const char*>(weights.shared_down.qdata), 2048ull * 512ull,
+        static_cast<const __nv_bfloat162*>(prenorm_gamma), prenorm_eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Codec>
 void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
-                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                               const void* prenorm_gamma, float prenorm_eps) {
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     auto* act                 = static_cast<float*>(workspace.scratch.data);
@@ -525,11 +597,13 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
     CUDA_CHECK(pdl::launch_dependent(
         {dim3(kIntermediate), dim3(9 * 32), 0, stream}, sparse_moe_d3_nine_warp_kernel<Codec>,
-        input, ids, routed_codes, routed_high, routed_scales, shared_codes, shared_scales, act));
+        input, ids, routed_codes, routed_high, routed_scales, shared_codes, shared_scales, act,
+        static_cast<const __nv_bfloat162*>(prenorm_gamma), prenorm_eps));
 }
 
 void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
-                  const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                  const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                  const void* prenorm_gamma, float prenorm_eps) {
     const auto* scores = static_cast<const float*>(workspace.scratch.data);
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
@@ -539,10 +613,12 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
 
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
-        launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
+        launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream, prenorm_gamma,
+                                           prenorm_eps);
         return;
     case QType::W8G32_F16S:
-        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
+        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream, prenorm_gamma,
+                                           prenorm_eps);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
@@ -749,9 +825,10 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
 
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
-                              const void* prefetch_data, std::size_t prefetch_bytes) {
-    launch_d1(x, weights, workspace, stream);
-    launch_d2_d3(x, weights, workspace, stream);
+                              const void* prefetch_data, std::size_t prefetch_bytes,
+                              const void* prenorm_gamma, float prenorm_eps) {
+    launch_d1(x, weights, workspace, stream, prenorm_gamma, prenorm_eps);
+    launch_d2_d3(x, weights, workspace, stream, prenorm_gamma, prenorm_eps);
     launch_d4_dependent(weights, destination, workspace, stream, prefetch_data, prefetch_bytes);
 }
 
