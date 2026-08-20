@@ -22,6 +22,19 @@ enum class SparseMoeEpilogue : std::uint8_t {
     AddResidual,
 };
 
+struct WeightPrefetchSpan {
+    const void* data  = nullptr;
+    std::size_t bytes = 0;
+};
+
+/**
+ * Registers the weight span the NEXT decode-step consumer will stream.
+ * The next sparse_moe decode launch issues fire-and-forget L2 prefetches for it
+ * from the D4 epilogue and clears the registration. Purely a cache hint recorded
+ * at capture time; no numeric effect.
+ */
+void set_next_weight_prefetch(WeightPrefetchSpan span);
+
 /**
  * Returns the transient capacity required by SparseMoe for every T in the inclusive
  * [min_tokens,max_tokens] interval. The routed QTypes are the fixed implementation profile.
