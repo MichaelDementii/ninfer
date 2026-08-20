@@ -380,10 +380,12 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     const auto results = workspace_recipe::mtp_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    // BASEOPT-23: route the draft head through the same fused q/k norm the main decode path
+    // uses. The op falls back to the two standalone norms for any other geometry, and rope
+    // stays in its own kernel (see the note on qk_norm_rope_text_kernel).
+    ops::qk_norm_rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, q, *mtp_.q_norm, qn, k,
+                      *mtp_.k_norm, kn, kCfg.rms_eps, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
