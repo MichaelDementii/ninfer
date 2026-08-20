@@ -927,9 +927,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    const bool fused_post_norm = T == 1 && ph == Phase::Verify && active_sequence_width_ == 1 &&
-                                 gdn_state_action_ != GdnStateAction::RecordForReplay &&
-                                 kCfg.gdn_v_heads <= 64;
+    const bool record_path = gdn_state_action_ == GdnStateAction::RecordForReplay;
+    const bool fused_post_norm =
+        ph == Phase::Verify && kCfg.gdn_v_heads <= 64 && active_sequence_batch_ == 1 &&
+        (record_path ? active_sequence_width_ == T : (T == 1 && active_sequence_width_ == 1));
     if (ph == Phase::Verify) {
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
         const std::int32_t width = active_sequence_width_;
@@ -945,6 +946,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (fused_post_norm) {
+                // BASEOPT-22: hand the gated post-mixer norm to the record tail.
+                ops::set_gdn_post_norm({z.data, w.gdn_norm->data, on.data, kCfg.rms_eps});
+            }
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_slots_, records.key,
