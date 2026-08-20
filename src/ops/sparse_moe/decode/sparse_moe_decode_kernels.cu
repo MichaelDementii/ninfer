@@ -417,21 +417,22 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
             for (int row = 0; row < Rows; ++row) { paths[kTopK][row] = *shared_scale * dot[row]; }
         }
     }
+    if (prefetch_data != nullptr) {
+        // Fire-and-forget L2 warmup of the next consumer's weight codes,
+        // issued BEFORE the block barrier so it hides behind the slowest warp instead
+        // of extending the grid tail. Pure cache hint; no values, no addition order.
+        const unsigned long long offset =
+            (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
+        if (offset < prefetch_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch_data + offset));
+        }
+    }
     __syncthreads();
     if (warp == 0 && lane < Rows) {
         float value = __bfloat162float(destination[row_base + lane]);
 #pragma unroll
         for (int path = 0; path < kTopK + 1; ++path) { value += paths[path][lane]; }
         destination[row_base + lane] = __float2bfloat16_rn(value);
-    }
-    if (prefetch_data != nullptr) {
-        // Fire-and-forget L2 warmup of the next consumer's weight codes.
-        // Pure cache hint; touches no values and no addition order.
-        const unsigned long long offset =
-            (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
-        if (offset < prefetch_bytes) {
-            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch_data + offset));
-        }
     }
 }
 
