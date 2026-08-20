@@ -197,4 +197,20 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+void qk_norm_rope_text16x2_launch(const Tensor& positions, const Tensor& q_in,
+                                  const Tensor& q_weight, Tensor& q_out, const Tensor& k_in,
+                                  const Tensor& k_weight, Tensor& k_out, float eps,
+                                  cudaStream_t stream) {
+    const int tokens = positions.ne[0];
+    qk_norm_rope_text16x2_kernel<<<tokens, 576, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        reinterpret_cast<const __nv_bfloat162*>(q_in.data),
+        reinterpret_cast<const __nv_bfloat162*>(q_weight.data),
+        reinterpret_cast<__nv_bfloat162*>(q_out.data),
+        reinterpret_cast<const __nv_bfloat162*>(k_in.data),
+        reinterpret_cast<const __nv_bfloat162*>(k_weight.data),
+        reinterpret_cast<__nv_bfloat162*>(k_out.data), eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail
