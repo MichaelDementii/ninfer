@@ -75,6 +75,17 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * overwriting another row's initial slot; a row may overwrite its own initial slot after loading
  * it. This form uses no arena allocation and `ssm_states` is the only persistent state mutated.
  */
+// BASEOPT-20: registration for the post-mixer gated RMS-norm folded into the snapshot tail.
+// Set immediately before the snapshot call; the launcher consumes and clears it.
+struct GdnPostNormSpan {
+    const void* gate_z = nullptr;
+    const void* weight = nullptr;
+    void* out          = nullptr;
+    float eps          = 0.0F;
+};
+void set_gdn_post_norm(GdnPostNormSpan span);
+GdnPostNormSpan take_gdn_post_norm();
+
 void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                               const Tensor& beta, float scale, bool normalize_qk,
                               Tensor& ssm_states, const Tensor& valid_columns,

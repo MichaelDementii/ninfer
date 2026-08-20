@@ -1,3 +1,4 @@
+#include "ninfer/ops/gated_delta_net.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"
@@ -65,6 +66,7 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+    const GdnPostNormSpan post_norm = ::ninfer::ops::take_gdn_post_norm();
     const SnapshotAccess<Batched, Masked> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
@@ -82,6 +84,10 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
         scale,
         prefetch_data,
         prefetch_bytes,
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.gate_z),
+        reinterpret_cast<const __nv_bfloat162*>(post_norm.weight),
+        reinterpret_cast<__nv_bfloat162*>(post_norm.out),
+        post_norm.eps,
     };
     recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());

@@ -15,6 +15,19 @@
 #include <string>
 
 namespace ninfer::ops {
+
+namespace {
+thread_local GdnPostNormSpan g_gdn_post_norm_storage{};
+}
+
+void set_gdn_post_norm(GdnPostNormSpan span) { g_gdn_post_norm_storage = span; }
+
+GdnPostNormSpan take_gdn_post_norm() {
+    const GdnPostNormSpan span = g_gdn_post_norm_storage;
+    g_gdn_post_norm_storage    = {};
+    return span;
+}
+
 namespace {
 
 struct Geometry {

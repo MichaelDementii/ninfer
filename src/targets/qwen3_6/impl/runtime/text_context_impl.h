@@ -925,6 +925,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    const bool fused_post_norm = T == 1 && ph == Phase::Verify && active_sequence_width_ == 1 &&
+                                 gdn_state_action_ != GdnStateAction::RecordForReplay &&
+                                 kCfg.gdn_v_heads <= 64;
     if (ph == Phase::Verify) {
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
         const std::int32_t width = active_sequence_width_;
@@ -947,6 +952,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         } else {
             // BASEOPT-16 (R2-3): the snapshot tail warms L2 for this layer's out-proj
             // codes; the gated-rms window that follows leaves the bus idle. Decode only.
+            if (fused_post_norm) {
+                // BASEOPT-20: hand the gated post-mixer norm to the snapshot tail.
+                ops::set_gdn_post_norm({z.data, w.gdn_norm->data, on.data, kCfg.rms_eps});
+            }
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                                           /*normalize_qk=*/true, recurrent_states, valid,
                                           *active_linear_state_slots_, *active_linear_state_slots_,
@@ -961,9 +970,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                              /*normalize_qk=*/true, work_, recurrent_state, o, s);
     }
 
-    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (!fused_post_norm) { ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s); }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
