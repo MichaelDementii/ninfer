@@ -112,20 +112,29 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
     return warp_reduce_sum(sum);
 }
 
+// BASEOPT-18: ticket for the last-arriving D1 block. atomicInc wraps at gridDim.x-1, so the
+// counter returns to zero on its own and needs no host-side initialisation or workspace slot.
+__device__ unsigned int g_sparse_moe_route_ticket = 0;
+
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores,
                                      const char* __restrict__ shared_down_codes,
                                      unsigned long long shared_down_bytes,
                                      const __nv_bfloat162* __restrict__ prenorm_gamma,
-                                     float prenorm_eps) {
+                                     float prenorm_eps, int* __restrict__ ids,
+                                     float* __restrict__ alpha,
+                                     float* __restrict__ shared_scale) {
     __shared__ float partial[kD1Warps];
+    __shared__ float selected_logits[kTopK];
+    __shared__ bool is_last_block;
     __shared__ __align__(16) __nv_bfloat16 x_normed[kHidden];
     __shared__ float norm_warp_sums[8];
     __shared__ float norm_inv;
     const int row  = static_cast<int>(blockIdx.x);
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     const __nv_bfloat16* xs = x;
     if (prenorm_gamma != nullptr) {
         moe_prenorm_to_shared(reinterpret_cast<const __nv_bfloat162*>(x), prenorm_gamma,
@@ -141,6 +150,19 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
         float value = lane < kD1Warps ? partial[lane] : 0.0f;
         value       = warp_reduce_sum<kD1Warps>(value);
         if (lane == 0) { scores[row] = value; }
+    }
+    // BASEOPT-18: the top-8 router selection used to be a separate single-warp kernel whose cost
+    // was dominated by the fixed price of a graph node rather than by its work. The block that
+    // arrives last here runs the identical selection instead, so the node disappears. The routine,
+    // its inputs and its comparison order are unchanged, hence the routing is bit-identical.
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned int ticket = atomicInc(&g_sparse_moe_route_ticket, gridDim.x - 1u);
+        is_last_block             = ticket == gridDim.x - 1u;
+    }
+    __syncthreads();
+    if (is_last_block && warp == 0) {
+        sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
     }
     if (shared_down_codes != nullptr) {
         // BASEOPT-9: warm L2 for the shared-expert down codes that D4's shared warp
@@ -579,7 +601,9 @@ void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
         static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
         static_cast<float*>(workspace.scratch.data),
         static_cast<const char*>(weights.shared_down.qdata), 2048ull * 512ull,
-        static_cast<const __nv_bfloat162*>(prenorm_gamma), prenorm_eps);
+        static_cast<const __nv_bfloat162*>(prenorm_gamma), prenorm_eps,
+        static_cast<int*>(workspace.ids.data), static_cast<float*>(workspace.alpha.data),
+        static_cast<float*>(workspace.shared_scale.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -608,8 +632,11 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
-    CUDA_CHECK(cudaGetLastError());
+    // BASEOPT-18: D2 is folded into the last-arriving D1 block; nothing to launch here.
+    (void)scores;
+    (void)ids;
+    (void)alpha;
+    (void)shared_scale;
 
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
