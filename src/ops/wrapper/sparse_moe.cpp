@@ -197,7 +197,8 @@ constexpr std::size_t kNextWeightPrefetchLimit = std::size_t{8} << 20;
 void set_next_weight_prefetch(WeightPrefetchSpan span) { g_next_weight_prefetch = span; }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
+                const Tensor* pre_norm_weight, float pre_norm_eps) {
     const WeightPrefetchSpan next_prefetch{
         g_next_weight_prefetch.data,
         g_next_weight_prefetch.bytes < kNextWeightPrefetchLimit ? g_next_weight_prefetch.bytes
@@ -213,11 +214,18 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 
     std::vector<AddressRange> ranges;
     ranges.reserve(16);
-    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    if (pre_norm_weight == nullptr) {
+        ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    }
+    // BASEOPT-15: in fused pre-norm mode raw x IS the residual destination by design;
+    // every consumer reads x before D4's residual accumulation writes it.
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, ranges);
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
+    if (use_small_t && pre_norm_weight != nullptr) {
+        throw std::invalid_argument("sparse_moe: fused pre-norm requires the decode route");
+    }
     const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
                                                              weights.routed_down.qtype);
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
@@ -271,7 +279,10 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
         detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream,
-                                         next_prefetch.data, next_prefetch.bytes);
+                                         next_prefetch.data, next_prefetch.bytes,
+                                         pre_norm_weight == nullptr ? nullptr
+                                                                    : pre_norm_weight->data,
+                                         pre_norm_eps);
     }
 }
 

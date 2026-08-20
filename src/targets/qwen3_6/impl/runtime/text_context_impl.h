@@ -984,7 +984,15 @@ void TextContext::set_next_projection_prefetch(int layer) {
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
+    if constexpr (Variant::kFusedPostMixerNorm) {
+        if (T == 1) {
+            // BASEOPT-15: the decode MoE recomputes this norm in the d1/d3 prologs
+            // (bit-exact clone); the standalone node is skipped.
+            Variant::post_mixer_fused_norm(x, *post_norm, kCfg.rms_eps, *m.payload, x, work_, s);
+            return;
+        }
+    }
+    Tensor h = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);

@@ -64,13 +64,14 @@ bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_
 }
 
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    const Tensor* pre_norm_weight, float pre_norm_eps, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
         weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1], hidden.ne[1]));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual, leaf_workspace,
-                    stream);
+                    stream, pre_norm_weight, pre_norm_eps);
 }
 
 void validate_token_interval(std::int32_t first, std::int32_t last) {
@@ -214,12 +215,18 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
-    run_sparse_moe(hidden, weights.op, residual, workspace, stream);
+    run_sparse_moe(hidden, weights.op, residual, nullptr, 0.0f, workspace, stream);
+}
+
+void Variant::post_mixer_fused_norm(const Tensor& raw_x, const Tensor& pre_norm_weight, float eps,
+                                    const PostMixerWeights& weights, Tensor& residual,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    run_sparse_moe(raw_x, weights.op, residual, &pre_norm_weight, eps, workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
-    run_sparse_moe(hidden, weights.op, residual, workspace, stream);
+    run_sparse_moe(hidden, weights.op, residual, nullptr, 0.0f, workspace, stream);
 }
 
 std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
