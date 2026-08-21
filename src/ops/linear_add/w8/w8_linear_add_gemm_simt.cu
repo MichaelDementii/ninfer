@@ -215,7 +215,7 @@ void w8_linear_add_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& w
                                      Tensor& residual_out, cudaStream_t stream) {
     if (x.ne[1] == 1 && x.ne[0] == 4096 && w.k == 4096 &&
         w.padded_shape[1] == 4096) {
-        launch_decode_k<4096, 8>(x, w, residual_out, stream);
+        launch_decode_k<4096, 16>(x, w, residual_out, stream);
         return;
     }
     launch_variant<4>(full, x, w, residual_out, stream);
