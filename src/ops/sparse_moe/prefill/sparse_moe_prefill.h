@@ -35,6 +35,9 @@ struct SparseMoePrefillWorkspace {
     // Selection first writes a rank local to one routing tile. Gather replaces
     // it in place with the inverse map from token/route slot to packed column.
     Tensor packed_index;
+    // Inverse of packed_index: the token each packed column was routed from. Lets the routed
+    // gate/up GEMM stage its activation tile from `x` instead of a materialised copy.
+    Tensor packed_token;
     Tensor shared_scale;
     Tensor tile_counts;
     Tensor tile_bases;
@@ -67,6 +70,7 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.token_ids      = arena.alloc(DType::I32, {assignments}, 256);
     out.token_alpha    = arena.alloc(DType::FP32, {assignments}, 256);
     out.packed_index   = arena.alloc(DType::I32, {assignments}, 256);
+    out.packed_token   = arena.alloc(DType::I32, {assignments}, 256);
     out.shared_scale   = arena.alloc(DType::FP32, {capacity_tokens}, 256);
     out.tile_counts    = arena.alloc(DType::I32, {256, route_tiles}, 256);
     out.tile_bases     = arena.alloc(DType::I32, {256, route_tiles}, 256);
