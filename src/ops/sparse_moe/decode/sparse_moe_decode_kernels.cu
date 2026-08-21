@@ -456,7 +456,47 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
             }
         }
     } else if (lane < Codec::kGroupK / 2) {
-        for (int group = first_group; group < last_group; ++group) {
+        // The shared expert's W8 rows carry one FP16 scale per 32-value group and two code bytes
+        // per lane. Reading the scale inside every group leaves a single dependent load pair in
+        // flight, which is what keeps this warp behind the eight routed warps at the block barrier.
+        // Eight group scales are one 16-byte load, so hoist them per chunk and unroll the body:
+        // the eight code loads of a chunk are independent and issue together. Lane ownership,
+        // the operand bytes and the FMA order are untouched, so the result stays bit-identical.
+        constexpr int kScaleChunk = 8;
+        int group                 = first_group;
+        if ((first_group & (kScaleChunk - 1)) == 0) {
+            for (; group + kScaleChunk <= last_group; group += kScaleChunk) {
+                std::uint16_t chunk_scales[Rows][kScaleChunk];
+#pragma unroll
+                for (int row = 0; row < Rows; ++row) {
+                    const std::int64_t index =
+                        static_cast<std::int64_t>(row_base + row) * kGroups + group;
+                    *reinterpret_cast<uint4*>(&chunk_scales[row][0]) =
+                        load_vec<uint4>(scales + index * 2);
+                }
+#pragma unroll
+                for (int step = 0; step < kScaleChunk; ++step) {
+                    const int k     = (group + step) * Codec::kGroupK + lane * 2;
+                    const float2 xv = load_vec<float2>(x + k);
+#pragma unroll
+                    for (int row = 0; row < Rows; ++row) {
+                        const std::int64_t index =
+                            static_cast<std::int64_t>(row_base + row) * kGroups + group + step;
+                        const float scale =
+                            __half2float(__ushort_as_half(chunk_scales[row][step]));
+                        const std::uint8_t* packed = codes + index * Codec::kGroupK +
+                                                     static_cast<std::int64_t>(lane) * 2;
+                        const float w0 =
+                            static_cast<float>(static_cast<std::int8_t>(packed[0])) * scale;
+                        const float w1 =
+                            static_cast<float>(static_cast<std::int8_t>(packed[1])) * scale;
+                        acc[row] = fmaf(w0, xv.x, acc[row]);
+                        acc[row] = fmaf(w1, xv.y, acc[row]);
+                    }
+                }
+            }
+        }
+        for (; group < last_group; ++group) {
             const int k     = group * Codec::kGroupK + lane * 2;
             const float2 xv = load_vec<float2>(x + k);
 #pragma unroll
