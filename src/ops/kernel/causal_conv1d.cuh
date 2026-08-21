@@ -85,6 +85,88 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 
+// Split-output forms of the two prefill kernels. Identical arithmetic; the output column is
+// routed to one of three destinations by channel so the caller keeps q/k/v already unpacked.
+__global__ void causal_conv1d_prefill_split_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* conv_state,
+    __nv_bfloat16* out0, __nv_bfloat16* out1, __nv_bfloat16* out2, std::int32_t split0,
+    std::int32_t split1, std::int32_t C, std::int32_t T) {
+    const std::int64_t C64      = static_cast<std::int64_t>(C);
+    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t c_base   = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
+    const std::int64_t c        = c_base + threadIdx.x;
+    if (t >= T || c >= C64) { return; }
+
+    const std::int32_t ci      = static_cast<std::int32_t>(c);
+    const std::int64_t in_idx  = static_cast<std::int64_t>(t) * C64 + c;
+    const __nv_bfloat16 x0     = (t >= 3) ? x[static_cast<std::int64_t>(t - 3) * C64 + c]
+                                          : conv_state[static_cast<std::int64_t>(t) * C64 + c];
+    const __nv_bfloat16 x1     = (t >= 2) ? x[static_cast<std::int64_t>(t - 2) * C64 + c]
+                                          : conv_state[static_cast<std::int64_t>(t + 1) * C64 + c];
+    const __nv_bfloat16 x2     = (t >= 1) ? x[static_cast<std::int64_t>(t - 1) * C64 + c]
+                                          : conv_state[static_cast<std::int64_t>(t + 2) * C64 + c];
+    const __nv_bfloat16 x3     = x[in_idx];
+
+    float acc = 0.0f;
+    acc += __bfloat162float(weight[ci]) * __bfloat162float(x0);
+    acc += __bfloat162float(weight[C64 + ci]) * __bfloat162float(x1);
+    acc += __bfloat162float(weight[2 * C64 + ci]) * __bfloat162float(x2);
+    acc += __bfloat162float(weight[3 * C64 + ci]) * __bfloat162float(x3);
+
+    const std::int64_t s0 = split0;
+    const std::int64_t s1 = split1;
+    __nv_bfloat16* dst    = c < s0 ? out0 + static_cast<std::int64_t>(t) * s0 + c
+                           : c < s1 ? out1 + static_cast<std::int64_t>(t) * (s1 - s0) + (c - s0)
+                                    : out2 + static_cast<std::int64_t>(t) * (C64 - s1) + (c - s1);
+    *dst                  = __float2bfloat16_rn(silu(acc));
+}
+
+__global__ void causal_conv1d_prefill_pairs_split_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* conv_state,
+    __nv_bfloat16* out0, __nv_bfloat16* out1, __nv_bfloat16* out2, std::int32_t split0,
+    std::int32_t split1, std::int32_t C, std::int32_t T) {
+    const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
+    const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t         = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t pair_base = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
+    const std::int64_t p         = pair_base + threadIdx.x;
+    if (t >= T || p >= C2) { return; }
+
+    const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* state2  = reinterpret_cast<const __nv_bfloat162*>(conv_state);
+
+    const std::int64_t in_idx = static_cast<std::int64_t>(t) * C2 + p;
+    const __nv_bfloat162 x0   = (t >= 3) ? x2[static_cast<std::int64_t>(t - 3) * C2 + p]
+                                         : state2[static_cast<std::int64_t>(t) * C2 + p];
+    const __nv_bfloat162 x1   = (t >= 2) ? x2[static_cast<std::int64_t>(t - 2) * C2 + p]
+                                         : state2[static_cast<std::int64_t>(t + 1) * C2 + p];
+    const __nv_bfloat162 x2v  = (t >= 1) ? x2[static_cast<std::int64_t>(t - 1) * C2 + p]
+                                         : state2[static_cast<std::int64_t>(t + 2) * C2 + p];
+    const __nv_bfloat162 x3   = x2[in_idx];
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    causal_conv1d_acc_pair(weight2[p], x0, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
+
+    const std::int64_t s0 = split0 / 2;
+    const std::int64_t s1 = split1 / 2;
+    __nv_bfloat162* dst =
+        p < s0 ? reinterpret_cast<__nv_bfloat162*>(out0) + static_cast<std::int64_t>(t) * s0 + p
+        : p < s1
+            ? reinterpret_cast<__nv_bfloat162*>(out1) + static_cast<std::int64_t>(t) * (s1 - s0) +
+                  (p - s0)
+            : reinterpret_cast<__nv_bfloat162*>(out2) + static_cast<std::int64_t>(t) * (C2 - s1) +
+                  (p - s1);
+    *dst = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+}
+
 // Writes the trailing width-3 conv window after consuming the T input columns.
 // The initial window is read from `conv_state_in` and the new window is written
 // to `conv_state_out`; passing the same pointer for both is the in-place form.

@@ -1,5 +1,6 @@
 // ninfer::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "ninfer/ops/scatter.h"
 
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
@@ -167,6 +168,36 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
     } else {
         detail::causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
     }
+}
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                              Tensor& conv_state_out, Tensor& out_q, Tensor& out_k, Tensor& out_v,
+                              Tensor& scratch, cudaStream_t stream) {
+    if (out_q.dtype != DType::BF16 || out_k.dtype != DType::BF16 || out_v.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: split destinations must be BF16");
+    }
+    if (out_q.ne[0] + out_k.ne[0] + out_v.ne[0] != x.ne[0] || out_q.ne[1] != x.ne[1] ||
+        out_k.ne[1] != x.ne[1] || out_v.ne[1] != x.ne[1]) {
+        throw std::invalid_argument("causal_conv1d: split destinations must partition x by row");
+    }
+    if (!out_q.is_contiguous() || !out_k.is_contiguous() || !out_v.is_contiguous() ||
+        out_q.data == nullptr || out_k.data == nullptr || out_v.data == nullptr) {
+        throw std::invalid_argument(
+            "causal_conv1d: split destinations must be contiguous and non-null");
+    }
+    if (x.ne[1] > detail::kCausalConvSequenceMaxTokens) {
+        require_x_shape(x);
+        require_weight_shape(weight, x.ne[0]);
+        require_state_shape(conv_state_in, x.ne[0]);
+        require_state_shape(conv_state_out, x.ne[0]);
+        detail::causal_conv1d_prefill_split_launch(x, weight, conv_state_in, conv_state_out, out_q,
+                                                   out_k, out_v, stream);
+        return;
+    }
+    causal_conv1d_silu(x, weight, conv_state_in, conv_state_out, scratch, stream);
+    extract_bf16_columns(scratch, 0, out_q, stream);
+    extract_bf16_columns(scratch, out_q.ne[0], out_k, stream);
+    extract_bf16_columns(scratch, out_q.ne[0] + out_k.ne[0], out_v, stream);
 }
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
