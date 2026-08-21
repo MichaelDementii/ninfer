@@ -26,7 +26,7 @@ void launch_companion_decode(const Tensor& x, const Weight& weight, Tensor& q, T
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     constexpr int kRows       = 9216;
-    constexpr int kRowsPerCta = 8;
+    constexpr int kRowsPerCta = 4;
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
     using Output = W8SplitOutput4<4096, 512, 4096, 512>;
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),

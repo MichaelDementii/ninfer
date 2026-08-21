@@ -55,7 +55,7 @@ make_conv_epilogue(const Tensor& conv_weight, Tensor& conv_states, const Tensor&
 void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
     constexpr int kRows       = 12288;
-    constexpr int kRowsPerCta = 8;
+    constexpr int kRowsPerCta = 4;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     w8_k2048_decode_kernel<kRows, kRowsPerCta>
@@ -71,7 +71,7 @@ void w8_gdn_input_decode_conv_snapshot_launch(
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
     constexpr int kRows       = 12288;
-    constexpr int kRowsPerCta = 8;
+    constexpr int kRowsPerCta = 4;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
     const W8GdnDecodeConvEpilogue epilogue{
