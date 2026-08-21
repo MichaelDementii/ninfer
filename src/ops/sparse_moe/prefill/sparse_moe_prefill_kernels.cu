@@ -683,6 +683,12 @@ struct Q5DownMma {
                                                             int lane) {
         return Q5MmaDecodeAtom::decode_pair(codes, high, scale, row, lane);
     }
+
+    __device__ static __forceinline__ void decode_eight(unsigned word,
+                                                        const std::uint8_t* high_chunk, float scale,
+                                                        unsigned (&out)[4]) {
+        Q5MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
+    }
 };
 
 struct Q6DownMma {
@@ -693,6 +699,12 @@ struct Q6DownMma {
                                                             const std::uint8_t* scale, int row,
                                                             int lane) {
         return Q6MmaDecodeAtom::decode_pair(codes, high, scale, row, lane);
+    }
+
+    __device__ static __forceinline__ void decode_eight(unsigned word,
+                                                        const std::uint8_t* high_chunk, float scale,
+                                                        unsigned (&out)[4]) {
+        Q6MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
     }
 };
 
@@ -780,10 +792,20 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         };
 
         auto decode_weight = [&](int stage, int kt) {
-            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
-                const __nv_bfloat162 value = Codec::decode(
-                    Cr[stage], Hr[stage], &Sr[(row * GroupsPerRow + kt) * 2], row, lane);
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
+            constexpr int ChunksPerRow = 32 / 4;
+            constexpr int HighPerChunk = Codec::kHighBytes / ChunksPerRow;
+            for (int item = tid; item < kExpertBM * ChunksPerRow; item += ExpertThreads) {
+                const int row     = item / ChunksPerRow;
+                const int chunk   = item - row * ChunksPerRow;
+                const float scale = __half2float(__ushort_as_half(
+                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
+                unsigned decoded[4];
+                Codec::decode_eight(
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
+                    &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], scale, decoded);
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
+                          make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
+                                    static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
             }
         };
 
