@@ -257,6 +257,28 @@ constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
 constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
+// Eight packed Q4 codes -> four bf16 pairs in weight order. Bit-identical to the scalar
+// (nibble -> int -> float -> bf16) path: the codes decode to integers in [-8, 7], which bf16
+// represents exactly, so `128 + (code ^ 8)` minus `136` reproduces the same bits.
+__device__ __forceinline__ void q4_decode_eight_bf16(unsigned word, unsigned (&out)[4]) {
+    const unsigned kBias  = 0x43084308u; // bf16 136.0 in both halves
+    const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
+    word ^= 0x88888888u;
+    const unsigned lo   = word & 0x0f0f0f0fu;
+    const unsigned hi   = (word >> 4) & 0x0f0f0f0fu;
+    const unsigned even = __byte_perm(lo, hi, 0x5140);
+    const unsigned odd  = __byte_perm(lo, hi, 0x7362);
+    const unsigned biased[4] = {__byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+                                __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 value =
+            __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
+                    *reinterpret_cast<const __nv_bfloat162*>(&kBias));
+        out[i] = *reinterpret_cast<const unsigned*>(&value);
+    }
+}
+
 template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
@@ -342,13 +364,16 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         };
 
         auto decode_weight = [&](int stage) {
-            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
-                const std::uint8_t packed = Cr[stage][row * 32 + lane];
-                const int q0              = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-                const int q1              = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
-                const __nv_bfloat162 value =
-                    __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
+            constexpr int ChunksPerRow = 32 / 4;
+            for (int item = tid; item < kExpertBM * ChunksPerRow; item += ExpertThreads) {
+                const int row   = item / ChunksPerRow;
+                const int chunk = item - row * ChunksPerRow;
+                unsigned decoded[4];
+                q4_decode_eight_bf16(
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
+                          make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
+                                    static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
             }
         };
 
