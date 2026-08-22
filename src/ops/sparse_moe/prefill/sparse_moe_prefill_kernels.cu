@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -279,6 +280,39 @@ constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
 constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
+// [research] ширина задания MoE-GEMM prefill: NINFER_MOE_BN=64|128.
+inline int ninfer_moe_bn_override() {
+    static const int value = [] {
+        const char* env  = std::getenv("NINFER_MOE_BN");
+        const int parsed = env == nullptr ? 64 : std::atoi(env);
+        return parsed == 128 ? 128 : 64;
+    }();
+    return value;
+}
+inline int ninfer_moe_wide_blocks() {
+    return ninfer_moe_bn_override() == 128 ? 2 * kRtx5090SmCount : kPrefillPersistentBlocks;
+}
+#define NINFER_MOE_LAUNCH_Q4GU(...)                                                                \
+    do {                                                                                           \
+        if (ninfer_moe_bn_override() == 128) {                                                     \
+            sparse_moe_prefill_q4_gate_up_kernel<8, 128>                                           \
+                <<<ninfer_moe_wide_blocks(), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+        } else {                                                                                   \
+            sparse_moe_prefill_q4_gate_up_kernel<8, 64>                                            \
+                <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+        }                                                                                          \
+    } while (0)
+#define NINFER_MOE_LAUNCH_DOWN(CODEC, ...)                                                         \
+    do {                                                                                           \
+        if (ninfer_moe_bn_override() == 128) {                                                     \
+            sparse_moe_prefill_qx_down_kernel<CODEC, 8, 128>                                       \
+                <<<ninfer_moe_wide_blocks(), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+        } else {                                                                                   \
+            sparse_moe_prefill_qx_down_kernel<CODEC, 8, 64>                                        \
+                <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+        }                                                                                          \
+    } while (0)
+
 // Eight packed Q4 codes -> four bf16 pairs in weight order. Bit-identical to the scalar
 // (nibble -> int -> float -> bf16) path: the codes decode to integers in [-8, 7], which bf16
 // represents exactly, so `128 + (code ^ 8)` minus `136` reproduces the same bits.
@@ -302,7 +336,7 @@ __device__ __forceinline__ void q4_decode_eight_bf16(unsigned word, unsigned (&o
 }
 
 template <int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
+__global__ __launch_bounds__(ExpertWarps * 32, ExpertBN >= 128 ? 2 : 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
     const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
@@ -733,13 +767,16 @@ struct Q6DownMma {
 };
 
 template <class Codec, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_down_kernel(
+__global__ __launch_bounds__(ExpertWarps * 32, ExpertBN >= 128 ? 2 : 3) void sparse_moe_prefill_qx_down_kernel(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ output) {
     constexpr int ExpertThreads = ExpertWarps * 32;
+    constexpr int WarpCols      = ExpertBN / ExpertWarps;
+    constexpr int WarpNT        = WarpCols / 8;
+    static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
     constexpr int GroupsPerRow  = kIntermediate / 64;
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
@@ -771,7 +808,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         const int count       = expert_offsets[expert + 1] - begin;
         const int column_base = route_job_columns[route_job];
         const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
-        float acc[4][4]       = {};
+        float acc[4][WarpNT][4] = {};
 
         auto stage_scales = [&] {
             for (int row = tid; row < kExpertBM; row += ExpertThreads) {
@@ -853,7 +890,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
 #pragma unroll
                 for (int ki = 0; ki < kExpertBK / 16; ++ki) {
                     unsigned af[4][4];
-                    unsigned bf[2];
+                    unsigned bf[WarpNT][2];
 #pragma unroll
                     for (int mi = 0; mi < 4; ++mi) {
                         const int row = mi * 16 + a_rowoff;
@@ -861,14 +898,22 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
                         ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
                                     smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
                     }
-                    const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
-                    ldmatrix_x2(bf[0], bf[1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+#pragma unroll
+                    for (int ni = 0; ni < WarpNT; ++ni) {
+                        const int brow = warp * WarpCols + ni * 8 + b_rin;
+                        ldmatrix_x2(
+                            bf[ni][0], bf[ni][1],
+                            smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                    }
 #pragma unroll
                     for (int mi = 0; mi < 4; ++mi) {
-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
-                                 af[mi][1], af[mi][2], af[mi][3], bf[0], bf[1]);
+#pragma unroll
+                        for (int ni = 0; ni < WarpNT; ++ni) {
+                            mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                                     acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                     bf[ni][0], bf[ni][1]);
+                        }
                     }
                 }
             }
@@ -881,26 +926,29 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         cp_wait<0>();
         __syncthreads();
 
-        if (warp * 8 < cols) {
+        if (warp * WarpCols < cols) {
 #pragma unroll
             for (int mi = 0; mi < 4; ++mi) {
                 const int output_row0 = row0 + mi * 16 + gid;
                 const int output_row1 = output_row0 + 8;
-                const int col0        = begin + column_base + warp * 8 + 2 * lid;
-                const int col1        = col0 + 1;
-                const int local_col0  = warp * 8 + 2 * lid;
-                const int local_col1  = local_col0 + 1;
-                if (local_col0 < cols) {
-                    output[static_cast<std::int64_t>(col0) * kHidden + output_row0] =
-                        __float2bfloat16_rn(acc[mi][0]);
-                    output[static_cast<std::int64_t>(col0) * kHidden + output_row1] =
-                        __float2bfloat16_rn(acc[mi][2]);
-                }
-                if (local_col1 < cols) {
-                    output[static_cast<std::int64_t>(col1) * kHidden + output_row0] =
-                        __float2bfloat16_rn(acc[mi][1]);
-                    output[static_cast<std::int64_t>(col1) * kHidden + output_row1] =
-                        __float2bfloat16_rn(acc[mi][3]);
+#pragma unroll
+                for (int ni = 0; ni < WarpNT; ++ni) {
+                    const int local_col0 = warp * WarpCols + ni * 8 + 2 * lid;
+                    const int local_col1 = local_col0 + 1;
+                    const int col0       = begin + column_base + local_col0;
+                    const int col1       = col0 + 1;
+                    if (local_col0 < cols) {
+                        output[static_cast<std::int64_t>(col0) * kHidden + output_row0] =
+                            __float2bfloat16_rn(acc[mi][ni][0]);
+                        output[static_cast<std::int64_t>(col0) * kHidden + output_row1] =
+                            __float2bfloat16_rn(acc[mi][ni][2]);
+                    }
+                    if (local_col1 < cols) {
+                        output[static_cast<std::int64_t>(col1) * kHidden + output_row0] =
+                            __float2bfloat16_rn(acc[mi][ni][1]);
+                        output[static_cast<std::int64_t>(col1) * kHidden + output_row1] =
+                            __float2bfloat16_rn(acc[mi][ni][3]);
+                    }
                 }
             }
         }
@@ -1214,7 +1262,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
-        const int route_job_bn = wide_plan ? 64 : 32;
+        const int route_job_bn = wide_plan ? ninfer_moe_bn_override() : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive);
@@ -1249,8 +1297,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
-                sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                NINFER_MOE_LAUNCH_Q4GU(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
@@ -1288,8 +1335,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
             if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                NINFER_MOE_LAUNCH_DOWN(Q5DownMma, 
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
@@ -1303,8 +1349,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             break;
         case QType::Q6G64_F16S:
             if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                NINFER_MOE_LAUNCH_DOWN(Q6DownMma, 
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
