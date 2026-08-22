@@ -5,7 +5,6 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-
 bool sparse_moe_uses_small_t(std::int32_t tokens) noexcept {
     return tokens >= kSparseMoeSmallTMin && tokens <= kSparseMoeSmallTMax;
 }
@@ -43,15 +42,11 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
     }
 
     plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
-    if (routed_down == QType::Q5G64_F16S) {
-        plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
-                           : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
-                                          : SparseMoeSmallTD4Schedule::Rows4;
-    } else {
-        plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
-                           : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
-                                          : SparseMoeSmallTD4Schedule::Rows4;
-    }
+    // One row per weight stream was the entry point of this ladder, but at the only width that
+    // reaches it, T=2, it costs 6.3% of the decode step against two rows, and two rows is not
+    // behind anywhere else in the small-T range. Both codecs resolve the same way.
+    plan.d4_schedule = tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
+                                    : SparseMoeSmallTD4Schedule::Rows4;
     return plan;
 }
 
