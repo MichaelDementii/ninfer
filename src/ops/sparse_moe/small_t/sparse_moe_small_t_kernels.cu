@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -152,11 +153,52 @@ void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* parti
     CUDA_CHECK(cudaGetLastError());
 }
 
+
+// S2 reduces the router partials and picks the top eight. It runs in a single CTA with one warp
+// per column, so at the widths a speculative round actually uses it occupies one SM out of a
+// hundred and seventy and the whole cost is the dependent load chain. One CTA per column shortens
+// that chain without touching the arithmetic: the partition sum keeps its order, so the scores and
+// therefore the selection are bit-identical.
+template <int Tokens>
+__global__ void sparse_moe_small_t_s2_wide_kernel(const float* __restrict__ partial_scores,
+                                                  int* __restrict__ token_ids,
+                                                  float* __restrict__ token_alpha,
+                                                  float* __restrict__ shared_scale) {
+    static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
+    __shared__ float scores[kRouterRows];
+    __shared__ float selected_logits[kTopK];
+    const int token = static_cast<int>(blockIdx.x);
+    const int tid   = static_cast<int>(threadIdx.x);
+    if (tid == 0) { pdl::trigger_dependents(); }
+    pdl::wait_for_dependencies();
+    for (int row = tid; row < kRouterRows; row += static_cast<int>(blockDim.x)) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int partition = 0; partition < kRouterPartitions; ++partition) {
+            sum += partial_scores[(static_cast<std::int64_t>(token) * kRouterRows + row) *
+                                      kRouterPartitions +
+                                  partition];
+        }
+        scores[row] = sum;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        sparse_moe_select_top8_warp(scores, token_ids + token * kTopK, token_alpha + token * kTopK,
+                                    shared_scale + token, selected_logits);
+    }
+}
+
+
 template <int Tokens>
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
                cudaStream_t stream) {
     constexpr int kThreads = (Tokens < 32 ? Tokens : 32) * 32;
-    if constexpr (Tokens <= 44) {
+    constexpr int kWideThreads = 512;
+    if constexpr (true) {
+        CUDA_CHECK(pdl::launch_dependent({dim3(Tokens), dim3(kWideThreads), 0, stream},
+                                         sparse_moe_small_t_s2_wide_kernel<Tokens>, partial_scores,
+                                         token_ids, token_alpha, shared_scale));
+    } else if constexpr (Tokens <= 44) {
         CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
                                          sparse_moe_small_t_s2_kernel<Tokens>, partial_scores,
                                          token_ids, token_alpha, shared_scale));
