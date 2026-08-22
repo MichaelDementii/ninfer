@@ -568,7 +568,7 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
 }
 
 template <class RoutedCodec, int Rows, bool Adaptive>
-__global__ void sparse_moe_d4_token_kernel(
+__global__ __launch_bounds__(9 * 32, 6) void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
