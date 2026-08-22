@@ -44,9 +44,9 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
 
     plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
     if (routed_down == QType::Q5G64_F16S) {
-        plan.d4_schedule = tokens <= 2   ? SparseMoeSmallTD4Schedule::Rows1
-                           : tokens <= 5 ? SparseMoeSmallTD4Schedule::Rows2
-                                         : SparseMoeSmallTD4Schedule::Rows4;
+        plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
+                           : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
+                                          : SparseMoeSmallTD4Schedule::Rows4;
     } else {
         plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
                            : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
