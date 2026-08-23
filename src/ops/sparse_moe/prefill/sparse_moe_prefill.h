@@ -18,7 +18,7 @@ inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
-inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
+inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 8192;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
 // 257 logits padded to a 16-byte-aligned per-token stride.
 inline constexpr std::int32_t kSparseMoeRouterScoreRows = 260;
