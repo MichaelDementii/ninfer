@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {

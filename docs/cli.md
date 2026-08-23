@@ -171,7 +171,7 @@ measured recommendation rather than a semantic limit.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..15` where the target registers that window, otherwise `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
