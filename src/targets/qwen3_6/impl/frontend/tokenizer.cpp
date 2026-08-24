@@ -527,6 +527,13 @@ struct BpeWordEnd {
     std::size_t token_frontier    = 0;
 };
 
+// One token of a merged word, with its end offset measured from the start of the word so the
+// entry stays valid wherever that word appears in the text.
+struct BpeWordToken {
+    int symbol      = -1;
+    std::size_t end = 0;
+};
+
 struct LaterBpeCandidate {
     bool operator()(const BpeCandidate& lhs, const BpeCandidate& rhs) const noexcept {
         if (lhs.rank != rhs.rank) { return lhs.rank > rhs.rank; }
@@ -553,9 +560,27 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
+    // The merge order is a pure function of the word, so a repeated word does not have to be
+    // merged again. Keys are views into `normalized`, which outlives this loop.
+    std::unordered_map<std::string_view, std::vector<BpeWordToken>> word_cache;
+    std::vector<BpeWordToken> merged;
+
     for (std::size_t begin = 0; begin < normalized.size();) {
         const std::size_t end = qwen_word_end(normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
+        if (const auto cached = word_cache.find(word); cached != word_cache.end()) {
+            for (const BpeWordToken token : cached->second) {
+                ids.push_back(token.symbol);
+                if (token_ends != nullptr) { token_ends->push_back(begin + token.end); }
+                if (ids.size() == max_tokens) { return false; }
+            }
+            if (word_ends != nullptr) {
+                word_ends->push_back(
+                    BpeWordEnd{.normalized_offset = end, .token_frontier = ids.size()});
+            }
+            begin = end;
+            continue;
+        }
         std::vector<BpeNode> nodes(word.size());
         for (std::size_t index = 0; index < word.size(); ++index) {
             const unsigned char byte = static_cast<unsigned char>(word[index]);
@@ -614,12 +639,18 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
             push_candidate(left.previous);
             push_candidate(candidate.left);
         }
+        merged.clear();
         for (int node = nodes.empty() ? -1 : 0; node >= 0;
              node     = nodes[static_cast<std::size_t>(node)].next) {
-            ids.push_back(nodes[static_cast<std::size_t>(node)].symbol);
-            if (token_ends != nullptr) {
-                token_ends->push_back(begin + nodes[static_cast<std::size_t>(node)].end);
-            }
+            merged.push_back(BpeWordToken{.symbol = nodes[static_cast<std::size_t>(node)].symbol,
+                                          .end    = nodes[static_cast<std::size_t>(node)].end});
+        }
+        // Record the whole word before emitting: a token budget that runs out mid-word must not
+        // leave a truncated entry behind for the next occurrence to copy.
+        word_cache.emplace(word, merged);
+        for (const BpeWordToken token : merged) {
+            ids.push_back(token.symbol);
+            if (token_ends != nullptr) { token_ends->push_back(begin + token.end); }
             if (ids.size() == max_tokens) { return false; }
         }
         if (word_ends != nullptr) {
