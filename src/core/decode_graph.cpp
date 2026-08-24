@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <stdexcept>
+#include <cstddef>
 #include <string>
 
 namespace ninfer {
@@ -15,6 +16,8 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
                      cudaGetErrorString(err));
     }
 }
+
+std::size_t g_last_instantiated_nodes = 0;
 
 void destroy_graph_exec(cudaGraphExec_t& exec) noexcept {
     if (exec != nullptr) {
@@ -105,6 +108,12 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     reset();
 
     cudaGraphExec_t exec  = nullptr;
+    {
+        std::size_t captured = 0;
+        if (cudaGraphGetNodes(definition.graph_, nullptr, &captured) == cudaSuccess) {
+            g_last_instantiated_nodes = captured;
+        }
+    }
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
@@ -112,6 +121,43 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     }
     exec_ = exec;
 }
+
+namespace {
+
+
+
+std::string graph_update_shape_description(cudaGraph_t replacement) {
+    std::size_t now = 0;
+    if (cudaGraphGetNodes(replacement, nullptr, &now) != cudaSuccess) { return ""; }
+    return "; captured " + std::to_string(g_last_instantiated_nodes) + " nodes, now " +
+           std::to_string(now);
+}
+
+// A topology change names a node; report which one, and for a kernel node which function, so the
+// message points at the route that moved rather than at the round as a whole.
+std::string graph_update_node_description(const cudaGraphExecUpdateResultInfo& info) {
+    const cudaGraphNode_t node = info.errorNode != nullptr ? info.errorNode : info.errorFromNode;
+    if (node == nullptr) { return " at an unnamed node"; }
+
+    cudaGraphNodeType type{};
+    if (cudaGraphNodeGetType(node, &type) != cudaSuccess) { return " at an unreadable node"; }
+    if (type != cudaGraphNodeTypeKernel) {
+        return " at a non-kernel node of type " + std::to_string(static_cast<int>(type));
+    }
+
+    cudaKernelNodeParams params{};
+    if (cudaGraphKernelNodeGetParams(node, &params) != cudaSuccess) {
+        return " at a kernel node whose parameters could not be read";
+    }
+    const char* name = nullptr;
+    if (cudaFuncGetName(&name, params.func) != cudaSuccess || name == nullptr) {
+        return " at an unnamed kernel node";
+    }
+    return std::string(" at kernel ") + name + " grid " + std::to_string(params.gridDim.x) + "x" +
+           std::to_string(params.gridDim.y) + " block " + std::to_string(params.blockDim.x);
+}
+
+} // namespace
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     if (!ready() || !definition.ready()) {
@@ -123,7 +169,9 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+            " (update result " + std::to_string(static_cast<int>(result.result)) + ")" +
+            graph_update_node_description(result) +
+            graph_update_shape_description(definition.graph_));
     }
 }
 
