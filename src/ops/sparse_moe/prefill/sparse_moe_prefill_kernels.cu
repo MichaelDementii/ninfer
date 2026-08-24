@@ -205,6 +205,10 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         cursor += tile_counts[index];
     }
 
+    // Thread e read scan[e-1] above; do not let thread e-1 overwrite it until every thread
+    // has taken its copy. The tile_bases loop in between makes the window wide in practice,
+    // but wide is not closed.
+    __syncthreads();
     scan[expert] = (count + job_bn - 1) / job_bn;
     __syncthreads();
 #pragma unroll
