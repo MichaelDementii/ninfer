@@ -280,23 +280,23 @@ constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
 constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
-// [research] ширина задания MoE-GEMM prefill: NINFER_MOE_BN=64|128.
-inline int ninfer_moe_bn_override() {
-    static const int value = [] {
-        const char* env  = std::getenv("NINFER_MOE_BN");
-        const int parsed = env == nullptr ? 64 : std::atoi(env);
-        return parsed == 128 ? 128 : 64;
-    }();
-    return value;
+// Job width for the grouped MoE prefill GEMM. Each job re-reads its expert's whole weight slab,
+// and the average column run per expert is tokens/32 at top-8 of 256, so a width of 64 covers a
+// 2048-token chunk exactly and re-reads every slab twice at 4096, four times at 8192. Pick the
+// width from the chunk.
+constexpr int kSparseMoePrefillWideBnTokens = 4096;
+
+inline int ninfer_moe_bn_for(int tokens) {
+    return tokens >= kSparseMoePrefillWideBnTokens ? 128 : 64;
 }
-inline int ninfer_moe_wide_blocks() {
-    return ninfer_moe_bn_override() == 128 ? 2 * kRtx5090SmCount : kPrefillPersistentBlocks;
+inline int ninfer_moe_wide_blocks(int tokens) {
+    return ninfer_moe_bn_for(tokens) == 128 ? 2 * kRtx5090SmCount : kPrefillPersistentBlocks;
 }
 #define NINFER_MOE_LAUNCH_Q4GU(...)                                                                \
     do {                                                                                           \
-        if (ninfer_moe_bn_override() == 128) {                                                     \
+        if (ninfer_moe_bn_for(tokens) == 128) {                                                     \
             sparse_moe_prefill_q4_gate_up_kernel<8, 128>                                           \
-                <<<ninfer_moe_wide_blocks(), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+                <<<ninfer_moe_wide_blocks(tokens), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
         } else {                                                                                   \
             sparse_moe_prefill_q4_gate_up_kernel<8, 64>                                            \
                 <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
@@ -304,9 +304,9 @@ inline int ninfer_moe_wide_blocks() {
     } while (0)
 #define NINFER_MOE_LAUNCH_DOWN(CODEC, ...)                                                         \
     do {                                                                                           \
-        if (ninfer_moe_bn_override() == 128) {                                                     \
+        if (ninfer_moe_bn_for(tokens) == 128) {                                                     \
             sparse_moe_prefill_qx_down_kernel<CODEC, 8, 128>                                       \
-                <<<ninfer_moe_wide_blocks(), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
+                <<<ninfer_moe_wide_blocks(tokens), 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
         } else {                                                                                   \
             sparse_moe_prefill_qx_down_kernel<CODEC, 8, 64>                                        \
                 <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(__VA_ARGS__);                    \
@@ -1262,7 +1262,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
-        const int route_job_bn = wide_plan ? ninfer_moe_bn_override() : 32;
+        const int route_job_bn = wide_plan ? ninfer_moe_bn_for(tokens) : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive);
