@@ -1,6 +1,9 @@
 #pragma once
 
+#include "ninfer/ops/gated_delta_net.h"
+
 #include "ops/common/bf16_vector.cuh"
+#include "ops/common/math.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
@@ -14,6 +17,49 @@ inline constexpr int kDvPerWarp = 4;
 inline constexpr int kNumWarps  = 4;
 inline constexpr int kBlockDv   = kNumWarps * kDvPerWarp;
 inline constexpr int kQkPerLane = kStateDim / kWarpSize;
+
+// One completion ticket per (value head, batch row). atomicInc wraps at gridDim.z-1, and every
+// slot the grid touches receives exactly gridDim.z increments per launch, so each counter returns
+// to zero on its own and no host-side reset is needed. That invariant is what makes an early
+// return anywhere ahead of the tail unsafe: a block that skips its increment leaves the slot
+// non-zero and the next launch elects its winner one tile too soon.
+__device__ unsigned int g_gdn_post_norm_ticket[kGdnPostNormMaxHeads * kGdnPostNormMaxBatch] = {};
+
+// Clone of rmsnorm_warp_bf16x2_kernel<Gated, 512> at D = kStateDim, one warp per row.
+__device__ __forceinline__ void gdn_post_norm_row(const __nv_bfloat162* __restrict__ mixer,
+                                                  const __nv_bfloat162* __restrict__ weight,
+                                                  const __nv_bfloat162* __restrict__ gate_z,
+                                                  __nv_bfloat162* __restrict__ out,
+                                                  std::int64_t row_base, int lane, float eps) {
+    constexpr int kPairs           = kStateDim / 2;
+    constexpr int kMaxPairsPerLane = 4;
+    static_assert(kPairs <= kMaxPairsPerLane * kWarpSize);
+    __nv_bfloat162 values[kMaxPairsPerLane];
+    float sum = 0.0F;
+#pragma unroll
+    for (int item = 0; item < kMaxPairsPerLane; ++item) {
+        const int pair = lane + item * kWarpSize;
+        if (pair < kPairs) {
+            values[item]    = mixer[row_base + pair];
+            const float2 xf = __bfloat1622float2(values[item]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+    }
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(kStateDim) + eps) : 0.0F;
+    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+#pragma unroll
+    for (int item = 0; item < kMaxPairsPerLane; ++item) {
+        const int pair = lane + item * kWarpSize;
+        if (pair < kPairs) {
+            const float2 xf = __bfloat1622float2(values[item]);
+            const float2 wf = __bfloat1622float2(weight[pair]);
+            const float2 zf = __bfloat1622float2(gate_z[row_base + pair]);
+            out[row_base + pair] = __floats2bfloat162_rn(xf.x * inv * wf.x * silu(zf.x),
+                                                         xf.y * inv * wf.y * silu(zf.y));
+        }
+    }
+}
 
 static_assert(kStateDim % kWarpSize == 0);
 static_assert(kQkPerLane == 4);
@@ -365,6 +411,10 @@ struct RecordAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    const __nv_bfloat162* post_norm_z;
+    const __nv_bfloat162* post_norm_weight;
+    __nv_bfloat162* post_norm_out;
+    float post_norm_eps;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -681,6 +731,33 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
+
+    if (access.post_norm_out == nullptr) { return; }
+    // Publish this tile's slice of every row before claiming a ticket, so the block that draws the
+    // last ticket for this (head, batch) pair reads rows no one is still writing.
+    __shared__ bool post_norm_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        const unsigned int slot =
+            blockIdx.x * static_cast<unsigned int>(kGdnPostNormMaxBatch) + blockIdx.y;
+        const unsigned int ticket = atomicInc(&g_gdn_post_norm_ticket[slot], gridDim.z - 1U);
+        post_norm_last            = ticket == gridDim.z - 1U;
+    }
+    __syncthreads();
+    if (!post_norm_last) { return; }
+    __threadfence();
+    const auto* mixer = reinterpret_cast<const __nv_bfloat162*>(access.out);
+    // The suffix rows zero_output_suffix just cleared normalise to zero either way, so the fold
+    // covers the full width exactly as the standalone kernel did.
+    for (std::int32_t token = static_cast<std::int32_t>(threadIdx.y); token < access.width;
+         token += static_cast<std::int32_t>(blockDim.y)) {
+        const std::int64_t row =
+            (static_cast<std::int64_t>(blockIdx.y) * access.width + token) * access.heads.H_v +
+            blockIdx.x;
+        gdn_post_norm_row(mixer, access.post_norm_weight, access.post_norm_z, access.post_norm_out,
+                          row * (kStateDim / 2), coord.lane, access.post_norm_eps);
+    }
 }
 
 template <class Geometry>

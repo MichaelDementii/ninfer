@@ -1,5 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "ninfer/ops/gated_rmsnorm.h"
+
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -214,6 +216,48 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     if (state_after != state) {
         std::cerr << "replay record modified source state" << suffix << "\n";
         ++failures;
+    }
+
+    // The gated post-mixer norm folded into this kernel's tail has to reproduce the standalone
+    // kernel bit for bit, and has to keep doing so on a second launch queued behind the first:
+    // the tail's completion tickets wrap by atomicInc instead of being reset, so a launch that
+    // leaves a slot non-zero elects the next launch's winner before its rows are written.
+    {
+        constexpr float kNormEps                     = 1.0e-6F;
+        const std::vector<std::uint16_t> weight_bits = make_bf16(kStateDim, seed + 6);
+        const std::vector<std::uint16_t> gate_bits   = make_bf16(value_elements, seed + 7);
+        DeviceBuffer device_weight                   = to_device(weight_bits);
+        DeviceBuffer device_gate                     = to_device(gate_bits);
+        DeviceBuffer expected_norm(value_elements * sizeof(std::uint16_t));
+        DeviceBuffer first_norm(value_elements * sizeof(std::uint16_t));
+        DeviceBuffer second_norm(value_elements * sizeof(std::uint16_t));
+        expected_norm.fill(0);
+        first_norm.fill(0xff);
+        second_norm.fill(0xff);
+
+        Tensor weight_tensor(device_weight.p, DType::BF16, {kStateDim});
+        Tensor gate_tensor(device_gate.p, DType::BF16, {kStateDim, value_heads, columns});
+        Tensor mixer_tensor(record_out.p, DType::BF16, {kStateDim, value_heads, columns});
+        Tensor expected_tensor(expected_norm.p, DType::BF16, {kStateDim, value_heads, columns});
+        ops::gated_rmsnorm(mixer_tensor, weight_tensor, gate_tensor, kNormEps, expected_tensor,
+                           nullptr);
+        cuda_synchronize();
+        const std::vector<std::uint16_t> expected_bits =
+            from_device<std::uint16_t>(expected_norm, value_elements);
+
+        ops::set_gdn_post_norm({device_gate.p, device_weight.p, first_norm.p, kNormEps});
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
+                                           valid, initial, key_record_tensor, value_record_tensor,
+                                           gate_record_tensor, record_output, nullptr);
+        ops::set_gdn_post_norm({device_gate.p, device_weight.p, second_norm.p, kNormEps});
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
+                                           valid, initial, key_record_tensor, value_record_tensor,
+                                           gate_record_tensor, record_output, nullptr);
+        cuda_synchronize();
+        failures += verify_equal("fused post-norm first launch" + suffix, expected_bits,
+                                 from_device<std::uint16_t>(first_norm, value_elements));
+        failures += verify_equal("fused post-norm second launch" + suffix, expected_bits,
+                                 from_device<std::uint16_t>(second_norm, value_elements));
     }
     return failures;
 }

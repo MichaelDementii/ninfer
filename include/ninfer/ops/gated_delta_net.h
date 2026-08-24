@@ -92,6 +92,22 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * unchanged, while the invalid out suffix is exact BF16 zero. Inputs, state, records, and out are
  * pairwise non-overlapping.
  */
+// Registration for the gated post-mixer RMS-norm folded into a recurrent kernel's tail. Set it
+// immediately before the call it belongs to; the launcher consumes and clears it, so a launch that
+// does not read it cannot inherit a stale span. The tail keeps one completion ticket per
+// (value head, batch row), which bounds both dimensions.
+inline constexpr std::int32_t kGdnPostNormMaxHeads = 64;
+inline constexpr std::int32_t kGdnPostNormMaxBatch = 8;
+
+struct GdnPostNormSpan {
+    const void* gate_z = nullptr;
+    const void* weight = nullptr;
+    void* out          = nullptr;
+    float eps          = 0.0F;
+};
+void set_gdn_post_norm(GdnPostNormSpan span);
+GdnPostNormSpan take_gdn_post_norm();
+
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,

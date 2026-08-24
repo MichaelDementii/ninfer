@@ -945,6 +945,18 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    const bool fused_post_norm = ph == Phase::Verify &&
+                                 gdn_state_action_ == GdnStateAction::RecordForReplay &&
+                                 kCfg.gdn_v_heads <= ops::kGdnPostNormMaxHeads &&
+                                 active_sequence_batch_ <= ops::kGdnPostNormMaxBatch;
+    // Only the fused tail needs this buffer before the mixer runs. Taking it early on the chunked
+    // prefill path would hold it live across the mixer's own scratch scope and lift the arena
+    // high-water mark past the planned reservation -- which shows up at 67k prefill, not on decode.
+    Tensor on;
+    if (fused_post_norm) {
+        on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+            {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    }
     if (ph == Phase::Verify) {
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
         const std::int32_t width = active_sequence_width_;
@@ -960,6 +972,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (fused_post_norm) {
+                ops::set_gdn_post_norm({z.data, w.gdn_norm->data, on.data, kCfg.rms_eps});
+            }
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_source_slots_, records.key,
@@ -980,9 +995,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                              o, s);
     }
 
-    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (!fused_post_norm) {
+        on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+            {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
