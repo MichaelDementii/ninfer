@@ -54,7 +54,7 @@ std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
     return graph_profiles_through(max_frontier, ends);
 }
 
-bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
+bool verify_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
                                         std::uint32_t max_visible_keys) {
     const std::uint32_t tokens = draft_window + 1;
     if (tokens <= 6) { return false; }
@@ -104,9 +104,22 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
+    // Past a verify width of six the attention route stops being unconditional and starts turning
+    // on the envelope's visible-key count, so the frontier has to break where the route flips --
+    // the two sides emit different node counts and cannot share one executable.
+    if (draft_window >= 6 && draft_window <= 15) {
+        add_shifted(draft_window <= 11 ? 512U : 1024U, draft_window + 1);
+    }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1, ends);
+
+    std::vector<GraphExecutionProfile> profiles = graph_profiles_through(capacity - 1, ends);
+    for (GraphExecutionProfile& profile : profiles) {
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        profile.topology_class = verify_uses_chunked_small_t(draft_window, 1U, target_max) ? 1U : 0U;
+    }
+    return profiles;
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
@@ -118,7 +131,7 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
             capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
         const bool split_swa           = profile.max > 96U;
         const bool chunked_target =
-            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+            verify_uses_chunked_small_t(draft_window, batch_size, target_max);
         profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
     }
     return profiles;
