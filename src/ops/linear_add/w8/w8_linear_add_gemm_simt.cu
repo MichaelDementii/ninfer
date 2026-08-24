@@ -5,7 +5,6 @@
 #include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
 
 #include <cstdint>
-#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -130,14 +129,6 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_add_decode_k_ker
 
     acc = warp_reduce_sum(acc);
     if (lane == 0) { residual[row] = __float2bfloat16_rn(__bfloat162float(residual[row]) + acc); }
-}
-
-inline bool ninfer_outproj_direct() {
-    static const bool value = [] {
-        const char* env = std::getenv("NINFER_OUTPROJ_DIRECT");
-        return env != nullptr && env[0] == '1';
-    }();
-    return value;
 }
 
 template <int DecodeK, int RowsPerCta>
