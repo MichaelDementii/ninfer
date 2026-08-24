@@ -36,7 +36,8 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, const char* prefetch_data = nullptr,
+                                   unsigned long long prefetch_bytes = 0);
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,

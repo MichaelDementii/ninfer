@@ -982,10 +982,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             if (fused_post_norm) {
                 ops::set_gdn_post_norm({z.data, w.gdn_norm->data, on.data, kCfg.rms_eps});
             }
+            // The out-projection is the next thing this layer streams; the mixer's tail warms L2
+            // for it. Bounds come from the weight itself, so they stay right across targets whose
+            // out-projection differs in shape or quantisation.
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
-                *active_linear_state_destination_slots_, out_batch, s);
+                *active_linear_state_destination_slots_, out_batch, s,
+                width == 1 ? w.out_proj->payload : nullptr,
+                static_cast<std::size_t>(w.out_proj->payload_bytes));
         }
     } else {
         Tensor recurrent_state_in =

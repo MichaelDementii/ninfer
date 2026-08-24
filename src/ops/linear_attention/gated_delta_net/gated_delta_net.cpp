@@ -242,13 +242,15 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   bool normalize_qk, Tensor& ssm_states,
                                   const Tensor& source_state_slots,
                                   const Tensor& destination_state_slots, Tensor& out,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const void* prefetch_data,
+                                  std::size_t prefetch_bytes) {
     validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
                                     destination_state_slots, out);
 
-    detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
-                                                           ssm_states, source_state_slots,
-                                                           destination_state_slots, out, stream);
+    detail::gated_delta_net::launch_recurrent_batch_update(
+        q, k, v, g, beta, scale, normalize_qk, ssm_states, source_state_slots,
+        destination_state_slots, out, stream, static_cast<const char*>(prefetch_data),
+        static_cast<unsigned long long>(prefetch_bytes));
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

@@ -70,12 +70,16 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * destination_state_slots[b]; selectors may be equal for an in-place row. Destination slots are
  * distinct across active rows. This form uses no arena allocation.
  */
+// `prefetch_data`/`prefetch_bytes` name a weight span the caller knows the next consumer will
+// stream. The tail issues fire-and-forget L2 prefetches over as much of it as the grid covers.
+// Purely a cache hint: it reads nothing the kernel uses and has no numeric effect.
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
                                   bool normalize_qk, Tensor& ssm_states,
                                   const Tensor& source_state_slots,
                                   const Tensor& destination_state_slots, Tensor& out,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, const void* prefetch_data = nullptr,
+                                  std::size_t prefetch_bytes = 0);
 
 /**
  * Op: gated_delta_net_replay_record

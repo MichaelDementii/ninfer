@@ -342,6 +342,8 @@ struct BatchUpdateAccess {
     head_map heads;
     std::int64_t state_slot_stride;
     float scale;
+    const char* prefetch_data;
+    unsigned long long prefetch_bytes;
     const __nv_bfloat162* post_norm_z;
     const __nv_bfloat162* post_norm_weight;
     __nv_bfloat162* post_norm_out;
@@ -724,6 +726,21 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);
     store_state_tile(state, access.state_write_base(coord), coord);
+
+    if (access.prefetch_data != nullptr) {
+        // Warm L2 for the out-projection this layer is about to stream. One line per thread,
+        // issued by every block -- so it has to sit ahead of the post-norm election below, which
+        // returns from all but the winning tile.
+        const unsigned long long block_index =
+            blockIdx.x + static_cast<unsigned long long>(gridDim.x) *
+                             (blockIdx.y + static_cast<unsigned long long>(gridDim.y) * blockIdx.z);
+        const unsigned long long thread_index =
+            block_index * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+        const unsigned long long offset = thread_index * 128ULL;
+        if (offset < access.prefetch_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(access.prefetch_data + offset));
+        }
+    }
 
     if (access.post_norm_out == nullptr) { return; }
     // Width one here, so a (head, batch) pair owns a single row and one warp finishes it. Same

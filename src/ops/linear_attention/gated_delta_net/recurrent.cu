@@ -41,7 +41,8 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
                                          const Tensor& g, const Tensor& beta, float scale,
                                          Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, const char* prefetch_data,
+                                         unsigned long long prefetch_bytes) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -63,6 +64,8 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         heads,
         state_slot_stride,
         scale,
+        prefetch_data,
+        prefetch_bytes,
         reinterpret_cast<const __nv_bfloat162*>(update_post_norm.gate_z),
         reinterpret_cast<const __nv_bfloat162*>(update_post_norm.weight),
         reinterpret_cast<__nv_bfloat162*>(update_post_norm.out),
@@ -170,15 +173,16 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const char* prefetch_data,
+                                   unsigned long long prefetch_bytes) {
     if (normalize_qk) {
         launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states,
                                                   source_state_slots, destination_state_slots, out,
-                                                  stream);
+                                                  stream, prefetch_data, prefetch_bytes);
     } else {
         launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states,
                                                    source_state_slots, destination_state_slots, out,
-                                                   stream);
+                                                   stream, prefetch_data, prefetch_bytes);
     }
 }
 
