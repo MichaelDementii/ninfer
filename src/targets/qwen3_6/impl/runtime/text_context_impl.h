@@ -946,7 +946,6 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     const bool fused_post_norm = ph == Phase::Verify &&
-                                 gdn_state_action_ == GdnStateAction::RecordForReplay &&
                                  kCfg.gdn_v_heads <= ops::kGdnPostNormMaxHeads &&
                                  active_sequence_batch_ <= ops::kGdnPostNormMaxBatch;
     // Only the fused tail needs this buffer before the mixer runs. Taking it early on the chunked
@@ -980,6 +979,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_source_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
+            if (fused_post_norm) {
+                ops::set_gdn_post_norm({z.data, w.gdn_norm->data, on.data, kCfg.rms_eps});
+            }
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,

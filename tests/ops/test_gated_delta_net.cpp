@@ -1,5 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "ninfer/ops/gated_rmsnorm.h"
+
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
 
@@ -379,6 +381,78 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
                                                device.g, device.beta);
+
+    // The gated post-mixer norm folded into this kernel's tail must reproduce the standalone
+    // kernel bit for bit, and must still do so on a second launch queued behind the first: the
+    // tail's completion tickets wrap by atomicInc rather than being reset, so a launch that leaves
+    // a slot non-zero elects the next launch's winner before its rows are written. Replaying the
+    // update only reproduces the same output when no destination slot feeds a source, so this runs
+    // on the fork cases and stands aside on the in-place ones.
+    const bool forks = std::none_of(destination_slots.begin(), destination_slots.end(),
+                                    [&](int slot) {
+                                        return std::find(source_slots.begin(), source_slots.end(),
+                                                         slot) != source_slots.end();
+                                    });
+    if (forks) {
+        constexpr float kNormEps = 1.0e-6f;
+        const std::size_t rows_total =
+            static_cast<std::size_t>(test_case.value_heads) * static_cast<std::size_t>(batch);
+        const std::size_t norm_elements = rows_total * static_cast<std::size_t>(kStateDim);
+        std::vector<float> weight_values(static_cast<std::size_t>(kStateDim));
+        std::vector<float> gate_values(norm_elements);
+        std::mt19937 norm_generator(seed + 811u);
+        fill_uniform(weight_values, norm_generator, -0.9f, 0.9f);
+        fill_uniform(gate_values, norm_generator, -1.4f, 1.4f);
+        round_to_bf16(weight_values);
+        round_to_bf16(gate_values);
+        std::vector<std::uint16_t> weight_bits(weight_values.size());
+        std::vector<std::uint16_t> gate_bits(gate_values.size());
+        for (std::size_t index = 0; index < weight_values.size(); ++index) {
+            weight_bits[index] = f32_to_bf16(weight_values[index]);
+        }
+        for (std::size_t index = 0; index < gate_values.size(); ++index) {
+            gate_bits[index] = f32_to_bf16(gate_values[index]);
+        }
+
+        DeviceBuffer device_weight = to_device(weight_bits);
+        DeviceBuffer device_gate   = to_device(gate_bits);
+        DeviceBuffer expected_norm(norm_elements * sizeof(std::uint16_t));
+        DeviceBuffer first_norm(norm_elements * sizeof(std::uint16_t));
+        DeviceBuffer second_norm(norm_elements * sizeof(std::uint16_t));
+        expected_norm.fill(0);
+        first_norm.fill(0xff);
+        second_norm.fill(0xff);
+
+        Tensor weight_tensor(device_weight.p, DType::BF16, {kStateDim});
+        Tensor gate_tensor(device_gate.p, DType::BF16,
+                           {kStateDim, test_case.value_heads, batch});
+        Tensor mixer_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, batch});
+        Tensor expected_tensor(expected_norm.p, DType::BF16,
+                               {kStateDim, test_case.value_heads, batch});
+        ops::gated_rmsnorm(mixer_tensor, weight_tensor, gate_tensor, kNormEps, expected_tensor,
+                           nullptr);
+        cuda_synchronize();
+        const std::vector<std::uint16_t> expected_bits =
+            from_device<std::uint16_t>(expected_norm, norm_elements);
+
+        ops::set_gdn_post_norm({device_gate.p, device_weight.p, first_norm.p, kNormEps});
+        ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
+                                          states_tensor, source_slots_tensor,
+                                          destination_slots_tensor, out_tensor, nullptr);
+        ops::set_gdn_post_norm({device_gate.p, device_weight.p, second_norm.p, kNormEps});
+        ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
+                                          states_tensor, source_slots_tensor,
+                                          destination_slots_tensor, out_tensor, nullptr);
+        cuda_synchronize();
+        if (from_device<std::uint16_t>(first_norm, norm_elements) != expected_bits) {
+            std::cerr << label << ": fused post-norm first launch differs\n";
+            ++failures;
+        }
+        if (from_device<std::uint16_t>(second_norm, norm_elements) != expected_bits) {
+            std::cerr << label << ": fused post-norm second launch differs\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
@@ -477,6 +551,11 @@ int main() {
                                   {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
     failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
                                   {1, 3, 5, 7}, 8, 13101u);
+    // Eight forked rows: the widest batch the folded post-mixer norm accepts, and the only shape
+    // where a per-head rather than per-(head, row) completion ticket shows up.
+    failures += batch_update_case({"35b forked eight-row", 16, 32, 1, true},
+                                  {0, 1, 2, 3, 4, 5, 6, 7}, {8, 9, 10, 11, 12, 13, 14, 15}, 16,
+                                  13201u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

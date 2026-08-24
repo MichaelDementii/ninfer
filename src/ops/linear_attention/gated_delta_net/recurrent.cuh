@@ -342,6 +342,10 @@ struct BatchUpdateAccess {
     head_map heads;
     std::int64_t state_slot_stride;
     float scale;
+    const __nv_bfloat162* post_norm_z;
+    const __nv_bfloat162* post_norm_weight;
+    __nv_bfloat162* post_norm_out;
+    float post_norm_eps;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -720,6 +724,27 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);
     store_state_tile(state, access.state_write_base(coord), coord);
+
+    if (access.post_norm_out == nullptr) { return; }
+    // Width one here, so a (head, batch) pair owns a single row and one warp finishes it. Same
+    // ticket array and same wrap invariant as the record tail.
+    __shared__ bool post_norm_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        const unsigned int slot =
+            blockIdx.x * static_cast<unsigned int>(kGdnPostNormMaxBatch) + blockIdx.y;
+        const unsigned int ticket = atomicInc(&g_gdn_post_norm_ticket[slot], gridDim.z - 1U);
+        post_norm_last            = ticket == gridDim.z - 1U;
+    }
+    __syncthreads();
+    if (!post_norm_last || threadIdx.y != 0) { return; }
+    __threadfence();
+    const std::int64_t row =
+        static_cast<std::int64_t>(blockIdx.y) * access.heads.H_v + blockIdx.x;
+    gdn_post_norm_row(reinterpret_cast<const __nv_bfloat162*>(access.out),
+                      access.post_norm_weight, access.post_norm_z, access.post_norm_out,
+                      row * (kStateDim / 2), coord.lane, access.post_norm_eps);
 }
 
 template <bool Masked>

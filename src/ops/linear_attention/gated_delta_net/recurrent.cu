@@ -48,6 +48,7 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+    const GdnPostNormSpan update_post_norm = ::ninfer::ops::take_gdn_post_norm();
     const BatchUpdateAccess access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
@@ -62,6 +63,10 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         heads,
         state_slot_stride,
         scale,
+        reinterpret_cast<const __nv_bfloat162*>(update_post_norm.gate_z),
+        reinterpret_cast<const __nv_bfloat162*>(update_post_norm.weight),
+        reinterpret_cast<__nv_bfloat162*>(update_post_norm.out),
+        update_post_norm.eps,
     };
     recurrent_batch_update_kernel<NormalizeInputs><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
