@@ -111,9 +111,14 @@ struct GdnConvEpilogue {
             }
 
             publish.publish(token, batch_row, row, s1, s2, p);
+            // The tap this column leaves for the next one has to be the value the next
+            // column would have READ, and a sequential decode reads it back from bf16 state.
+            // Carrying the unrounded projection forward instead makes a multi-column pass
+            // compute a different number than one column at a time -- bf16-magnitude, on
+            // thirty of forty layers, on every column but the first.
             s0 = s1;
             s1 = s2;
-            s2 = p;
+            s2 = __bfloat162float(__float2bfloat16_rn(p));
         }
     }
 };
