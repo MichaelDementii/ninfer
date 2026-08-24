@@ -422,6 +422,14 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             acc[n][3] *= alpha1;
         }
 
+// Consumer parts (sm_89, sm_120) run f32-accumulate HMMA at half rate. Accumulate the
+// 64-key tile in packed fp16 at full rate and fold it into the fp32 running accumulator
+// once per tile; the per-tile sums are magnitude-bounded by the softmax weights.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+        unsigned tacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) { tacc[n][0] = tacc[n][1] = 0u; }
+#endif
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -437,10 +445,25 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+                mma_f16_f16acc(tacc[n][0], tacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+#else
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
+#endif
             }
         }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const __half2 lo = *reinterpret_cast<const __half2*>(&tacc[n][0]);
+            const __half2 hi = *reinterpret_cast<const __half2*>(&tacc[n][1]);
+            acc[n][0] += __half2float(lo.x);
+            acc[n][1] += __half2float(lo.y);
+            acc[n][2] += __half2float(hi.x);
+            acc[n][3] += __half2float(hi.y);
+        }
+#endif
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
