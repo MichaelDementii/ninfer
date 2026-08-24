@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
@@ -1473,6 +1474,32 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
+    }
+
+    // Handing the Op a gate must produce exactly what applying sigmoid_mul afterwards produces --
+    // on the route that folds the multiply into the reduce epilogue and on the routes that fall
+    // back to the standalone kernel alike. Re-running the Op is safe: appending the same k/v to
+    // the same rows again leaves the cache byte-identical.
+    {
+        const std::vector<std::uint16_t> gate_bits =
+            to_bf16_bits(make_bf16_values(q_bits.size(), test_case.seed + 97u, -3.0f, 3.0f));
+        GuardedDeviceBuffer dgate(gate_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dexpected(gate_bits.size() * sizeof(std::uint16_t));
+        dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
+        dexpected.copy_from_host(output_bits.data(), output_bits.size() * sizeof(std::uint16_t));
+        Tensor tgate(dgate.data(), DType::BF16,
+                     {kHeadDim, geometry.q_heads, test_case.width, batch});
+        Tensor texpected(dexpected.data(), DType::BF16,
+                         {kHeadDim, geometry.q_heads, test_case.width, batch});
+        ops::sigmoid_mul(tgate, texpected, nullptr);
+        ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows,
+                                      op_geometry(geometry), kAttentionScale, cache.view(),
+                                      envelope, workspace, tout, nullptr, &tgate);
+        cuda_synchronize();
+        failures += verify_exact((label + " fused gate").c_str(),
+                                 copy_from_guarded<std::uint16_t>(dout, q_bits.size()),
+                                 copy_from_guarded<std::uint16_t>(dexpected, q_bits.size()));
+        failures += dgate.verify_guards((label + " fused gate input").c_str());
     }
     return failures;
 }

@@ -128,12 +128,16 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
  */
+// An optional `gate` asks the Op to finish with out *= sigmoid(gate), shaped like out. Where the
+// route allows it the multiply is folded into the reduce epilogue; everywhere else the Op applies
+// the standalone elementwise kernel itself. Either way the result is bit-identical to calling
+// sigmoid_mul on the ungated output, so the caller need not know which route it landed on.
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream);
+                              Tensor& out, cudaStream_t stream, const Tensor* gate = nullptr);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.

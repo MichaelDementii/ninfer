@@ -158,7 +158,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate) {
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -217,7 +217,10 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     if (head_m == -CUDART_INF_F) {
         const int d = d_start + tid;
         if (tid < DChunk && d < kCausalHeadDim) {
-            out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
+            const auto index = causal_q_index<Geometry>(q_head, d, output_column);
+            out[index]       = gate == nullptr
+                                   ? __float2bfloat16(0.0f)
+                                   : __float2bfloat16_rn(0.0f * sigmoid(__bfloat162float(gate[index])));
         }
         return;
     }
@@ -265,8 +268,18 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
         if constexpr (Offset) { absolute_column += column_begin; }
         valid = absolute_column < valid_columns[batch];
     }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const float value    = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
+    const auto out_index = causal_q_index<Geometry>(q_head, d, output_column);
+    if (gate == nullptr) {
+        out[out_index] = __float2bfloat16(value);
+        return;
+    }
+    // Bit-exact with the standalone multiply: that kernel reads what attention stored, so it sees
+    // the reduce result already rounded to bf16. Round here first, widen back, then multiply --
+    // keeping the fp32 value would be more accurate and would move tokens.
+    const __nv_bfloat16 reduced = __float2bfloat16(value);
+    out[out_index]              = __float2bfloat16_rn(
+        __bfloat162float(reduced) * sigmoid(__bfloat162float(gate[out_index])));
 }
 
 } // namespace ninfer::ops
