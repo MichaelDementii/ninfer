@@ -189,8 +189,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared          = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
-    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const int row_begin   = static_cast<int>(blockIdx.x) * Schedule::kBlockN;
+    // N-18: grouped rasterization (G token tiles per row-tile sweep) for L2 weight reuse.
+    constexpr int kRasterGroup = 8;
+    const int raster_id        = static_cast<int>(blockIdx.x) +
+                          static_cast<int>(gridDim.x) * static_cast<int>(blockIdx.y);
+    const int raster_group_first =
+        (raster_id / (static_cast<int>(gridDim.x) * kRasterGroup)) * kRasterGroup;
+    const int raster_group_size =
+        min(kRasterGroup, static_cast<int>(gridDim.y) - raster_group_first);
+    const int raster_index = raster_id - raster_group_first * static_cast<int>(gridDim.x);
+    const int raster_token = raster_group_first + raster_index % raster_group_size;
+    const int raster_row   = raster_index / raster_group_size;
+    const int token_begin = raster_token * Schedule::kBlockM;
+    const int row_begin   = raster_row * Schedule::kBlockN;
 
     if (threadIdx.x == 0) {
 #pragma unroll
