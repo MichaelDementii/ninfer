@@ -1,0 +1,4 @@
+*.nsys-rep
+*.sqlite
+__pycache__/
+work/

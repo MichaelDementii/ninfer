@@ -1,0 +1,29 @@
+########## GROUPS == 4 extents ##########
+g4 34816 mst rc=0
+g4 248320 mst rc=0
+g4 34816 w8 rc=0
+g4 248320 w8 rc=0
+########## repeatability: three passes per arm ##########
+pass 1 mst rc=0
+pass 1 w8 rc=0
+pass 2 mst rc=0
+pass 2 w8 rc=0
+pass 3 mst rc=0
+pass 3 w8 rc=0
+########## prefill kernel breakdown, both arms ##########
+nsys mst rc=0
+stats mst rc=0
+nsys w8 rc=0
+stats w8 rc=0
+total 1588
+drwxrwxr-x 2 root root    184 Aug 28 22:23 .
+drwxrwxr-x 3 root root   8192 Aug 28 22:22 ..
+-rw-rw-r-- 1 root root  20328 Aug 28 22:22 k_mst_cuda_gpu_kern_sum.csv
+-rw-rw-r-- 1 root root  20321 Aug 28 22:23 k_w8_cuda_gpu_kern_sum.csv
+-rw-rw-r-- 1 root root   2282 Aug 28 22:22 p_mst.err
+-rw-rw-r-- 1 root root 774146 Aug 28 22:22 p_mst.nsys-rep
+-rw-rw-r-- 1 root root    474 Aug 28 22:22 p_mst.txt
+-rw-rw-r-- 1 root root   2282 Aug 28 22:23 p_w8.err
+-rw-rw-r-- 1 root root 775403 Aug 28 22:23 p_w8.nsys-rep
+-rw-rw-r-- 1 root root    517 Aug 28 22:23 p_w8.txt
+W8_EXTRA_DONE

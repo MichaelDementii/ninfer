@@ -1,0 +1,147 @@
+BUILD mst EXIT=0
+[275/276] Linking CXX executable bench/ninfer_qwen3_6_27b_mtp_round_bench
+[276/276] Linking CXX executable bench/ninfer_qwen3_6_35b_a3b_dflash_round_bench
+STASHED mst at 3a61ef3f fix(ops): separate sparse moe gather index lifetimes
+BUILD w8 EXIT=0
+[136/137] Linking CXX executable bench/ninfer_qwen3_6_27b_mtp_round_bench
+[137/137] Linking CXX executable bench/ninfer_qwen3_6_35b_a3b_dflash_round_bench
+STASHED w8 at 33e068f5 perf(ops): widen w8 rowsplit weight decode to eight codes per thread
+########## ctest, both arms ##########
+--- origin/master ---
+      Start 89: ninfer_linear_pair_w8_a16_test
+89/94 Test #89: ninfer_linear_pair_w8_a16_test .................   Passed    1.29 sec
+      Start 90: ninfer_linear_swiglu_q4_a16_test
+90/94 Test #90: ninfer_linear_swiglu_q4_a16_test ...............   Passed    1.89 sec
+      Start 91: ninfer_linear_swiglu_w8_a16_test
+91/94 Test #91: ninfer_linear_swiglu_w8_a16_test ...............   Passed    1.37 sec
+      Start 92: ninfer_linear_swiglu_nvfp4_test
+92/94 Test #92: ninfer_linear_swiglu_nvfp4_test ................   Passed    2.05 sec
+      Start 93: ninfer_linear_swiglu_fp8_test
+93/94 Test #93: ninfer_linear_swiglu_fp8_test ..................   Passed    2.09 sec
+      Start 94: ninfer_qwen3_6_27b_visual_scatter_test
+94/94 Test #94: ninfer_qwen3_6_27b_visual_scatter_test .........   Passed    1.09 sec
+
+99% tests passed, 1 tests failed out of 94
+
+Total Test time (real) = 316.59 sec
+
+The following tests did not run:
+	 24 - ninfer_qwen3_6_27b_load_plan_test (Skipped)
+
+The following tests FAILED:
+	 23 - ninfer_qwen3_6_27b_prefix_real_test (Failed)
+Errors while running CTest
+Output from these tests are in: /root/ninfer_d4/build/Testing/Temporary/LastTest.log
+Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely.
+--- perf/widen-w8-rowsplit-decode ---
+      Start 89: ninfer_linear_pair_w8_a16_test
+89/94 Test #89: ninfer_linear_pair_w8_a16_test .................   Passed    1.29 sec
+      Start 90: ninfer_linear_swiglu_q4_a16_test
+90/94 Test #90: ninfer_linear_swiglu_q4_a16_test ...............   Passed    1.88 sec
+      Start 91: ninfer_linear_swiglu_w8_a16_test
+91/94 Test #91: ninfer_linear_swiglu_w8_a16_test ...............   Passed    1.34 sec
+      Start 92: ninfer_linear_swiglu_nvfp4_test
+92/94 Test #92: ninfer_linear_swiglu_nvfp4_test ................   Passed    2.03 sec
+      Start 93: ninfer_linear_swiglu_fp8_test
+93/94 Test #93: ninfer_linear_swiglu_fp8_test ..................   Passed    2.08 sec
+      Start 94: ninfer_qwen3_6_27b_visual_scatter_test
+94/94 Test #94: ninfer_qwen3_6_27b_visual_scatter_test .........   Passed    1.11 sec
+
+99% tests passed, 1 tests failed out of 94
+
+Total Test time (real) = 325.67 sec
+
+The following tests did not run:
+	 24 - ninfer_qwen3_6_27b_load_plan_test (Skipped)
+
+The following tests FAILED:
+	 23 - ninfer_qwen3_6_27b_prefix_real_test (Failed)
+Errors while running CTest
+Output from these tests are in: /root/ninfer_d4/build/Testing/Temporary/LastTest.log
+Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely.
+########## operator benchmarks, both arms ##########
+smoe mst 1024 rc=0
+smoe mst 4096 rc=0
+smoe mst 8192 rc=0
+add mst rc=0
+swig mst rc=0
+lin mst rc=0
+gdnip mst rc=0
+attnip mst rc=0
+pair mst rc=0
+smoe w8 1024 rc=0
+smoe w8 4096 rc=0
+smoe w8 8192 rc=0
+add w8 rc=0
+swig w8 rc=0
+lin w8 rc=0
+gdnip w8 rc=0
+attnip w8 rc=0
+pair w8 rc=0
+########## end to end, arms alternating in every round ##########
+c8192_niah_4k MST r1 prefill=20995.36 decode=335.38
+c8192_niah_4k W8 r1 prefill=21477.33 decode=335.54
+c8192_niah_16k MST r1 prefill=17431.71 decode=298.17
+c8192_niah_16k W8 r1 prefill=17767.32 decode=298.06
+c8192_niah_32k MST r1 prefill=13982.29 decode=262.80
+c8192_niah_32k W8 r1 prefill=14192.48 decode=263.06
+c1024_niah_16k MST r1 prefill=14086.28 decode=297.40
+c1024_niah_16k W8 r1 prefill=14336.57 decode=297.45
+d27 MST r1 prefill=3000.08 decode=74.90
+d27 W8 r1 prefill=2987.26 decode=74.74
+c8192_niah_4k W8 r2 prefill=21408.57 decode=335.19
+c8192_niah_4k MST r2 prefill=20918.40 decode=335.09
+c8192_niah_16k W8 r2 prefill=17705.20 decode=297.80
+c8192_niah_16k MST r2 prefill=17360.10 decode=297.80
+c8192_niah_32k W8 r2 prefill=14160.30 decode=262.75
+c8192_niah_32k MST r2 prefill=13949.06 decode=262.88
+c1024_niah_16k W8 r2 prefill=14313.42 decode=297.45
+c1024_niah_16k MST r2 prefill=14077.18 decode=297.12
+d27 W8 r2 prefill=2998.35 decode=74.80
+d27 MST r2 prefill=2989.63 decode=74.76
+c8192_niah_4k MST r3 prefill=20893.23 decode=335.12
+c8192_niah_4k W8 r3 prefill=21416.32 decode=335.01
+c8192_niah_16k MST r3 prefill=17345.10 decode=297.58
+c8192_niah_16k W8 r3 prefill=17690.56 decode=297.81
+c8192_niah_32k MST r3 prefill=13941.55 decode=262.88
+c8192_niah_32k W8 r3 prefill=14165.35 decode=262.81
+c1024_niah_16k MST r3 prefill=14071.52 decode=297.53
+c1024_niah_16k W8 r3 prefill=14328.51 decode=297.57
+d27 MST r3 prefill=2996.42 decode=74.80
+d27 W8 r3 prefill=2985.79 decode=74.74
+c8192_niah_4k W8 r4 prefill=21380.81 decode=335.25
+c8192_niah_4k MST r4 prefill=20913.69 decode=335.02
+c8192_niah_16k W8 r4 prefill=17714.09 decode=297.66
+c8192_niah_16k MST r4 prefill=17371.29 decode=297.88
+c8192_niah_32k W8 r4 prefill=14171.89 decode=262.98
+c8192_niah_32k MST r4 prefill=13944.46 decode=262.96
+c1024_niah_16k W8 r4 prefill=14316.40 decode=297.18
+c1024_niah_16k MST r4 prefill=14083.65 decode=297.46
+d27 W8 r4 prefill=2995.59 decode=74.81
+d27 MST r4 prefill=2986.93 decode=74.66
+########## greedy identity ##########
+IDENTICAL c1024_niah_16k_W8_r1.txt
+IDENTICAL c1024_niah_16k_W8_r2.txt
+IDENTICAL c1024_niah_16k_W8_r3.txt
+IDENTICAL c1024_niah_16k_W8_r4.txt
+IDENTICAL c8192_niah_16k_W8_r1.txt
+IDENTICAL c8192_niah_16k_W8_r2.txt
+IDENTICAL c8192_niah_16k_W8_r3.txt
+IDENTICAL c8192_niah_16k_W8_r4.txt
+IDENTICAL c8192_niah_32k_W8_r1.txt
+IDENTICAL c8192_niah_32k_W8_r2.txt
+IDENTICAL c8192_niah_32k_W8_r3.txt
+IDENTICAL c8192_niah_32k_W8_r4.txt
+IDENTICAL c8192_niah_4k_W8_r1.txt
+IDENTICAL c8192_niah_4k_W8_r2.txt
+IDENTICAL c8192_niah_4k_W8_r3.txt
+IDENTICAL c8192_niah_4k_W8_r4.txt
+IDENTICAL d27_W8_r1.txt
+IDENTICAL d27_W8_r2.txt
+IDENTICAL d27_W8_r3.txt
+IDENTICAL d27_W8_r4.txt
+########## sass and resources ##########
+functions: 2931 / 2931
+changed bodies: 120
+
+W8_ARMS_DONE

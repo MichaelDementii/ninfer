@@ -1,0 +1,15 @@
+functions: 2931 / 2931, comparable 2893, only-in-master 38, only-in-branch 38
+bodies with a different instruction count : 120
+bodies with a different per-opcode census : 120
+all of them are w8_rowsplit_gemm_mma_kernel: True
+changed bodies whose HMMA count moves  : 0
+  STS   across the 120 changed bodies:   2884 ->   1724
+  LDS   across the 120 changed bodies:   2934 ->   1514
+  I2F   across the 120 changed bodies:   3560 ->   1240
+  F2FP  across the 120 changed bodies:   3994 ->   4694
+  SHFL  across the 120 changed bodies:   1150 ->      0
+  HMMA  across the 120 changed bodies:  15120 ->  15120
+  IMAD  across the 120 changed bodies:  16476 ->  15493
+  LOP3  across the 120 changed bodies:  18003 ->  12982
+instruction delta: -32.4% .. -1.2%, median -4.9%
+CENSUS_DONE
