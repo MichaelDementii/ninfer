@@ -1,29 +1,32 @@
 perf(ops): widen w8 rowsplit weight decode to eight codes per thread
 
-dequant_w gave each lane one 16-bit code pair per quantisation group and broadcast the group
-scales across the warp with shfl_sync, because a lane's pair could belong to a group whose scale
-another lane had loaded. A row of a weight tile therefore cost 32 four-byte shared stores, and the
-GROUPS == 4 schedule paid two shuffles per row pair on top.
+dequant_w gave each lane one 16-bit code pair per quantisation group and broadcast the group scales
+across the warp with shfl_sync, because a lane's pair could belong to a group whose scale another
+lane had loaded. A row of a weight tile therefore cost 32 four-byte shared stores on the BK == 64
+schedules and 64 on the BK == 128 one, and the GROUPS == 4 schedule paid two shuffles per row pair
+on top.
 
-The loop is now indexed by thread over eight-code chunks, the shape stage_x and stage_w already
-use in the same kernel. A thread owns a whole chunk inside one quantisation group, so it reads its
-own scale halfword directly, decodes eight codes out of one uint2 and stores them with a single
-16-byte store_vec. Three quarters of the shared stores, the loop trips around them and all three
-shuffle sites go with it.
+The loop is now indexed by thread over eight-code chunks. A thread owns a whole chunk inside one
+quantisation group, so it reads its own scale halfword directly, decodes eight codes out of one
+uint2 and stores them with a single 16-byte store_vec through W8Bf16x8Bits, the union this file
+already keeps for that shape. Three quarters of the shared stores, the loop trips around them and
+all three shuffle sites go with it. The scale loads move the other way, from one or two lanes per
+warp to every thread, but they are broadcast reads out of shared memory and the tile is smaller work
+than the stores they replace.
 
-Per weight the arithmetic is unchanged: the same sign extension, the same multiply by the same
-group scale, the same __floats2bfloat162_rn. Only the route by which the scale reaches the thread
-changes. For GROUPS == 2 the old code read a uint32 at scale_pair_offset and extracted
->> ((gg & 1) * 16); for GROUPS == 4 it shuffled two uint32 from +0 and +4. Both resolve to the
-halfword at scale_pair_offset + gg * 2, which is what the thread now reads directly, and the
-highest byte touched is still 16, which is SCALE_CACHE_BYTES.
+Per weight the arithmetic is unchanged: the same sign extension, the same multiply by the same group
+scale, the same __floats2bfloat162_rn. Only the route by which the scale reaches the thread changes.
+For GROUPS == 2 the old code read a uint32 at scale_pair_offset and extracted >> ((gg & 1) * 16);
+for GROUPS == 4 it shuffled two uint32 from +0 and +4. Both resolve to the halfword at
+scale_pair_offset + gg * 2, which is what the thread now reads directly, and the highest byte
+touched is still 16, which is SCALE_CACHE_BYTES.
 
-The 16-byte store lands on the same eight shared slots in the same order as the four 4-byte
-stores it replaces: w8g32_swz64(row, 8c) is a multiple of eight elements, so the byte offset is
-16-byte aligned, and c ^ (row & 7) is a bijection on a row's chunks. Removing the shuffles is safe
-because they sat in a warp-uniform loop - the old trip count depended only on warp, so all 32
-lanes were converged.
+The 16-byte store lands on the same eight shared slots in the same order as the four 4-byte stores
+it replaces: w8g32_swz64(row, 8c) is a multiple of eight elements, so the byte offset is 16-byte
+aligned, and c ^ (row & 7) is a bijection on a row's chunks. Removing the shuffles is safe because
+they sat in a warp-uniform loop - the old trip count depended only on warp, so all 32 lanes were
+converged.
 
-One invariant that used to hold structurally now depends on the loop shape: a chunk lies inside a
-single quantisation group only because eight divides the group width of 32. It is asserted rather
-than assumed.
+Eight is not a tunable here: w8g32_swz64 permutes whole eight-element runs, so a wider chunk would
+not be contiguous in As, and eight divides the 32-code group, so one scale covers it. The relation
+that can still fail if the tile changes - that a row of codes tiles into those chunks - is asserted.

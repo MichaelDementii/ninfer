@@ -1,1 +1,1 @@
-W8 row-split GEMM stages one code pair per lane and shuffles the group scales: 1.12x on six Op families
+W8 row-split GEMM stages one code pair per lane and shuffles the group scales: x1.12 on its shapes
