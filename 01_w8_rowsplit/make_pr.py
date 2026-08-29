@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Assemble and file the W8 row-split weight-decode submission, one explicit stage at a time.
 
-The point of the staging is that the text lives in files next to this script and can be re-read
-and edited between stages. Nothing here touches GitHub unless a stage that writes is named on the
-command line; the default stage only reports.
+The text lives in files next to this script so it can be re-read and edited between stages.
+Nothing here touches GitHub unless a stage that writes is named on the command line; the default
+stage only reports.
 
 Stages
   check       validate the files and show what every later stage would do. Changes nothing.
@@ -13,14 +13,16 @@ Stages
   push        push the branch to the fork. Rewrites the remote branch.
   create      open the pull request from PR_TITLE.txt and PR_BODY.md.
 
-Typical order:  check -> issue -> (wait for the maintainer to confirm) -> bundle -> fetch
-                -> push -> create
+Typical order:  check -> issue -> (wait for him to confirm) -> bundle -> fetch -> push -> create
 
-CONTRIBUTING.md now requires a confirmed Issue before a pull request, so `issue` comes first and
-the branch does not go anywhere until he answers. Every writing stage prints exactly what it is
-about to do and needs --yes to proceed.
+CONTRIBUTING.md requires a confirmed Issue before a pull request, so `issue` comes first and the
+branch does not go anywhere until he answers. `create` enforces that with two gates it can actually
+check: ISSUE_CONFIRMED.txt must exist and say what he agreed to, and the branch must still be
+exactly one commit on top of the current origin/master. Every writing stage prints what it is about
+to do and needs --yes.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +33,8 @@ TITLE_FILE = HERE / "PR_TITLE.txt"
 BODY_FILE = HERE / "PR_BODY.md"
 ISSUE_TITLE_FILE = HERE / "ISSUE_TITLE.txt"
 ISSUE_BODY_FILE = HERE / "ISSUE_BODY.md"
+ISSUE_URL_FILE = HERE / "ISSUE_URL.txt"
+CONFIRMED_FILE = HERE / "ISSUE_CONFIRMED.txt"
 WORK = HERE / "work"
 BUNDLE = HERE / "branch.bundle"
 
@@ -38,14 +42,26 @@ UPSTREAM = "Neroued/ninfer"
 FORK = "MichaelDementii/ninfer"
 BRANCH = "perf/widen-w8-rowsplit-decode"
 REMOTE_BRANCH = "perf/widen-w8-rowsplit-decode"
-# The branch is rebased onto current origin/master, so the PR targets master directly.
 BASE_BRANCH = "master"
 
-KEY = "C:/Users/MixaPC/.ssh/ninfer_5090_ed25519"
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
-       "-i", KEY, "-p", "28677", "root@180.189.55.43"]
+# The key lives in a different place on each of our machines; NINFER_KEY overrides.
+KEY_CANDIDATES = [
+    os.environ.get("NINFER_KEY", ""),
+    str(Path.home() / ".ssh_ninfer" / "key"),
+    "C:/Users/MixaPC/.ssh/ninfer_5090_ed25519",
+    str(Path.home() / ".ssh" / "ninfer_5090_ed25519"),
+    str(HERE.parent / "vast_47972656"),
+]
 SCP_HOST = "root@180.189.55.43"
+PORT = "28677"
 SERVER_REPO = "/root/ninfer_d4"
+
+
+def key_path():
+    for k in KEY_CANDIDATES:
+        if k and Path(k).exists():
+            return k
+    sys.exit("no ssh key found; set NINFER_KEY to its path")
 
 
 def run(cmd, cwd=None, check=True, quiet=False):
@@ -64,7 +80,10 @@ def read_texts(title_file, body_file):
     return title_file.read_text(encoding="utf-8").strip(), body_file.read_text(encoding="utf-8")
 
 
-def validate(title, body):
+def validate(title, body, kind):
+    """Only checks that can actually be wrong. An earlier version flagged every percentage in a
+    table cell as unsigned, which caught eleven legitimate share and spread cells and refused to
+    file anything; a validator that cries wolf is worse than none."""
     problems = []
     if not title:
         problems.append("title is empty")
@@ -74,19 +93,21 @@ def validate(title, body):
         problems.append("title spans more than one line")
     if len(body.strip()) < 500:
         problems.append("body is suspiciously short")
-    for token in ("TODO", "TBD", "XXX", "<<", "PLACEHOLDER"):
+    for token in ("TODO", "TBD", "XXX", "PLACEHOLDER", "FIXME"):
         if token in body:
             problems.append(f"body still contains {token}")
-    for n, line in enumerate(body.splitlines(), 1):
-        if re.search(r"\|\s*\d+\.\d+%\s*\|", line) and "±" not in line:
-            problems.append(f"line {n}: percentage without a sign, is it a gain or a loss?")
+    if kind == "pr":
+        if "#ISSUE" not in body and not re.search(r"#\d+", body):
+            problems.append("the PR body references no Issue at all")
+        if "Scope as confirmed" in body and "…" in body.split("Scope as confirmed", 1)[1][:200]:
+            problems.append("the agreed-scope line is still a placeholder")
     return problems
 
 
 def stage_check(args):
     problems = []
-    for label, tf, bf in (("PR", TITLE_FILE, BODY_FILE),
-                          ("Issue", ISSUE_TITLE_FILE, ISSUE_BODY_FILE)):
+    for kind, label, tf, bf in (("issue", "Issue", ISSUE_TITLE_FILE, ISSUE_BODY_FILE),
+                                ("pr", "PR", TITLE_FILE, BODY_FILE)):
         if not tf.exists() or not bf.exists():
             problems.append(f"{label}: missing {tf.name} or {bf.name}")
             continue
@@ -95,14 +116,16 @@ def stage_check(args):
         print(f"{label} body: {len(body.splitlines())} lines, {len(body)} chars")
         for h in [l for l in body.splitlines() if l.startswith("#")]:
             print("   ", h)
-        problems += [f"{label}: {p}" for p in validate(title, body)]
+        problems += [f"{label}: {p}" for p in validate(title, body, kind)]
         print()
+    print("Issue filed:      ", ISSUE_URL_FILE.read_text().strip() if ISSUE_URL_FILE.exists() else "not yet")
+    print("Scope confirmed:  ", "yes" if CONFIRMED_FILE.exists() else "no - create will refuse")
     if problems:
-        print("PROBLEMS:")
+        print("\nPROBLEMS:")
         for p in problems:
             print("  -", p)
     else:
-        print("no problems found")
+        print("\nno problems found")
     print(f"\nwould open  Issue on {UPSTREAM}")
     print(f"would push  {BRANCH}  ->  {FORK}:{REMOTE_BRANCH}")
     print(f"would open  PR against {UPSTREAM}:{BASE_BRANCH}")
@@ -111,12 +134,15 @@ def stage_check(args):
 
 def stage_issue(args):
     title, body = read_texts(ISSUE_TITLE_FILE, ISSUE_BODY_FILE)
-    problems = validate(title, body)
+    problems = validate(title, body, "issue")
     if problems:
         print("refusing to open an Issue with unresolved problems:")
         for p in problems:
             print("  -", p)
         sys.exit(1)
+    if ISSUE_URL_FILE.exists():
+        sys.exit(f"ISSUE_URL.txt already exists ({ISSUE_URL_FILE.read_text().strip()}); "
+                 "delete it if you really mean to open a second Issue")
     print(f"opening Issue on {UPSTREAM}")
     print(f"  title: {title}")
     print(f"  body:  {len(body.splitlines())} lines")
@@ -128,18 +154,28 @@ def stage_issue(args):
                "--body-file", str(tmp)])
     tmp.unlink(missing_ok=True)
     print(url)
-    (HERE / "ISSUE_URL.txt").write_text(url + "\n", encoding="utf-8")
+    ISSUE_URL_FILE.write_text(url + "\n", encoding="utf-8")
+    print("\nNow wait for him. When he confirms the scope, write what he agreed to into\n"
+          "ISSUE_CONFIRMED.txt - create refuses without it.")
 
 
 def stage_bundle(args):
-    print(f"pulling {BRANCH} off the build server as a bundle")
+    key = key_path()
+    print(f"pulling {BRANCH} off the build server as a bundle, key {key}")
     if not args.yes:
         return print("dry run; pass --yes")
-    run(SSH + [f"cd {SERVER_REPO} && git bundle create /tmp/w8.bundle "
-               f"origin/{BASE_BRANCH}..{BRANCH} --branches={BRANCH} 2>&1 | tail -3"])
-    run(["scp", "-q", "-o", "BatchMode=yes", "-i", KEY, "-P", "28677",
+    # No pipe: a pipeline would hand back tail's exit status and a failed bundle would go unnoticed,
+    # leaving a stale /tmp/w8.bundle to be shipped.
+    run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "-i", key, "-p", PORT, SCP_HOST,
+         f"rm -f /tmp/w8.bundle && cd {SERVER_REPO} && "
+         f"git bundle create /tmp/w8.bundle origin/{BASE_BRANCH}..{BRANCH} --branches={BRANCH}"])
+    BUNDLE.unlink(missing_ok=True)
+    run(["scp", "-q", "-o", "BatchMode=yes", "-i", key, "-P", PORT,
          f"{SCP_HOST}:/tmp/w8.bundle", str(BUNDLE)])
-    print(f"bundle: {BUNDLE} ({BUNDLE.stat().st_size} bytes)")
+    size = BUNDLE.stat().st_size
+    if size < 512:
+        sys.exit(f"bundle is only {size} bytes; that is not a real bundle")
+    print(f"bundle: {BUNDLE} ({size} bytes)")
 
 
 def stage_fetch(args):
@@ -152,6 +188,7 @@ def stage_fetch(args):
         run(["git", "clone", "--quiet", f"https://github.com/{UPSTREAM}.git", str(WORK)])
         run(["git", "remote", "add", "fork", f"https://github.com/{FORK}.git"], cwd=WORK)
     run(["git", "fetch", "--quiet", "origin"], cwd=WORK)
+    run(["git", "fetch", "--quiet", "fork"], cwd=WORK, check=False)
     run(["git", "fetch", str(BUNDLE), f"{BRANCH}:{BRANCH}", "--force"], cwd=WORK)
     n = run(["git", "rev-list", "--count", f"origin/{BASE_BRANCH}..{BRANCH}"], cwd=WORK, quiet=True)
     print(f"{BRANCH} imported: {n} commits ahead of origin/{BASE_BRANCH}")
@@ -164,30 +201,50 @@ def stage_push(args):
     print(f"pushing {BRANCH} -> {FORK}:{REMOTE_BRANCH} (force-with-lease)")
     if not args.yes:
         return print("dry run; pass --yes")
+    # force-with-lease needs a remote-tracking ref to compare against, and a fresh clone has none.
+    run(["git", "fetch", "fork"], cwd=WORK, check=False)
     run(["git", "push", "--force-with-lease", "fork", f"{BRANCH}:{REMOTE_BRANCH}"], cwd=WORK)
 
 
 def stage_create(args):
     title, body = read_texts(TITLE_FILE, BODY_FILE)
-    problems = validate(title, body)
-    issue_url = HERE / "ISSUE_URL.txt"
-    if not issue_url.exists():
-        problems.append("no ISSUE_URL.txt; CONTRIBUTING.md wants a linked, confirmed Issue. "
-                        "Run the issue stage, wait for his answer, then come back.")
-    else:
-        number = issue_url.read_text(encoding="utf-8").strip().rsplit("/", 1)[-1]
+    problems = validate(title, body, "pr")
+
+    if not ISSUE_URL_FILE.exists():
+        problems.append("no ISSUE_URL.txt; run the issue stage and wait for his answer")
+    if not CONFIRMED_FILE.exists():
+        problems.append("no ISSUE_CONFIRMED.txt; CONTRIBUTING wants the agreed scope in the PR, "
+                        "and this is the only gate that can check he actually answered")
+    if not WORK.exists():
+        problems.append("no work clone; run fetch first")
+
+    number = None
+    if ISSUE_URL_FILE.exists():
+        number = ISSUE_URL_FILE.read_text(encoding="utf-8").strip().rsplit("/", 1)[-1]
         if not number.isdigit():
             problems.append(f"ISSUE_URL.txt does not end in an issue number: {number}")
-        elif "#ISSUE" in body:
-            body = body.replace("#ISSUE", f"#{number}")
-            print(f"  substituted #ISSUE -> #{number}")
-        elif f"#{number}" not in body:
-            problems.append(f"the PR body mentions neither #ISSUE nor #{number}")
+
+    if WORK.exists():
+        run(["git", "fetch", "--quiet", "origin"], cwd=WORK, quiet=True)
+        ahead = run(["git", "rev-list", "--count", f"origin/{BASE_BRANCH}..{BRANCH}"],
+                    cwd=WORK, quiet=True)
+        behind = run(["git", "rev-list", "--count", f"{BRANCH}..origin/{BASE_BRANCH}"],
+                     cwd=WORK, quiet=True)
+        if ahead != "1":
+            problems.append(f"branch is {ahead} commits ahead of {BASE_BRANCH}; he asks for one")
+        if behind != "0":
+            problems.append(f"{BASE_BRANCH} has moved {behind} commits ahead of the branch; "
+                            "rebase on the server and re-run bundle/fetch/push")
+
     if problems:
         print("refusing to open a PR with unresolved problems:")
         for p in problems:
             print("  -", p)
         sys.exit(1)
+
+    if "#ISSUE" in body:
+        body = body.replace("#ISSUE", f"#{number}")
+        print(f"  substituted #ISSUE -> #{number}")
     print(f"opening PR on {UPSTREAM}, base {BASE_BRANCH}, head {FORK.split('/')[0]}:{REMOTE_BRANCH}")
     print(f"  title: {title}")
     if not args.yes:

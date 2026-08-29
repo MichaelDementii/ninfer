@@ -1,0 +1,61 @@
+functions 2931 / 2931, comparable 2893, unmatched 38
+bodies differing in count or per-opcode census: 120
+all of them this kernel: True
+instructions over the changed bodies: 179948 -> 161238 (-10.4%)
+per-body delta: -33.3% .. -1.6%, median -4.9%
+
+opcode sums over the 120 changed bodies (only those that move):
+  BRA               5000 ->    4430   -11.4%
+  BSSY              2667 ->    2967   +11.2%
+  BSYNC             2667 ->    2967   +11.2%
+  CS2R              3011 ->    3023   +0.4%
+  ENDCOLLECTIVE      390 ->       0   -100.0%
+  F2FP              3994 ->    4694   +17.5%
+  FMUL              3976 ->    5376   +35.2%
+  HADD2             1780 ->     620   -65.2%
+  I2F               3560 ->    1240   -65.2%
+  I2FP                 0 ->    3720   +inf%
+  IADD             11998 ->    9701   -19.1%
+  IADD3              347 ->     133   -61.7%
+  IMAD             16476 ->   15493   -6.0%
+  ISETP             7589 ->    6742   -11.2%
+  LDC                489 ->     483   -1.2%
+  LDCU              3721 ->    3693   -0.8%
+  LDS               2934 ->    1514   -48.4%
+  LEA               9179 ->    8832   -3.8%
+  LOP3             17924 ->   12940   -27.8%
+  MOV              12215 ->    8466   -30.7%
+  NOP               1386 ->    1376   -0.7%
+  PLOP3               79 ->      42   -46.8%
+  PRMT              1381 ->    1374   -0.5%
+  R2UR                 8 ->      14   +75.0%
+  S2R                849 ->     335   -60.5%
+  S2UR              1351 ->     531   -60.7%
+  SEL               1985 ->    1914   -3.6%
+  SHF               5561 ->    7649   +37.5%
+  SHFL              1150 ->       0   -100.0%
+  STS               2884 ->    1724   -40.2%
+  UIADD3            2483 ->    1981   -20.2%
+  UIMAD              155 ->     149   -3.9%
+  UISETP             206 ->     241   +17.0%
+  ULEA              2302 ->    1827   -20.6%
+  ULOP3               88 ->     190   +115.9%
+  UMOV              4444 ->    2481   -44.2%
+  USHF               536 ->     552   +3.0%
+  UVIMNMX             22 ->      28   +27.3%
+  VIMNMX             700 ->     694   -0.9%
+  VOTEU               10 ->      11   +10.0%
+  WARPSYNC          1360 ->       0   -100.0%
+
+opcodes identical across all changed bodies:
+  BAR 1302, CALL 416, DEPBAR 600, EXIT 163, FADD 920, FCHK 416, FFMA 4160, HMMA 15120, LDG 210, LDGDEPBAR 730, LDGSTS 1802, LDSM 12480, MUFU 832, P2R 34, STG 1882, USEL 24
+
+bodies where HMMA moves: 0
+
+largest changed body: 2913 -> 2466 (-15.3%)
+  _ZN6ninfer3ops6detail27w8_rowsplit_gemm_mma_kernelINS1_25W8RowSplitMmaGemmScheduleILi128ELi64ELi64ELi16ELi2ELi2ELi64ELi2EEELb0ELNS1_10W8EpilogueE2ENS1
+deepest reduction: 1922 -> 1282 (-33.3%)
+  _ZN6ninfer3ops6detail27w8_rowsplit_gemm_mma_kernelINS1_25W8RowSplitMmaGemmScheduleILi64ELi48ELi64ELi16ELi3ELi2ELi64ELi2EEELb1ELNS1_10W8EpilogueE1ENS1_
+  largest: STS 46->21  LDS 61->26  I2F 60->10  I2FP 0->30  F2FP 62->52  HMMA 160->160  SHFL 20->0  WARPSYNC 15->0
+  deepest: STS 72->37  LDS 61->11  I2F 80->10  I2FP 0->30  F2FP 60->40  HMMA 160->160  SHFL 30->0  WARPSYNC 20->0
+CENSUS2_DONE
