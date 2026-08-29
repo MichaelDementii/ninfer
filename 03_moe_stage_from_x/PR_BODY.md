@@ -80,10 +80,11 @@ told from a row that is noisy.
 `w8-w8` is the same operator, the same benchmark and a codec this change does not reach. Its eight
 cells span **0.9965 to 1.0045**, and that is the floor the Q4 rows should be read against.
 
-The size of the gain is worth stating because it is also its ceiling. At T = 8192 the gather stores
-256 MiB and reads about 32 MiB of `x` to do it. The measured saving is about 180 us of a 4018 us
-operator, so those 288 MiB are leaving at roughly 1.6 TB/s - which is the traffic and nothing else.
-**The GEMM itself does not get faster**; see the trace below.
+The gain is the gather and nothing else, and the two independent measurements agree on that to the
+microsecond. The trace below times the gather at 57.61 ms over 680 launches, 84.7 us each, and each
+launch covers one 4096-token slice; at T = 8192 the operator runs two of them, 169 us, against a
+measured saving of about 180 us. **The GEMM that stopped reading the copy barely moves** - the trace
+puts it at -0.6%, inside what a single pass resolves.
 
 ## Workspace
 
