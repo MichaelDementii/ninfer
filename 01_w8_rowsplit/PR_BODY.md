@@ -304,9 +304,11 @@ row above, which is where they are measured instead.
 | `w8_rowsplit_gemm_mma` | 120 of 158 | 127 -> **117** | 102.4 -> **96.2** | same set of 22 values | none either side |
 | MoE prefill gate/up and down | 19 | 116 -> 116 | 70.6 -> 70.6 | unchanged | none either side |
 
-Registers fall in 103, rise in 9, unchanged in 8. For reference against #106's table, which reported
-this kernel on master as 158 instantiations with maximum 128: that 128-register instantiation is one
-of the 38 concat symbols, which is why the matched-set maximum reads 127 here. The MoE row is there
+Registers fall in 103, rise in 9, unchanged in 8. For reference against #106's table, which reported this kernel on master as 158 instantiations with
+maximum 128: `cuobjdump --dump-resource-usage` over the master binary splits those 158 into the 120
+named instantiations, whose maximum is 127, and the 38 internal-linkage concat symbols, whose
+maximum is 128. So the single 128-register instantiation is one of the 38, which is why the
+matched-set maximum reads 127 here. The MoE row is there
 because those kernels are #106's subject; this branch leaves them untouched, register for register.
 Workspace, resident memory, transfers and graph nodes are unchanged.
 
