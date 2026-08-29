@@ -1,0 +1,1 @@
+The grouped MoE prefill route slices every chunk at 4096 tokens, halving the expert column runs at wider chunks
