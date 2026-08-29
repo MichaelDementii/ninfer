@@ -1,0 +1,33 @@
+perf(ops): stage the routed MoE gate/up tile from x instead of a gathered copy
+
+sparse_moe_prefill_gather_kernel materialises one 2048-wide bf16 row for every (token, expert)
+assignment, which at top-8 of 256 is eight copies of every token: 256 MiB stored and read straight
+back at a 8192-token prefill chunk. Every one of those rows is a byte-exact copy of a column of x,
+and the Q4 gate/up GEMM does not need the copy. It needs to know which token each packed column came
+from.
+
+On the Q4 routed codec the copy kernel becomes an index kernel that publishes only that map. It is
+one thread per assignment rather than one block, it writes four bytes per assignment instead of four
+kilobytes, and it reads the tile-local rank and writes the inverse map from the same thread, so the
+read/write overlap that 3a61ef3f separated the buffers for does not arise on this path at all.
+
+The staging loop follows the map into x. A thread stages the same columns of every one of the
+kHidden / kExpertBK tiles, so it resolves the rows those columns come from once per route job into a
+small register array and the k-loop then walks pointers instead of re-reading the map and redoing
+the row multiply per tile. Shared memory per block is unchanged from master, so the
+three-blocks-per-SM launch bound is met exactly as before rather than approached from underneath.
+
+packed_token needs no allocation of its own. Scan is the final consumer of tile_counts, packed_index
+already aliases its dead prefix, and that prefix is 256 * ceil(T / 8) >= 32 * T elements against
+8 * T per map, so the two maps together take half of it. The arena sequence is byte-identical to
+master's, which is what makes sparse_moe_prefill_workspace_bytes unchanged by construction rather
+than by measurement.
+
+The W8 routed codec keeps the gather. grouped_io stays either way: the routed down projection writes
+its output into that buffer, which is the lifetime union the header already documents. What this
+saves is traffic, not capacity, and the reported workspace peak does not move.
+
+The staged bytes are the same bytes. gathered[packed] was written as x[token] by the gather and
+packed_token[packed] resolves to that same token; columns past the tile tail read the same fallback
+row the old code read and are zero-filled by the same cp_async_zfill predicate. Greedy output is
+byte-identical to master.

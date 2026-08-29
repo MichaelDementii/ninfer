@@ -1,0 +1,1 @@
+Stage the routed MoE gate/up tile from x instead of a gathered copy: xTBD on the Q4 codec

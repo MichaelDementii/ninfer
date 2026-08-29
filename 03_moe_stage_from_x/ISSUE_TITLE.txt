@@ -1,0 +1,1 @@
+Sparse MoE prefill copies every token once per routed expert before the gate/up GEMM reads it back
