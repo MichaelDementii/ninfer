@@ -1,0 +1,30 @@
+perf(sparse-moe): let the grouped prefill job width follow the chunk
+
+The routed grouped GEMMs run one job per expert column tile, and the tile was 64 columns wide at
+every chunk width. Each job re-reads its expert's entire weight slab, and at top-8 of 256 the
+average column run per expert is tokens/32, so a 64-wide job covers a 2048-token slice exactly and
+re-reads every slab twice at 4096 and four times at 8192. The weight traffic of the routed MoE is a
+function of the job width and the slice width together, and only one of the two followed the caller.
+
+Both routed GEMMs gain a 128-wide instantiation and the plan picks it from the token count.
+sparse_moe_prefill_qx_down_kernel needed generalising to reach it: its accumulator, its B fragments
+and its epilogue were written for exactly one eight-column group per warp, the way
+sparse_moe_prefill_q4_gate_up_kernel already was not.
+
+A 128-wide tile doubles Bs and three blocks per SM stop fitting, so one expression owns both the
+launch bound and the grid and they cannot drift apart. The numbers under it are measured rather than
+assumed: the device reports sharedMemPerMultiprocessor 102400 and reservedSharedMemPerBlock 1024,
+and the wide instantiations take 50176, 48128 and 49152 bytes, which is 100352 for two blocks of the
+gate/up and 150528 for three. Registers hold two blocks with two to spare, 126 x 256 x 2 = 64512
+against 65536, and nothing spills.
+
+The nineteen existing instantiations are untouched in registers, shared, local and stack:
+prefill_blocks_per_sm(64) is the 3 the literal used to be, and the WarpNT generalisation collapses
+to the old shape where WarpNT is 1.
+
+Nothing about the workspace moves. sparse_moe_prefill_workspace_bytes is unchanged at every width,
+the arena sequence is untouched, and the engine's reported peak is the same on both arms.
+
+Job width divides the column range and changes no reduction: each job accumulates over the hidden
+dimension for its own columns, and a wider job carries more columns rather than reordering a sum.
+Greedy output is byte-identical to master.
