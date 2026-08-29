@@ -183,9 +183,10 @@ This is one pass per arm and is attribution, not measurement.
 cd build && ctest -j1
 ```
 
-`100% tests passed, 0 tests failed out of 94`, 1 skipped, on this branch and on `master` built in
-the same directory in the same run. The skip is `27b_load_plan`, which needs both real 27B artifacts
-and only one is on this box.
+`100% tests passed, 0 tests failed out of 94`, 1 skipped, on this branch. `master` in the same build
+directory reports the same, from the run that qualified the first form of this change earlier the
+same day - I am not claiming the two ran back to back. The skip is `27b_load_plan`, which needs both
+real 27B artifacts and only one is on this box.
 
 ## End to end
 

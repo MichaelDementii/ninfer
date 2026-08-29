@@ -102,8 +102,9 @@ Greedy output is byte-identical: 16 generations over four rounds, four points, t
 cd build && ctest -j1
 ```
 
-`100% tests passed, 0 tests failed out of 94`, 1 skipped. The skip is `27b_load_plan`, which needs
-both real 27B artifacts and only one is on this box.
+`100% tests passed, 0 tests failed out of 94`, 1 skipped, on this branch; `master` in the same build
+directory reports the same, from a run earlier the same day rather than back to back. The skip is
+`27b_load_plan`, which needs both real 27B artifacts and only one is on this box.
 
 ## Which bucket moves
 
