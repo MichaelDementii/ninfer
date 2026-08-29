@@ -1,0 +1,29 @@
+perf(nvfp4): register the fused TMA SwiGLU for every chunk width it accepts
+
+resolve_route took the fused TMA SwiGLU at exactly T == 1024, although the kernel accepts any
+T % 256 == 0 and the workspace recipe beside it was already written in terms of that constraint.
+Every wider prefill chunk therefore fell into LinearW4A4Post, which materialises the 34816xT bf16
+projection into the arena and reads it back through a separate silu_mul.
+
+The route now takes the fused kernel whenever tokens >= 1024 and tokens % 256 == 0, and the
+capacity query is widened to match: it sizes the fused path for the largest accepted width in the
+interval rather than for 1024 alone.
+
+The capacity does not grow anywhere. Enumerated over 4560 (min_tokens, max_tokens) intervals it is
+never larger than before, is smaller in 963, and the argument validation is unchanged. Where it
+shrinks it is usually by one token of the materialised projection, because last_baseline steps down
+when max_tokens itself now resolves to the fused route; on an interval collapsed to a single
+accepted width the materialising path becomes unreachable and the whole projection leaves, which is
+544 MiB at 8192. The engine does not request such an interval today, so the reported workspace peak
+is unchanged and the win is traffic rather than capacity.
+
+The two routes are not bit-identical and cannot be: the fused epilogue has the f32 accumulator in
+hand and rounds once, while the materialising one rounds gate and up to bf16 and multiplies the
+rounded values. This does not introduce that difference, it moves which widths see it - stock
+already answers differently at 1024 and at 8192, and after this both answer the way 1024 does.
+tests/ops/linear_swiglu/test_nvfp4.cpp qualifies both routes against the FP64 oracle today, at
+T = 49 and 128 for the materialising one and T = 1024 for the fused one, and this changes neither.
+Extending its A4 case list to the widths that do change route, both arms pass the same criterion:
+relative-L2 is 0.0513 against 0.0516 at 1280 and 0.0497 against 0.0501 at 2048, and equal at 4096,
+where the gross ratio is the one figure that moves the other way, 0.326 against 0.286. Every cell
+sits far inside a criterion the shipped widths already reach 0.639 of.

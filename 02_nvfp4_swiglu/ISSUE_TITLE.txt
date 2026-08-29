@@ -1,0 +1,1 @@
+NVFP4 SwiGLU: the fused TMA kernel is registered at one chunk width but accepts every multiple of 256

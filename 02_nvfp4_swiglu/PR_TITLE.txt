@@ -1,0 +1,1 @@
+Register the fused NVFP4 TMA SwiGLU for every width it accepts: x1.05 to x1.12, prefill +2.4%
