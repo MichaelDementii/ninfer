@@ -83,6 +83,21 @@
 > confirm the absence of a 1-2% one. That is a bound set by the number of questions, not by how the
 > runs were done. TBD_ACC_RERUN
 >
+> ## One question back, since it is your idea
+>
+> The same ceiling looks like it applies to `prompt_bf16.cuh`. On bf16 KV that kernel is 41.6% of
+> prefill on the trace I took today - by a wide margin the largest single kernel - and its PV stage
+> is `mma_bf16` into a `float acc[PVNt][4]`, which is the same f32-accumulate half-rate path your
+> issue is about. It is harder there than in the INT8 route: `prompt_i8.cuh` already has `v_f16` in
+> shared because it has to dequantise, while the bf16 route `cp_async`s V straight from the cache,
+> so the f16 operands would have to come from a register-side conversion after `ldmatrix` (which is
+> exact in that direction - bf16 carries 7 mantissa bits and f16 carries 10 - but narrows the
+> range).
+>
+> Is that something you are already planning? I am not going to start on it: it is your mechanism
+> and the first move on it should be yours. If you would rather someone else measured it, say so and
+> I will, with the attribution where it belongs.
+>
 > ## What I did not check
 >
 > TBD_LIMITS

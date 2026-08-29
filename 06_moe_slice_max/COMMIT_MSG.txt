@@ -1,0 +1,24 @@
+perf(sparse-moe): let the grouped prefill slice follow the chunk up to 8192
+
+resolve_sparse_moe_prefill_plan slices the prefill chunk at a fixed 4096 tokens whatever the caller
+asked for, so a caller that requests an 8192-token chunk gets two independent passes through the
+whole routed MoE. Each pass routes, scans and runs its own grouped GEMM, so every expert's column
+run is half as long as the chunk would allow - and the length of that run is the whole economy of
+the grouped route, because a route job re-reads its expert's entire weight slab and the average run
+is tokens/32 at top-8 of 256.
+
+Nothing in the kernels requires 4096. The constant bounds the workspace, not correctness.
+
+kSparseMoePrefillSliceMax is read only inside two min() calls, one sizing the workspace and one
+slicing the execution, so for any caller at or below 4096 tokens both expressions return exactly
+what they returned before. The default 1024-token chunk gets the same plan, the same workspace and
+the same arithmetic, by the shape of the expression rather than by measurement.
+
+Above 4096 the workspace grows with it, and that is the cost: capacity_tokens is what every
+per-assignment buffer is sized from, so at a 8192-token chunk the MoE prefill workspace doubles.
+sparse_moe_prefill_workspace_bytes(max_tokens) is a public query, so this is a contract change for
+max_tokens > 4096 and nothing else.
+
+Slice width divides the token range and changes no reduction: the grouped GEMM accumulates over the
+hidden dimension, and a wider slice adds columns rather than reordering a sum. Greedy output is
+byte-identical, and a host-side constant moves no device code.
