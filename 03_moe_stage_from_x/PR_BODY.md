@@ -12,7 +12,7 @@ the copy kernel becomes an index kernel that publishes only that map, and the st
 the map into `x`.
 
 **Process.** Opened as #ISSUE first and sent after your reply. Targeted at `master`, one commit on
-`TBD_BASE`; every number below was measured at `1fc1cb76`. It is unrelated to #112 and #113.
+``1fc1cb76``; every number below was measured at `1fc1cb76`. It is unrelated to #112 and #113.
 
 ## What changes
 
@@ -100,7 +100,8 @@ already aliases its dead prefix, and the prefix is `256 * ceil(T / 8) >= 32 * T`
 No `arena.alloc` is added or removed, so the arena sequence is byte-identical to master's and
 `sparse_moe_prefill_workspace_bytes` cannot move by construction. The benchmark reports it and
 confirms it: `workspace_bytes` is **43,378,176 / 86,752,768 / 173,501,952 / 173,501,952** at
-T = 1024 / 2048 / 4096 / 8192 on both arms, and the engine's own peak is TBD_WSPEAK.
+T = 1024 / 2048 / 4096 / 8192 on both arms, and the engine's own `gpu workspace peak` for the 35B
+artifact at 131,072 context is 835.06 MiB on both arms with the same zero KV headroom.
 
 `grouped_io` stays, and not because of the W8 gather. Your comment says why:
 
@@ -125,7 +126,9 @@ thread 0 publishes the packed column into the same place. The index kernel is on
 assignment: it reads the rank and writes the map itself, so the overlap does not arise on this path.
 The fix stays where it is and keeps protecting the gather, which is still there for W8.
 
-TBD_GATE
+All 24 generations - four rounds over six points, two artifacts and two chunk widths - are
+byte-identical to master, and so are the 24 from an earlier campaign on the first form of this
+change.
 
 ## Resources
 
@@ -158,7 +161,20 @@ redone for each of the 32 k-tiles.
 `nsys profile -t cuda --cuda-graph-trace=node`, Qwen3.6-35B-A3B, 32K prompt, chunk 8192, one pass
 per arm:
 
-TBD_NSYS
+| master ms | branch ms | delta | kernel |
+| --: | --: | --: | --- |
+| 1948.18 | 1944.80 | -3.38 | `causal_attention_prompt_bf16_kernel` |
+| 704.95 | 700.88 | **-4.07** | `sparse_moe_prefill_q4_gate_up_kernel<8, 64>` |
+| 560.79 | 560.17 | -0.62 | `w8_rowsplit_gemm_mma_kernel`, widest |
+| 359.05 | 353.12 | -5.93 | `sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>` |
+| 95.20 | 92.52 | -2.68 | `sparse_moe_prefill_w8_gate_up_kernel<false, false>` |
+| **57.61** | **0.00** | **-57.61** | `sparse_moe_prefill_gather_kernel<false>` |
+| 4738.7 | 4663.0 | **-75.7** | total, all kernels |
+
+The gather is 76% of what is saved. The GEMM that stopped reading it moves by 0.6%, which is inside
+what a single pass resolves. The two other kernels that move - the routed down and the shared
+gate/up - are the ones that no longer share the machine with 256 MiB of stores. Nothing else moves.
+This is one pass per arm and is attribution, not measurement.
 
 ## Tests
 
@@ -180,7 +196,20 @@ every point its own process, greedy, four rounds, on an otherwise idle box.
     --max-context 131072 --prefill-chunk <chunk> --kv-dtype bf16
 ```
 
-TBD_E2E
+| model | chunk | prompt | per-round branch/master | prefill | decode |
+| --- | --: | --: | --- | --: | --: |
+| Qwen3.6-35B-A3B | 1024 | 4,357 | 1.0215 1.0220 1.0224 1.0210 | **+2.17%** | +0.01% |
+| Qwen3.6-35B-A3B | 1024 | 16,441 | 1.0180 1.0191 1.0181 1.0192 | **+1.86%** | -0.01% |
+| Qwen3.6-35B-A3B | 1024 | 33,031 | 1.0141 1.0154 1.0144 1.0149 | **+1.47%** | -0.01% |
+| Qwen3.6-35B-A3B | 8192 | 16,441 | 1.0195 1.0163 1.0207 1.0173 | **+1.85%** | -0.01% |
+| Qwen3.6-35B-A3B | 8192 | 33,031 | 1.0151 1.0143 1.0149 1.0143 | **+1.47%** | +0.02% |
+| Qwen3.6-27B dense | 8192 | 16,441 | 0.9950 1.0040 0.9954 1.0045 | -0.03% | -0.01% |
+
+The dense 27B row is the null control and behaves like one: four ratios straddling 1.000, averaging
+to -0.03%, on an artifact with no sparse MoE. I quote the paired per-round ratios rather than a mean
+of means because the absolute rate drifts between rounds on both arms and the ratios do not.
+
+All 24 generations are byte-identical to `master`.
 
 ## Checks not run
 
