@@ -2,8 +2,9 @@ Closes #ISSUE. Scope as agreed there: ...
 
 `sparse_moe_prefill_gather_kernel` materialises one 2048-wide bf16 row for **every (token, expert)
 assignment**. At top-8 of 256 that is eight copies of every token: a 4096-token slice stores 32,768
-rows of 4 KiB, **128 MiB**, and an 8192-token chunk stores **256 MiB**, which
-`sparse_moe_prefill_q4_gate_up_kernel` then reads straight back through `stage_inputs`.
+rows of 4 KiB, **128 MiB**, and an 8192-token chunk stores that twice because the plan slices at
+4096 - all of which `sparse_moe_prefill_q4_gate_up_kernel` then reads straight back through
+`stage_inputs`.
 
 Every one of those rows is a byte-exact copy of a column of the layer input `x`. The GEMM does not
 need the copy - it needs to know which token each packed column came from. On the Q4 routed codec
@@ -79,10 +80,10 @@ told from a row that is noisy.
 `w8-w8` is the same operator, the same benchmark and a codec this change does not reach. Its eight
 cells span **0.9965 to 1.0045**, and that is the floor the Q4 rows should be read against.
 
-The size of the gain is not a coincidence and is worth stating, because it is also its ceiling: the
-gather stores 256 MiB at T = 8192 and reads about 32 MiB of `x` to do it, and 288 MiB at the rate
-this card sustains is roughly 190 us against a 4018 us operator - which is the 4.5% the table
-reports. **The GEMM itself does not get faster**; see the trace below.
+The size of the gain is worth stating because it is also its ceiling. At T = 8192 the gather stores
+256 MiB and reads about 32 MiB of `x` to do it. The measured saving is about 180 us of a 4018 us
+operator, so those 288 MiB are leaving at roughly 1.6 TB/s - which is the traffic and nothing else.
+**The GEMM itself does not get faster**; see the trace below.
 
 ## Workspace
 
