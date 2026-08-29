@@ -14,7 +14,7 @@ decodes eight codes out of one `uint2` and stores them with a single 16-byte `st
 the arithmetic is unchanged, so this changes how operands are prepared, not what is computed.
 
 This is the projection half of the widening whose MoE half you merged as #106. It is based on
-`master` at `3a61ef3f`, which already carries that half; `dev` is at `3a61ef3f` too, so nothing
+`master` at `1fc1cb76`, which already carries that half; `dev` is at `1fc1cb76` too, so nothing
 unmerged touches this header.
 
 ## The design
@@ -61,8 +61,10 @@ under the one-to-eight active requests the product targets.
 The claim is at operator level. The end-to-end section is confirmation, not the evidence.
 
 RTX 5090, sm_120a, driver 580.105.08, CUDA 13.1.115, gcc 13.3, Ubuntu 24.04, Release,
-`-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `3a61ef3f`, both arms built in the same build directory, the
-same two binaries throughout. Each benchmark's own default warmup (3 for `linear`, 5 for the others)
+`-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `1fc1cb76`. The figures were taken on `3a61ef3f`; the four commits since then touch `src/serve`,
+the cache test oracle and the FP8 vocabulary GEMM, none of them this header or its consumers, and
+the suite and the instruction census were re-run on the new base. Both arms built in the same build
+directory, the same two binaries throughout. Each benchmark's own default warmup (3 for `linear`, 5 for the others)
 and 50 measured samples. L2 is flushed for every sample; the timing path is
 `bench::measure_cold_launch` except for `linear_pair`, which is cold **graph replay** through
 `bench::measure_cold_graph`, and `sparse_moe`, which its own harness times eagerly - prefill is not
@@ -374,10 +376,12 @@ carries `a16(33), a16(34), a16(48), a16(49), a16(64), a16(65)` and `kN34816K5120
 cd build && ctest -j1
 ```
 
-92 pass, 1 skipped, 1 fails, with the same pass/fail set on both arms in the same campaign. The skip
-is `27b_load_plan`, which requires both real 27B artifacts and only one is on this box. The failure is
-`ninfer_qwen3_6_27b_prefix_real_test`: `Host checkpoint restore changed greedy output:
-restored=64,1248, baseline=64,56127 ... transfers=1/1/3/3`. It is #105 and still open.
+**94 tests, 0 failed, 1 skipped**, on master and on this branch, on the rebased base. The skip is
+`27b_load_plan`, which needs both real 27B artifacts and only one is on this box.
+
+On `3a61ef3f` this suite had one failure, `ninfer_qwen3_6_27b_prefix_real_test`, which we reported
+as #105. `fd48e2fa` between the two bases rewrites that test's oracle, so it now passes; the
+submission no longer carries a red test.
 
 ### End to end
 

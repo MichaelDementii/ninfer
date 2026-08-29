@@ -46,7 +46,7 @@ BASE_BRANCH = "master"
 # The commit every number in the submission was measured on. stage_bundle re-pulls from a build box
 # other work is using, so a pull that quietly returns a different valid commit must be an error
 # rather than a surprise. The committed branch.bundle already holds this head.
-EXPECT_COMMIT = "93959c1657eed5d926005d9bd4e5555f3c148504"
+EXPECT_COMMIT = "436aba7b8ca09afa7270e82f0289623281034cda"
 
 # The key lives in a different place on each of our machines; NINFER_KEY overrides.
 KEY_CANDIDATES = [

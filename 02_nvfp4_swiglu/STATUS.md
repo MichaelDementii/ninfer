@@ -1,7 +1,8 @@
 # NVFP4 fused SwiGLU: measured state, 2026-08-29
 
-Branch on the build server: `perf/nvfp4-fused-swiglu-every-width`, one commit on `origin/master`
-(`3a61ef3f`), one file, +10/−4. Cherry-picked from our `72219916`. The second NVFP4 commit,
+Branch on the build server: `perf/nvfp4-fused-swiglu-every-width`. Rebased onto `1fc1cb76` after
+review (was `3a61ef3f`); one commit, one file, +10/-4. None of the four commits between those bases
+touches `src/ops/linear_swiglu`, and the figures below were taken on `3a61ef3f`. Cherry-picked from our `72219916`. The second NVFP4 commit,
 `c5f7ace1` (walk the TMA grid in token groups), is a **different mechanism** and is deliberately not
 in this branch.
 
@@ -53,7 +54,8 @@ So the capacity never regresses anywhere, and the validation surface is untouche
 come in two classes:
 
 - **952 intervals fall by exactly 72,512 bytes** - one token of the `34816 × T` bf16 intermediate
-  (69,632) plus 2,880 of alignment. This is the `last_baseline` step-down: when `max_tokens` itself
+  (69,632) plus one token of the NVFP4 activation codes and scales (5120/2 + 5120/16 = 2,880), not
+  padding. This is the `last_baseline` step-down: when `max_tokens` itself
   now resolves to the fused route, the baseline term is sized for `max_tokens - 1`.
 - **11 intervals fall by the whole intermediate**, one per width in
   {1280, 1536, 2048, 4096, 6144, 8192, 12288, 16384, 32768, 65536, 131072}. These are the collapsed
@@ -119,8 +121,8 @@ the false conclusion that the two routes agree bit for bit. They are not require
 epilogue holds the f32 accumulator and rounds once, the materialising one rounds gate and up to
 bf16 and multiplies the rounded values. **Do not ship the 32-token result as evidence.**
 
-The gate that does carry weight: 33,031-token prompt, `--max-new 512`, stopping naturally on the
-stop token at 203 bytes.
+The gate that does carry weight: the **65,882-token** prompt (`niah_32k.json`), `--max-new 512`,
+stopping on the stop token after 164 generated tokens, 203 bytes.
 
 | chunk | verdict |
 |---|---|
@@ -189,3 +191,41 @@ is the A4 profile's criterion, which both routes meet.
 - [ ] independent review rounds, as was done for `01_w8_rowsplit`
 - [ ] this is the **second** submission; it must wait until the W8 Issue is answered, since the
       repo caps a contributor at two open items and the Issue-first rule applies to both
+
+## Open design point found in review: `kTmaBlockM` is duplicated across translation units
+
+The branch adds `constexpr std::int32_t kTmaBlockM = 256;` to
+`src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp`, duplicating
+`Nvfp4W4a4TmaSchedule<256,3,1>::kBlockM` from `nvfp4_linear_swiglu_w4a4_tma.cu` with no
+`static_assert` tying them together.
+
+Master was immune to this: 1024 is a multiple of 128, 256, 512 and 1024, so any retune of the
+schedule stayed safe. With the predicate keyed on 256, a schedule moved to `kBlockM = 512` — which
+the template permits — would send `T = 1280` to a launcher that throws at runtime, in prefill.
+
+The fix is small and should probably be in the submission: put the constant in
+`nvfp4_linear_swiglu_w4a4_tma_launch.h`, `static_assert` it against the schedule in the `.cu`, and
+have `plan.cpp` use it. That makes the diff touch three files instead of one, which is why it is
+recorded here as a decision rather than applied silently — but a duplicated magic number that
+turns into a runtime throw is exactly the kind of thing the maintainer objects to.
+
+## Two things the review changed after this file was first written
+
+**ctest is now green.** One of the four commits between `3a61ef3f` and `1fc1cb76` is
+`fd48e2fa test(cache): fix host restore output oracle`, which rewrites the oracle of
+`test_engine_prefix_real.cpp` — the test that was failing for us and that we reported as **#105**.
+He fixed the test's expectation, not the engine. On the rebased base, `ctest -j1` is
+**94 tests, 0 failed, 1 skipped** on master and on both branches. Both submissions should say that
+rather than carrying a "one pre-existing failure" paragraph.
+
+**The lower bound of the predicate was never measured, and the claim about it was false.** The
+submission said 1024 is the bound "because that is where the fused path starts winning". Nothing in
+the campaign measured the fused route below 1024 — the 1.000 rows at 256/512/768 time the
+*materialising* route on both arms. An independent probe says the fused route is faster there too,
+and by more: roughly x1.12 at 256, x1.35 at 512, x1.28 at 768. Being verified independently now.
+
+If it holds, the honest move is not to quietly lower the bound but to say so and offer it: the
+change as it stands is conservative, the three largest per-width wins are left on the table, and
+lowering the bound to `kTmaBlockM` is a one-token edit that re-routes widths the shipped test does
+not cover on either route. That is a decision for him, and putting it in the Issue is exactly what
+the Issue is for.

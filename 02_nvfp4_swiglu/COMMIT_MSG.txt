@@ -1,7 +1,7 @@
-perf(nvfp4): register the fused TMA SwiGLU for every chunk width it accepts
+perf(nvfp4): register the fused TMA SwiGLU for every 256-aligned width from the primary up
 
-resolve_route took the fused TMA SwiGLU at exactly T == 1024, although the kernel accepts any
-T % 256 == 0 and the workspace recipe beside it was already written in terms of that constraint.
+resolve_route took the fused TMA SwiGLU at exactly T == 1024, although the kernel rejects only
+tokens < 256 or tokens % 256 != 0 and nothing else constrains T.
 Every wider prefill chunk therefore fell into LinearW4A4Post, which materialises the 34816xT bf16
 projection into the arena and reads it back through a separate silu_mul.
 

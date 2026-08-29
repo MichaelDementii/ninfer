@@ -31,8 +31,9 @@ requests the product targets.
 ## Measured effect
 
 RTX 5090, sm_120a, driver 580.105.08, CUDA 13.1.115, gcc 13.3, Ubuntu 24.04, Release,
-`-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `3a61ef3f`; both arms built in the same build directory, the
-same two binaries throughout. Each benchmark's default warmup (3 for `linear`, 5 for the others), 50
+`-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `1fc1cb76`. The figures were taken on `3a61ef3f`; the four commits since then touch `src/serve`,
+the cache test oracle and the FP8 vocabulary GEMM, none of them this header or its consumers. Both
+arms built in the same build directory, the same two binaries throughout. Each benchmark's default warmup (3 for `linear`, 5 for the others), 50
 measured samples, L2 flushed for every one. Everything below was run at least twice: two independent
 campaigns with separate builds of both arms, and three passes for the table just below. The one
 exception is the 512-token output gate, a single run per arm. Ratios are master /
@@ -104,8 +105,10 @@ put at a p90 of x1.002 to x1.076 and a worst case of x1.164 - on rows this branc
 differently. Those rows also carry the widest figures in the whole report: the T=1 decode row reads
 x0.859 across arms, and one shape, `35b.dflash_feature`, reads x1.066 at T=1 and x0.957 at T=16.
 
-`ctest -j1`: 92 pass, 1 skipped, 1 fails, same set on both arms. The skip needs a 27B artifact this
-box does not have; the failure is #105, still open.
+`ctest -j1` on the rebased base: **94 tests, 0 failed, 1 skipped**, on master and on this branch. The
+skip needs a 27B artifact this box does not have. On the old base this suite had one failure, the
+one we reported as #105; `fd48e2fa` between the two bases rewrites that test's oracle and it now
+passes.
 
 ## End-to-end observation
 

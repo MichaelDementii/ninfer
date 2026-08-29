@@ -3,7 +3,7 @@ Implements #ISSUE.
 Scope as confirmed in #ISSUE: …
 
 `resolve_route` took the fused TMA SwiGLU at exactly `T == 1024`, although the kernel accepts any
-`T % 256 == 0` and the workspace recipe beside it was already written in terms of that constraint.
+`T % 256 == 0`.
 Every wider prefill chunk therefore fell into `LinearW4A4Post`, which materialises the `34816 x T`
 bf16 projection into the arena and reads it back through a separate `silu_mul`.
 
@@ -21,11 +21,14 @@ The claim is at operator level. The end-to-end section is confirmation, not the 
 Two clauses, both already true of the kernel: `kTmaBlockM` is the block extent the TMA schedule
 tiles `T` by, and 1024 remains the lower bound because that is where the fused path starts winning.
 The capacity query is widened to match - it sizes the fused path for the largest accepted width in
-the interval rather than for `kPrimaryT` alone, and `std::max`es rather than assigns, so the
-materialising term below it still governs where it needs to.
+the interval rather than for `kPrimaryT` alone. It `std::max`es rather than assigns, which matters
+for the term above it, not below: the old `maximum = fused_workspace_bytes(kPrimaryT)` clobbered
+the small-T fused term from the `min_tokens <= 48` branch. The materialising `last_baseline` term
+below already maxed and is untouched.
 
-Nothing else moves: no kernel is edited, and the diff is one predicate and one capacity branch in a
-host-side route table.
+Nothing else moves: no kernel is edited, and the compiled result agrees - `cuobjdump -sass` over the
+two binaries finds **0 of 2931 device functions changed**, registers, shared memory and spills
+identical everywhere. Only which kernel a given width reaches changes.
 
 ## Affected behaviour and contract
 
@@ -41,11 +44,18 @@ called on both arms over a grid of 4560 `(min_tokens, max_tokens)` intervals:
 | where the branch asks for less | 963 |
 | where argument validation changed | 0 |
 
-952 of the reductions are 72,512 bytes - one token of the materialised projection plus alignment -
-because `last_baseline` steps down when `max_tokens` itself now resolves to the fused route. The
-other 11 are intervals collapsed to a single accepted width, where the materialising path becomes
-unreachable and the whole projection leaves: 594,018,304 → 23,592,960 bytes at 8192, and
+952 of the reductions are 72,512 bytes - one token of the materialised bf16 projection
+(34816 x 2 = 69,632) plus one token of the NVFP4 activation codes and scales
+(5120/2 + 5120/16 = 2,880) - because `last_baseline` steps down when `max_tokens` itself now
+resolves to the fused route. The other 11 are intervals collapsed to a single accepted width, where
+the materialising path becomes unreachable and the whole projection leaves: 594,018,304 → 23,592,960 bytes at 8192, and
 34816 x 8192 x 2 = 570,425,344 exactly.
+
+The mechanism behind the zero is worth stating, so the sweep reads as a proof rather than as brute
+force: `baseline_workspace_bytes` exceeds `fused_workspace_bytes` at the same width by roughly 25x
+(594,018,304 against 23,592,960 at 8192). So whenever the interval still contains a width that
+routes to `LinearW4A4Post`, the baseline term is the maximum and the widened fused term cannot
+surface. The only intervals where the total moves materially are the eleven with no such width left.
 
 **The engine does not request a collapsed interval today**, and the measured peak settles that
 without reading further code: it is identical on both arms, 152.57 MiB at `--prefill-chunk 1024` and
@@ -73,10 +83,19 @@ samples. Ratios are master / branch, so above 1.000 is faster.
 ./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a4 \
   --t-sweep 1024,1025,1152,1279,1280,1281,1408,1536,1792,2048,2304,2560 --repeat 50
 
-NINFER_OP_REPORT_STATS=1 ./build/tests/ninfer_linear_swiglu_nvfp4_test   # kA4Cases extended
+# the numerics table below; the kA4Cases extension is in this commit, see Question 2 in the Issue
+NINFER_OP_REPORT_STATS=1 ./build/tests/ninfer_linear_swiglu_nvfp4_test
 
-./build/apps/ninfer qwen3_8_27b_nvfp4.ninfer --messages <prompt.json> --max-new 32|512 --greedy \
-  --no-thinking --max-context 131072 --prefill-chunk 8192|1024 --kv-dtype bf16
+# end-to-end rounds, one process per point, arms alternating inside each round
+./build/apps/ninfer qwen3_8_27b_nvfp4.ninfer --messages niah_16k.json --max-new 32 --greedy \
+  --no-thinking --max-context 131072 --prefill-chunk 8192 --kv-dtype bf16
+./build/apps/ninfer qwen3_8_27b_nvfp4.ninfer --messages niah_32k.json --max-new 32 --greedy \
+  --no-thinking --max-context 131072 --prefill-chunk 8192 --kv-dtype bf16
+./build/apps/ninfer qwen3_8_27b_nvfp4.ninfer --messages niah_16k.json --max-new 32 --greedy \
+  --no-thinking --max-context 131072 --prefill-chunk 1024 --kv-dtype bf16
+# the output gate
+./build/apps/ninfer qwen3_8_27b_nvfp4.ninfer --messages niah_32k.json --max-new 512 --greedy \
+  --no-thinking --max-context 131072 --prefill-chunk 8192 --kv-dtype bf16
 
 cd build && ctest -j1
 ```
@@ -106,8 +125,8 @@ Throughput over the same points goes 874 → 874 TFLOP/s at 1024 and 845 → 946
 | speedup | 0.995 | 1.000 | 1.000 | 1.000 | **1.053** | 0.997 | 1.000 | **1.065** | **1.063** | **1.079** | **1.084** | **1.087** |
 
 The gain appears at every accepted width and at no other, including across the adjacent triple
-1279 / 1280 / 1281. The two off-multiple cells that are not exactly unity - 1024 at 0.995, 1281 at
-0.997 - are the run-to-run floor on a route neither arm changes, and 2048 reads 1.079 here against
+1279 / 1280 / 1281. The two cells that are not exactly unity - 1024 at 0.995, already fused on both arms, and 1281 at
+0.997, not a multiple of 256 - are the run-to-run floor on a route neither arm changes, and 2048 reads 1.079 here against
 1.091 in the sweep above, which is that same floor from the other side.
 
 On `master` the materialising path at 1025 costs 598.0 µs against 417.8 for the fused path at 1024,
@@ -127,45 +146,84 @@ is exactly what does change route. The same test with that list extended, both a
 | 5, 48, 49, 128, 1024 | none | 0.111 … 0.0527 | **identical** | 0.639 … 0.373 | **identical** |
 | 1280 | → fused | 0.05159 | **0.05126** | 0.336 | **0.307** |
 | 2048 | → fused | 0.05011 | **0.04969** | 0.286 | **0.261** |
-| 4096 | → fused | 0.05234 | 0.05234 | 0.286 | **0.326** |
+| 4096 | → fused | 0.052342 | **0.052338** | 0.286 | **0.326** |
 
 Both arms pass at every width. Every width whose route is unchanged reproduces to the last printed
 digit, which is the confinement claim at the numerical level rather than the timing level. At the
 re-routed widths the fused path is equal or very slightly closer on relative-L2 and **worse on the
 gross tail at 4096**, 0.326 against 0.286 - so it is not strictly more accurate, and I am not
-claiming that. For scale, the widths already shipped reach 0.639 of the same gross limit.
+claiming that. For scale, the shipped widths reach 0.639 of their own gross limit against 0.326 here - noting the
+limit is width-dependent (0.567 at T=5, 1.266 at 4096), so these are fractions of different
+absolute bounds.
 
-The comment above that criterion is the frame:
+The comment above that criterion (`tests/ops/linear_swiglu/linear_swiglu_test_common.cpp:28`) is the
+frame:
 
 > The criterion belongs to the activation-compute profile, not the weight storage format or a
 > private materialized/fused implementation.
+
+### Resources
+
+No kernel is edited, so registers and shared memory cannot move, and `cuobjdump --dump-resource-usage`
+over the two binaries confirms it: every instantiation of every kernel identical, no spills either
+side. Workspace peak identical on both arms at both chunk widths (152.57 MiB at 1024, 1.19 GiB at
+8192). The capacity query never asks for more over 4560 intervals, as above. No allocation is added
+or removed, no transfer changes, no graph node appears or disappears. There is no fusion and no
+prefetch here - the change routes to an existing fused kernel - so there is no producer-consumer or
+Graph step to measure.
+
+### Suite
+
+`ctest -j1` on both arms: the same set, 92 pass, 1 skipped, 1 fails. The skip needs a 27B artifact
+this box does not have; the failure is `ninfer_qwen3_6_27b_prefix_real_test`, which is #105 and
+unrelated to this change.
 
 ### End to end
 
 Confirmation only. Arms alternating inside each round, one process per point, greedy, four rounds.
 
-| prompt tokens | chunk | prefill | decode | round spread |
+| prompt tokens | chunk | prefill | decode | master round spread |
 |---:|---:|---:|---:|---:|
-| 33 031 | 8192 | **+2.38%** | -0.01% | 0.91% |
-| 65 882 | 8192 | **+1.96%** | -0.05% | 0.70% |
-| 33 031 | **1024** | **+0.01%** | +0.01% | 0.32% |
+| 33 031 | 8192 | **+2.38%** | 0.00% | 0.91% |
+| 65 882 | 8192 | **+1.96%** | 0.00% | 0.70% |
+| 33 031 | **1024** | **+0.01%** | 0.00% | 0.32% |
 
-The 1024 row is the one to look at first. You wrote when you closed #96 that the 1024 default is
-deliberate and that the larger-chunk gain is not free; this does not ask you to move that default,
-and the default path measures as untouched rather than being argued to be. The two 8192 rows are for
-an operator who has already chosen a wider chunk.
+**On the chunk.** You wrote when you closed #96 that the 1024 default is deliberate and that the
+workspace a wider chunk costs comes out of KV. That is unchanged here and I am not arguing against
+it: on this host and artifact the workspace peak is 152.57 MiB at 1024 and 1.19 GiB at 8192, a
+1.04 GiB difference that is entirely the pre-existing cost of the wider chunk and is identical on
+both arms. What this change does is stop the wider chunk from also paying a route penalty it never
+needed to pay. It does not make the wider chunk cheaper and it is not a reason to move the default;
+the 1024 row is the control that says so.
 
-A 512-token generation on the 33,031-token prompt, stopping naturally at 203 bytes, is byte-identical
-between the arms at **both** chunk widths. That is agreement, not proof: greedy decoding absorbs
+At both 8192 points the slowest of the four branch runs is faster than the fastest of the four
+master runs, so the separation does not depend on round ordering. At 1024 the two ranges overlap
+completely and the four per-round deltas straddle zero (-0.038%, +0.080%, -0.057%, +0.067%): the
+default path is not merely reported as unchanged, it is unresolvable.
+
+A `--max-new 512` generation on the 65,882-token prompt, stopping on the stop token after 164
+generated tokens, is byte-identical between the arms at **both** chunk widths - 203 bytes, an
+eight-field JSON answer block, one run per arm. That is agreement, not proof: greedy decoding absorbs
 small numeric differences at the argmax, and these routes are not required to agree.
 
 ## Checks not run
 
 - No `ncu` counters: `RmProfilingAdminOnly` is set on this host.
+- Every µs figure is the benchmark's `median_us` over 50 samples after 5 warmup. Each T-sweep is one
+  pass per arm; the overlap between the two sweeps at 1024 and 2048 is the only repetition and puts
+  the run-to-run envelope at roughly ±1.2%, so ratios below x1.02 should be read as unity.
+- All workspace measurements use `--max-context 131072`, which pins KV capacity explicitly (headroom
+  reads 0 B on both arms). They establish that the two arms request identical workspace, not how an
+  auto-sized KV policy would respond to a wider chunk.
+- I kept `kPrimaryT` as the lower bound so no width that resolves to a route today changes route. I
+  did not measure the fused kernel below 1024, so the clause is conservative rather than optimal and
+  the crossover may be lower.
 - The oracle sweep stops at 4096. 8192 went through the benchmark and the product but not the FP64
   oracle.
 - The output gate is one prompt, one run per arm at each chunk width.
-- Only `qwen3.8-27b/nvfp4` is measured; no other registered artifact takes this route.
+- Only `qwen3.8-27b/nvfp4` is measured. `qwen3.6-27b/nvfp4` takes the same route and has strictly
+  greater exposure - it binds an NVFP4 `mlp/gate_up {34816,5120}` on every text layer, where the
+  measured artifact is NVFP4 only below layer 56 - and I did not measure it.
 - I have not checked whether the same registration gap exists on the FP8 SwiGLU route.
 - No `nsys` kernel attribution for this change; the operator sweep and the route table carry the
   claim instead.

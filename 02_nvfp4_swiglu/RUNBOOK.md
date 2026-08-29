@@ -5,7 +5,7 @@
 
 ## Отличия
 
-* Ветка `perf/nvfp4-fused-swiglu-every-width`, коммит `93959c16`, база `3a61ef3f`.
+* Ветка `perf/nvfp4-fused-swiglu-every-width`, коммит `436aba7b`, база `1fc1cb76`.
   `branch.bundle` в этой папке — он.
 * Модель для замеров — `qwen3.8-27b/nvfp4`, артефакт
   `/root/models/qwen3_8_27b_nvfp4.ninfer`. Ни один другой зарегистрированный артефакт этот
