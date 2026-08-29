@@ -86,7 +86,9 @@ samples. Ratios are master / branch, so above 1.000 is faster.
 ./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a4 \
   --t-sweep 1024,1025,1152,1279,1280,1281,1408,1536,1792,2048,2304,2560 --repeat 50
 
-# the numerics table below; the kA4Cases extension is in this commit, see Question 2 in the Issue
+# the numerics table below. The kA4Cases extension is NOT in this commit - it was applied on top
+# of each arm to take those rows, because whether it belongs in the change is Question 2 in the
+# Issue. Extend kA4Cases to {5, 48, 49, 128, 1024, 1280, 2048, 4096} to reproduce them.
 NINFER_OP_REPORT_STATS=1 ./build/tests/ninfer_linear_swiglu_nvfp4_test
 
 # end-to-end rounds, one process per point, arms alternating inside each round
