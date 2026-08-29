@@ -4,9 +4,9 @@ evidence.
 ## The observation
 
 `sparse_moe_prefill_gather_kernel` materialises one 2048-wide BF16 row for **every (token, expert)
-assignment**. At top-8 of 256 that is eight copies of every token: TBD_GATHER_MB of stores per
-4096-token slice, which `sparse_moe_prefill_q4_gate_up_kernel` then reads straight back through
-`stage_inputs`.
+assignment**. At top-8 of 256 that is eight copies of every token: a 4096-token slice stores 32,768
+rows of 4 KiB, **128 MiB**, and a 8,192-token chunk stores **256 MiB**, which
+`sparse_moe_prefill_q4_gate_up_kernel` then reads straight back through `stage_inputs`.
 
 Every one of those rows is a byte-exact copy of a column of the layer input `x`. The GEMM does not
 need the copy, it needs to know **which token each packed column came from**. So the copy kernel can
@@ -16,16 +16,20 @@ become an index kernel that publishes only that map, and the staging loop can fo
 -                const int packed_col = begin + column_base + col;
 -                const auto* src = gathered +
 -                    static_cast<std::int64_t>(col < cols ? packed_col : begin) * kHidden + ...
-+                const auto* src = x + static_cast<std::int64_t>(Tok[col]) * kHidden + k0 + k8 * 8;
++                cp_async_zfill<16, Cache::cg>(dst, src_row[i] + k0 + k8 * 8, col < cols ? 16 : 0);
 ```
 
-`Tok[ExpertBN]` is filled once per route job from the published map and read by every stage of the
-k-loop. The addressing is the only thing that changes: same codes, same scales, same accumulation
-order, same `cp_async_zfill` for the columns past the tail.
+A thread stages the same columns of every one of the `kHidden / kExpertBK` tiles, so it resolves the
+rows those columns come from **once per route job**, into `src_row[]`, and the k-loop then walks
+pointers. That keeps the map out of shared memory: **shared per block is identical to master's**, so
+the `__launch_bounds__(ExpertWarps * 32, 3)` occupancy target is met exactly as before rather than
+approached from underneath. The addressing is the only thing that changes: same codes, same scales,
+same accumulation order, same `cp_async_zfill` predicate for the columns past the tail.
 
 **The W8 routed path keeps the gather.** The change is registered only where the routed gate/up is
 `Q4G64_F16S`, so the W8 codec is an untouched control that has to stand at 1.000 in the operator
-bench, and a dense artifact is an untouched control end to end.
+bench, and a dense artifact is an untouched control end to end. Question 3 below is about whether
+you want the other half; I have built and measured it, and the numbers are there.
 
 ## The interaction with `3a61ef3f`, and why it goes the right way
 
@@ -51,21 +55,28 @@ to. You had just shown where to put it:
 ```
 
 Scan is the final consumer of `tile_counts`, and the arithmetic leaves room for both maps rather
-than one: `256 * ceil(T / 8) >= 32 * T` elements against `8 * T` per map, so the two together use a
-quarter of the dead prefix. **No allocation is added or removed and the arena sequence is
-byte-identical to master's**, which makes `sparse_moe_prefill_workspace_bytes` unchanged by
-construction, not by measurement - and the reported peak confirms it: TBD_WORKSPACE.
+than one: the buffer is `256 * ceil(T / 8) >= 32 * T` elements and each map is `8 * T`, so the two
+together take **half** the dead prefix. **No allocation is added or removed and the arena sequence
+is byte-identical to master's**, which makes `sparse_moe_prefill_workspace_bytes` unchanged by
+construction rather than by measurement - and `ninfer_sparse_moe_bench` confirms it, reporting the
+same `workspace_bytes` on both arms at every width: TBD_WORKSPACE.
 
-`grouped_io` stays exactly as it is. It is a lifetime union - gathered X against the routed down
-output - and both the W8 gather and the down path still use it, so this saves **traffic, not
-capacity**, and I would rather say that than quote a buffer that does not leave.
+`grouped_io` stays exactly as it is, and not because of the W8 gather. Your own comment says why:
+
+```cpp
+    //   gathered X BF16    <-> routed down output BF16
+```
+
+The routed down projection writes its output into that buffer and the reduce reads it back, so the
+buffer does not leave even if nothing gathers into it any more. This saves **traffic, not
+capacity**, and I would rather say that than quote a buffer that does not go away.
 
 ## Values are unchanged
 
-`gathered[packed_col]` was written as `x[token]` by the gather, and `Tok[col]` resolves to that same
-`token`, so the staged bytes are the same bytes. Columns past the tail read the same fallback row
-the old code read and are zero-filled by the same `cp_async_zfill` predicate. Greedy output is
-byte-identical: TBD_GATE.
+`gathered[packed_col]` was written as `x[token]` by the gather, and `packed_token[packed_col]`
+resolves to that same `token`, so the staged bytes are the same bytes. Columns past the tail read
+the same fallback row the old code read and are zero-filled by the same `cp_async_zfill` predicate.
+Greedy output is byte-identical: TBD_GATE.
 
 ## Measured effect
 
@@ -73,14 +84,7 @@ TBD_MEASURED
 
 ## Resources
 
-| kernel | master | branch |
-|---|---|---|
-| `q4_gate_up<4, 32>` | REG 116, SHARED 25 600 | REG 116, SHARED 25 728 |
-| `q4_gate_up<8, 64>` | REG 75, SHARED 33 792 | REG 76, SHARED 34 048 |
-| `gather_kernel<0/1>` | REG 20, SHARED 0 | unchanged, still used by W8 |
-| `index_kernel<0/1>` | - | REG 16, SHARED 0 |
-
-The shared growth is exactly `ExpertBN * sizeof(int)` - the `Tok` array and nothing else. TBD_OCCUPANCY
+TBD_RESOURCES
 
 ## Checks not run
 
@@ -94,6 +98,8 @@ TBD_LIMITS
    the workspace byte-identical and it follows what `3a61ef3f` did, but it does put a second live
    map in a buffer whose lifetime you had just made explicit, and a plain `arena.alloc` costing 256
    KiB at chunk 8192 is the alternative.
-3. Should the same treatment go to the W8 routed path? It is the same copy for the same reason; I
-   left it out because the W8 gate/up stages through a different codec loop and that is a second
-   mechanism.
+3. Should the same treatment go to the W8 routed path? It is the same copy for the same reason. I
+   left it out of this submission because taking it would remove the only untouched codec in the
+   operator benchmark, but I did build it, because the answer changes the shape of the change rather
+   than only its size: with both routed codecs staging from `x` the gather kernel has no caller left
+   and the launcher stops branching on the codec at all. TBD_W8_ANSWER
