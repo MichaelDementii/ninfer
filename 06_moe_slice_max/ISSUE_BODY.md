@@ -2,6 +2,16 @@
 workspace boundary** - `sparse_moe_prefill_workspace_bytes(max_tokens)` returns more for
 `max_tokens > 4096` - so the cost is stated before the gain.
 
+**You have already published this change's price.** When you closed #96 you wrote that the MoE
+prefill workspace grows "from about 120 MiB at 1024 to 482 MiB at 4096 and 963 MiB at 8192", that
+it comes out of KV capacity, and that this does not justify changing the default chunk. The 963 MiB
+is the figure with this constant raised - on `master` the ceiling caps `capacity_tokens` at 4096, so
+a 8192-token chunk asks for the 4096 figure. **I am not proposing to change the default chunk.** The
+default stays at 1024 and gets the same plan, the same workspace and the same arithmetic, by the
+shape of the expression rather than by measurement. What changes is only what a caller who has
+already chosen a chunk wider than 4096 gets - and for that caller the price is your number,
+482 -> 963 MiB.
+
 ## The observation
 
 `resolve_sparse_moe_prefill_plan` slices the prefill chunk at a fixed 4096 tokens whatever the

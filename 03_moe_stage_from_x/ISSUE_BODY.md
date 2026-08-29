@@ -1,5 +1,5 @@
-**Level of the claim: kernel.** The end-to-end figures at the end are an observation, not the
-evidence.
+**Level of the claim: operator.** The evidence is `ninfer_sparse_moe_bench` on the sparse-MoE
+prefill operator; the end-to-end figures at the end are an observation and do not isolate it.
 
 ## The observation
 
