@@ -13,9 +13,9 @@ Each thread now owns a whole eight-code run inside one group: it reads its own s
 decodes eight codes out of one `uint2` and stores them with a single 16-byte `store_vec`. Per weight
 the arithmetic is unchanged, so this changes how operands are prepared, not what is computed.
 
-This is the projection half of the widening whose MoE half you merged as #106. On `master` at
-`3a61ef3f`, which already carries that half; `dev` is at `3a61ef3f` too, so nothing unmerged touches
-this header.
+This is the projection half of the widening whose MoE half you merged as #106. It is based on
+`master` at `3a61ef3f`, which already carries that half; `dev` is at `3a61ef3f` too, so nothing
+unmerged touches this header.
 
 ## The design
 
@@ -25,9 +25,9 @@ The loop is indexed by thread over eight-code chunks rather than by row pair ove
   the reason the loop had to be built around `lane >> 4` and `lane & 15`. The scale loads change
   shape rather than growing: every thread now loads instead of two or four lanes per warp, but the
   number of load instructions per tile halves on `BK == 64` and is unchanged on `BK == 128`, and each
-  touches four distinct 32-bit words in four distinct banks, so it stays conflict-free. Measured on a
-  bare warp: 8.76 and 8.78 cycles per load against 8.39 for a true broadcast and 12.64 for a
-  deliberate four-way conflict.
+  touches four distinct 32-bit words in four distinct banks, so it stays conflict-free. On a single warp a deliberate four-way conflict costs 12.64 cycles
+  per load and a true broadcast 8.39; this access pattern sits at 8.76 and 8.78, within 5% of
+  broadcast, which is address arithmetic rather than conflict.
 - **Eight decoded codes are sixteen contiguous bytes**, so four 4-byte stores become one 16-byte
   store, through `W8Bf16x8Bits` - the union this file already keeps for that shape and already uses
   in the residual epilogue, in the same write-`pair`, read-`raw` direction.
@@ -58,6 +58,8 @@ under the one-to-eight active requests the product targets.
 
 ## Verification
 
+The claim is at operator level. The end-to-end section is confirmation, not the evidence.
+
 RTX 5090, sm_120a, driver 580.105.08, CUDA 13.1.115, gcc 13.3, Ubuntu 24.04, Release,
 `-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `3a61ef3f`, both arms built in the same build directory, the
 same two binaries throughout. Each benchmark's own default warmup (3 for `linear`, 5 for the others)
@@ -67,8 +69,9 @@ and 50 measured samples. L2 is flushed for every sample; the timing path is
 graph captured, the only capture site being `src/core/decode_graph.cpp` with the chunk loop outside
 it.
 
-Everything was run twice, as two independent campaigns with separate builds of both arms, plus
-targeted extra passes where the first two disagreed. Tables quote the second campaign; where the
+Everything below was run at least twice: two independent campaigns with separate builds of both arms,
+three passes for the production-extent table and for the repeat-floor and projection tables, and five
+for `linear_pair`. The one exception is the 512-token output gate, a single run per arm. Tables quote the second campaign; where the
 campaigns differ it is stated. All ratios are master / branch, so above 1.000 is faster.
 
 ```bash
@@ -110,12 +113,13 @@ the four W8 shapes a 35B prefill actually uses, at the extents it uses them:
 
 | n, k | T=1024 | 2048 | 4096 | 8192 |
 |---|---:|---:|---:|---:|
-| 12288, 2048 | x1.080 | x1.086 | x1.087 | x1.089 |
-| 9216, 2048 | x1.093 | x1.090 | x1.089 | x1.090 |
-| 2048, 4096 | x1.091 | x1.083 | x1.100 | x1.089 |
-| 2048, 16384 | x1.089 | x1.119 | x1.099 | x1.095 |
+| 12288, 2048 | 1.080-1.086 | 1.086-1.090 | 1.087 | 1.087-1.089 |
+| 9216, 2048 | 1.093-1.103 | 1.090 | 1.088-1.089 | 1.088-1.090 |
+| 2048, 4096 | 1.071-1.091 | 1.083 | 1.096-1.100 | 1.089-1.092 |
+| 2048, 16384 | 1.089 | 1.118-1.121 | 1.096-1.099 | 1.093-1.095 |
 
-**Median x1.089 over the sixteen points, range x1.080 to x1.119.** That is the operator figure the
+Sixteen shapes and extents, three independent passes each, so each cell is the range over its three
+passes. **Median x1.090 over the 48 points, range x1.071 to x1.121.** That is the operator figure the
 end-to-end result rests on, and it matches the in-product kernel measurement below (x1.082) rather
 than the x1.12 the `linear_add` production sweep reports at T=129-1024.
 
@@ -129,7 +133,10 @@ by the kernel each shape reaches:
 | `w8_rowsplit_gemm_mma` | 18 | 129-1024 | **x1.123** | x1.211 | x1.018 |
 | `w8_small_t_mma` (`splitk8`) | 21 | 2-48 | x1.000 | x1.000 | x0.938 |
 | `medium_splitk` | 10 | 63-128 | x1.000 | x1.026 | x0.960 |
-| decode | 1 | 1 | x0.859 | - | - |
+| decode | 1 | 1 | x0.859 [^1] | - | - |
+
+[^1]: a single T=1 cell on a kernel this branch does not compile differently; the same row varies by
+x1.164 against itself on one arm, see the repeat-pass table below.
 
 Three of those four are not compiled differently by this branch, so their rows are the harness floor
 rather than a control for the change, and it is not a tight floor. Three things measure it rather
@@ -167,10 +174,18 @@ reachable in that benchmark only behind an explicit `--qtype` and were not run t
 covered in the projection benchmarks below instead. Of its 68 rows, 21 move by more than one percent
 either way, median x1.089, best x1.171, worst x0.951, and 20 of the 21 are W8 rows.
 
-The stronger statement is by route. Ten of the 33 W8 rows have an `(n, k, T)` that
-`select_w8_a16_launch` sends to this kernel; **all ten move up, median x1.090, none below x1.059,
-none above x1.171.** Ten more provably reach `launch_w8_small_t` and sit at median x1.000. The 35
-Q4/Q5/Q6 rows sit at median x1.000 with a single exception, the Q6 `vision_patch` row at x0.951.
+Splitting the 33 W8 rows by extent says more than that aggregate does:
+
+| W8 rows | count | median | best | worst |
+|---|---:|---:|---:|---:|
+| T = 128 and T = 1024, the extents that reach this kernel | 17 | **x1.089** | x1.171 | x1.059 |
+| T = 1, 4, 16, decode extents on other kernels | 16 | x1.000 | x1.066 | x0.957 |
+
+**All 17 rows at the extents that reach this kernel move up**, none by less than 5.9%. The 16 short
+rows are the floor, and one shape shows on its own what that floor is worth:
+`35b.dflash_feature` (n=2048, k=16384) reads **x1.066 at T=1 and x0.957 at T=16** - ten points apart,
+across two decode extents of a route this branch does not compile differently. The only other row
+below unity is `27b.mtp_down` at T=16, x0.972.
 
 | benchmark | rows moving >1% either way | median of those | best | worst |
 |---|---:|---:|---:|---:|
@@ -186,8 +201,8 @@ what five passes gave, not an error bar:
 
 The on-route cells from T=193 up are stable to a thousandth across passes; the off-route cells below
 it are not, and T=192 spans 0.994 to 1.061 on a kernel this branch does not compile differently. The
-T=193 spread is on the master arm, whose median there is bimodal - 34.85 µs in one pass and 36.83 µs
-in the other four.
+T=193 spread is on the master arm, whose median there is bimodal - 34.85 us in one pass, 36.64 in another and 36.83 in the
+remaining three.
 
 ### Where the routes hand the shape over
 
@@ -205,7 +220,9 @@ says, and the ratio steps at those two different extents accordingly. Above T=48
 different wide schedules of this same kernel, so three of its schedules are visible in one sweep, all
 moving, with the untouched route flat underneath. One thing worth flagging that the ratios hide: on
 `master` the `GROUPS == 4` route is *slower* at its own boundary than the `small_t` route it replaces
-(206.6 against 194.6 µs at `n=34816`, T=41); this change removes that inversion (190.5 µs).
+at its first extent (T=41, 206.6 us) is slower than the `small_t` route it takes over from at the
+last extent that route serves (T=40, 194.6 us); this change removes that inversion (T=41, 190.5 us).
+Those three are campaign 1; campaign 2 reads 206.8, 192.5 and 190.5.
 
 The projections, two passes, both shown. `gdn_input_proj` hands over at T=97
 (`src/ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp:20-23`); `attn_input_proj` at T=65 for the target
@@ -219,11 +236,13 @@ Below those extents all three w8 rows are on `SplitKMmaDirect`, untouched here:
 | `attn_input_proj` w8-qgkv | 1.000 | 0.999 / 1.053 | **1.045 / 1.045** | 1.049 / 1.091 | 1.043 / 1.092 | 1.044 | 1.067 | 1.071 | 1.093 |
 
 Two cells below the handover move between passes - `w8-qkv` at T=65 and `w8-qgkv` at T=64. Both are
-off-route and inside the short-extent floor. Every on-route cell reproduces across the two passes.
+off-route and inside the short-extent floor. Every on-route cell moves up in both passes; three of
+them differ between passes - `gdn_input_proj` at T=97 (1.062 / 1.031) and T=256 (1.085 / 1.097), and
+`w8-qgkv` at T=97 (1.043 / 1.092) - which is the same short-extent variance the floor rows show.
 
 The seven untouched weight-format rows in these two benchmarks - `q4q5`, `nvfp4`, `fp8` on
 `gdn_input_proj` and those plus `bf16` on `attn_input_proj` - span x0.958 to x1.053 below T=64 and
-x0.989 to x1.031 at T=64 and above, with the widest cells being nvfp4 `gdn_input_proj` at T=256 and
+x0.969 to x1.031 at T=64 and above, with the widest cells being nvfp4 `gdn_input_proj` at T=256 and
 T=1024. That is the floor these benchmarks carry, and the w8 rows have to be read against it.
 
 Warm L2 was not the explanation for anything here: run with `--cache both`, the warm ratios are
@@ -257,14 +276,17 @@ Four profile pairs were taken across the two campaigns. Across all four, no unch
 from unity by more than **0.27%** (worst: `qx_down` 0.273%, `q4_gate_up` 0.249%, attention 0.133%,
 gdn 0.125%, gather 0.071%). A single pair looks tighter than that, but repeating it does not support
 a tighter bound. Checked individually rather than trusting the grouping, the widest move among single
-unchanged kernels longer than 1 ms is x0.990 (`sigmoid_gate_mul_bf16x8_kernel`, 3.4 ms).
+unchanged kernels longer than 1 ms is x0.990 in the pair above and x1.013 across all four - both
+times `sigmoid_gate_mul_bf16x8_kernel`, 3.4 ms.
 
 The launch count of every one of the 67 kernels is identical between arms, which is the direct
 evidence for "no graph node appears or disappears".
 
-The in-product speedup on the changed kernel is x1.082 against the x1.089 the operator measurement at
+The in-product speedup on the changed kernel is x1.082 in the pair above and x1.079 to x1.082 across
+all four pairs, against the x1.089 the operator measurement at
 production extents gives - not against the x1.12 the `linear_add` sweep reports at extents the model
-does not run. The total, x1.020, is not independent evidence: GPU busy time is 99.5% of prefill wall
+does not run. The total, x1.020 in this pair and x1.018 to x1.021 across the four, is not independent
+evidence: GPU busy time is 99.5% of prefill wall
 clock here, so the kernel sum and the end-to-end prefill figure are the same quantity read off two
 clocks.
 
@@ -294,9 +316,11 @@ instantiations of this kernel. Over those 120 bodies the instruction count falls
 The whole shuffle machinery leaves: `SHFL` **1150 -> 0**, `WARPSYNC` **1360 -> 0**,
 `ENDCOLLECTIVE` **390 -> 0**. Staging and the integer work around it fall: `STS` 2884 -> 1724,
 `LDS` 2934 -> 1514, `MOV` 12215 -> 8466, `UMOV` 4444 -> 2481, `S2R` 849 -> 335, `S2UR` 1351 -> 531,
-`LOP3` 17924 -> 12940, `IADD` 11998 -> 9701, `IMAD` 16476 -> 15493. Some rise: `SHF` 5561 -> 7649,
-`FMUL` 3976 -> 5376, `F2FP` 3994 -> 4694, and the int-to-float conversion moves to a packed form,
-`I2F` 3560 -> 1240 with `I2FP` 0 -> 3720.
+`LOP3` 17924 -> 12940, `IADD` 11998 -> 9701, `IMAD` 16476 -> 15493. Some rise, and the two that read against the
+narrative are named first: `BSSY` and `BSYNC` both 2667 -> 2967, the reconvergence barriers, because
+one wide loop replaces the row-pair loop and its nesting. Then `SHF` 5561 -> 7649, `FMUL`
+3976 -> 5376, `F2FP` 3994 -> 4694, and the int-to-float conversion moves to a packed form, `I2F`
+3560 -> 1240 with `I2FP` 0 -> 3720.
 
 What does *not* move is the argument. These opcodes are identical, body for body, across all 120:
 **`HMMA` 15120**, `LDSM` 12480, `LDGSTS` 1802, `FFMA` 4160, `STG` 1882, `LDG` 210, `BAR` 1302,
@@ -380,7 +404,9 @@ text-only greedy run with speculation off does not reach.
 produce only four distinct completions, three of which coincide - so byte-comparing them, while it
 passes 20 of 20, discriminates weakly. The gate that carries weight is a full generation: 33,031
 tokens in, `--max-new 512`, which stops naturally at 164 generated tokens on the stop token. That
-output is **byte-identical between the arms**, 203 bytes.
+output is **byte-identical between the arms** - 203 bytes, an eight-field JSON answer block, one run
+per arm. Since the change is bit-identical a greedy run is expected to match, so this confirms the
+result in the product rather than establishing it.
 
 ## Checks not run
 

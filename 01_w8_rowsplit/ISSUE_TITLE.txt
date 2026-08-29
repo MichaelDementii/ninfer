@@ -1,1 +1,1 @@
-W8 row-split GEMM stages one code pair per lane and shuffles the group scales: x1.12 median on its shapes
+W8 row-split GEMM stages one code pair per lane and shuffles the group scales: x1.09 at production extents

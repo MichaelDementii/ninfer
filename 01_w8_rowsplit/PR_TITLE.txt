@@ -1,1 +1,1 @@
-Eight weight codes per thread in the W8 row-split GEMM: x1.12 median on its shapes, prefill up to +2.3%
+Eight weight codes per thread in the W8 row-split GEMM: x1.09 at production extents, prefill +1.6 to +2.4%

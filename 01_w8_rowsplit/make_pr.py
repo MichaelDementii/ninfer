@@ -43,6 +43,10 @@ FORK = "MichaelDementii/ninfer"
 BRANCH = "perf/widen-w8-rowsplit-decode"
 REMOTE_BRANCH = "perf/widen-w8-rowsplit-decode"
 BASE_BRANCH = "master"
+# The commit every number in the submission was measured on. stage_bundle re-pulls from a build box
+# other work is using, so a pull that quietly returns a different valid commit must be an error
+# rather than a surprise. The committed branch.bundle already holds this head.
+EXPECT_COMMIT = "c42e52757835e9fc18e305bd0c46d31a2b0b7840"
 
 # The key lives in a different place on each of our machines; NINFER_KEY overrides.
 KEY_CANDIDATES = [
@@ -175,6 +179,11 @@ def stage_bundle(args):
     size = BUNDLE.stat().st_size
     if size < 512:
         sys.exit(f"bundle is only {size} bytes; that is not a real bundle")
+    heads = run(["git", "bundle", "list-heads", str(BUNDLE)], quiet=True)
+    if EXPECT_COMMIT not in heads:
+        sys.exit(f"bundle head is not {EXPECT_COMMIT}, it is:\n{heads}\n"
+                 "The branch on the build server has moved. The committed branch.bundle is the\n"
+                 "reviewed one: restore it with git and skip this stage entirely.")
     print(f"bundle: {BUNDLE} ({size} bytes)")
 
 

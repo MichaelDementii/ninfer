@@ -33,8 +33,9 @@ requests the product targets.
 RTX 5090, sm_120a, driver 580.105.08, CUDA 13.1.115, gcc 13.3, Ubuntu 24.04, Release,
 `-DCMAKE_CUDA_ARCHITECTURES=120a`. Base `3a61ef3f`; both arms built in the same build directory, the
 same two binaries throughout. Each benchmark's default warmup (3 for `linear`, 5 for the others), 50
-measured samples, L2 flushed for every one. Everything below was run as two independent campaigns
-with separate builds of both arms, plus extra passes where the two disagreed. Ratios are master /
+measured samples, L2 flushed for every one. Everything below was run at least twice: two independent
+campaigns with separate builds of both arms, and three passes for the table just below. The one
+exception is the 512-token output gate, a single run per arm. Ratios are master /
 branch.
 
 **The operator at the extents the product runs.** The shipped suites stop at T=1024 and prefill runs
@@ -43,14 +44,15 @@ them:
 
 | n, k | T=1024 | 2048 | 4096 | 8192 |
 |---|---:|---:|---:|---:|
-| 12288, 2048 | x1.080 | x1.086 | x1.087 | x1.089 |
-| 9216, 2048 | x1.093 | x1.090 | x1.089 | x1.090 |
-| 2048, 4096 | x1.091 | x1.083 | x1.100 | x1.089 |
-| 2048, 16384 | x1.089 | x1.119 | x1.099 | x1.095 |
+| 12288, 2048 | 1.080-1.086 | 1.086-1.090 | 1.087 | 1.087-1.089 |
+| 9216, 2048 | 1.093-1.103 | 1.090 | 1.088-1.089 | 1.088-1.090 |
+| 2048, 4096 | 1.071-1.091 | 1.083 | 1.096-1.100 | 1.089-1.092 |
+| 2048, 16384 | 1.089 | 1.118-1.121 | 1.096-1.099 | 1.093-1.095 |
 
-**Median x1.089 over sixteen points.** The `w8_linear_add --production-only` sweep reports a higher
+Three independent passes per cell, so each cell is the range over its three.
+**Median x1.090 over the 48 points, range x1.071 to x1.121.** The `w8_linear_add --production-only` sweep reports a higher
 figure, x1.123 median over its 18 row-split rows at T=129-1024, but those are extents the model does
-not execute; x1.089 is the number the end-to-end result rests on, and it agrees with the in-product
+not execute; x1.090 is the number the end-to-end result rests on, and it agrees with the in-product
 kernel measurement below.
 
 **Where the routes hand the shape over.** Three dispatch tables put a boundary inside a sweep, and
@@ -99,7 +101,8 @@ scale-cache refill (983,163 bytes identical).
 **Other execution paths**: one function in one header. The decode-shaped W8 kernels keep their own
 staging; in the shipped suites their rows are the harness floor, which three repeat passes per arm
 put at a p90 of x1.002 to x1.076 and a worst case of x1.164 - on rows this branch does not compile
-differently.
+differently. Those rows also carry the widest figures in the whole report: the T=1 decode row reads
+x0.859 across arms, and one shape, `35b.dflash_feature`, reads x1.066 at T=1 and x0.957 at T=16.
 
 `ctest -j1`: 92 pass, 1 skipped, 1 fails, same set on both arms. The skip needs a 27B artifact this
 box does not have; the failure is #105, still open.
