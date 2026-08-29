@@ -116,3 +116,24 @@ sparse_moe_prefill_q4_gate_up_kernel(...)
 `sparse_moe_prefill_launch` равен 4096 — порог `kSparseMoePrefillWideBnTokens = 4096` срабатывает и
 так. С 4a срез становится 8192, и колонка эксперта вдвое длиннее. Правки независимы, но 4a
 усиливает эту.
+
+---
+
+## Собрано и прошло тесты; и одна деталь про порядок подачи
+
+**`nvcc` принял `constexpr`-функцию внутри `__launch_bounds__`** — запасной тернарник не понадобился.
+`build bn rc=0`, `ctest` **94/94, 0 падений**, 1 пропуск.
+
+**4a и 4bc конфликтуют по соседним строкам.** 4bc вставляет `kSparseMoePrefillWideBnTokens` ровно
+над строкой `kSparseMoePrefillSliceMax`, которую правит 4a, поэтому черри-пик одного поверх другого
+даёт `CONFLICT (content)` в `sparse_moe_prefill.h`. Правки независимы по смыслу, конфликт чисто
+текстовый и разрешается в одну строку — но **тому, кто пойдёт вторым, понадобится ребейз**, и об
+этом стоит сказать в теле второй заявки, а не обнаружить на мердже.
+
+Совмещённое состояние выглядит так:
+
+```cpp
+inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
+inline constexpr std::int32_t kSparseMoePrefillWideBnTokens = 4096;
+inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 8192;
+```
