@@ -1,0 +1,1 @@
+The grouped MoE prefill job is 64 columns wide at every chunk, so a wide chunk re-reads each expert slab several times
