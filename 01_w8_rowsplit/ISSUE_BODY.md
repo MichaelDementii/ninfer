@@ -84,7 +84,7 @@ mean 102.4 -> 96.2, lower in 103, higher in 9, unchanged in 8. **Shared memory**
 values. **Spills**: none either side. **Workspace, resident memory, transfers, graph nodes**:
 unchanged - no allocation added or removed, no boundary moved.
 
-**Instruction stream**: of 2893 name-matched device functions, 120 differ and 2773 are identical in
+**Instruction stream**: of 2899 name-matched device functions, 120 differ and 2779 are identical in
 both instruction count and per-opcode census; all 120 are instantiations of this kernel. Over them
 the count falls 179,948 -> 161,238. The shuffle machinery leaves entirely - `SHFL` 1150 -> 0,
 `WARPSYNC` 1360 -> 0, `ENDCOLLECTIVE` 390 -> 0 - and staging falls with it, `STS` 2884 -> 1724,
@@ -109,6 +109,21 @@ x0.859 across arms, and one shape, `35b.dflash_feature`, reads x1.066 at T=1 and
 skip needs a 27B artifact this box does not have. On the old base this suite had one failure, the
 one we reported as #105; `fd48e2fa` between the two bases rewrites that test's oracle and it now
 passes.
+
+
+**Re-taken on the current base.** Both arms were rebuilt on `1fc1cb76` after the rebase and the
+whole grid re-measured, one more pass:
+
+| n, k | T=1024 | 2048 | 4096 | 8192 |
+|---|---:|---:|---:|---:|
+| 12288, 2048 | 1.088 | 1.090 | 1.089 | 1.088 |
+| 9216, 2048 | 1.103 | 1.090 | 1.089 | 1.089 |
+| 2048, 4096 | 1.091 | 1.084 | 1.096 | 1.092 |
+| 2048, 16384 | 1.089 | 1.121 | 1.097 | 1.093 |
+
+Median **x1.090**, range x1.084 to x1.121 - the same median as the campaign above and the same top
+of range. Three cells in the first row land 0.1 to 0.3% above their earlier per-pass range and two
+land just below theirs, all of it inside the run-to-run envelope stated below.
 
 ## End-to-end observation
 

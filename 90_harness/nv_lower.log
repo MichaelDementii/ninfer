@@ -1,0 +1,20 @@
+########## 1. the fused route below 1024, three runs ##########
+--- run 1 ---
+--- run 2 ---
+--- run 3 ---
+########## 2. numerics at those widths, both arms ##########
+40:    if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
+build rc=0
+oracle lowered rc=1 verdict=FAIL LinearSwiGLU NVFP4 correctness
+oracle master rc=0 verdict=OK LinearSwiGLU NVFP4 correctness
+########## 3. side by side ##########
+     T |  mst rel_l2    gross |  low rel_l2    gross | verdict
+     5 |    0.111020    0.639 |    0.111020    0.639 | same
+    48 |    0.083602    0.639 |    0.083602    0.639 | same
+    49 |    0.083578    0.639 |    0.083578    0.639 | same
+   128 |    0.066212    0.589 |    0.066212    0.589 | same
+   256 |    0.059000    0.531 |    0.058382    0.486 | lowered closer
+   512 |    0.057068    0.531 |    0.056556    0.486 | lowered closer
+   768 |    0.054019    0.408 |    0.053731    0.373 | lowered closer
+  1024 |    0.052689    0.373 |    0.052689    0.373 | same
+NV_LOWER_DONE

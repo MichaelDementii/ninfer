@@ -19,7 +19,9 @@ The claim is at operator level. The end-to-end section is confirmation, not the 
 ```
 
 Two clauses, both already true of the kernel: `kTmaBlockM` is the block extent the TMA schedule
-tiles `T` by, and 1024 remains the lower bound because that is where the fused path starts winning.
+tiles `T` by, and `kPrimaryT` remains the lower bound because it is the width the fused route is
+already registered and oracle-qualified at - not because it is where the fused path starts winning,
+which it is not; `The lower bound` below measures how much that leaves.
 The capacity query is widened to match - it sizes the fused path for the largest accepted width in
 the interval rather than for `kPrimaryT` alone. It `std::max`es rather than assigns, which matters
 for the term above it, not below: the old `maximum = fused_workspace_bytes(kPrimaryT)` clobbered
@@ -27,7 +29,8 @@ the small-T fused term from the `min_tokens <= 48` branch. The materialising `la
 below already maxed and is untouched.
 
 Nothing else moves: no kernel is edited, and the compiled result agrees - `cuobjdump -sass` over the
-two binaries finds **0 of 2931 device functions changed**, registers, shared memory and spills
+two binaries finds **0 of 2899 comparable device functions changed** (2937 enumerated, 38 unmatched
+by name because they are concat symbols with internal linkage), registers, shared memory and spills
 identical everywhere. Only which kernel a given width reaches changes.
 
 ## Affected behaviour and contract
@@ -133,6 +136,15 @@ On `master` the materialising path at 1025 costs 598.0 µs against 417.8 for the
 so the table has a sawtooth at every 256-wide step above 1024. This removes it at the accepted
 widths and leaves it in between.
 
+
+**Re-taken on the current base.** Master moved to `1fc1cb76` while this was in review; both arms
+were rebuilt there and both sweeps re-run in one more pass. The operator reads 1.000 / 1.006 / 1.000
+/ 1.000 at 256 / 512 / 768 / 1024, then 1.053 at 1280, 1.091 at 2048, 1.130 at 4096 and 1.122 at
+8192. The predicate sweep reads 1.000 at every width that is not a multiple of 256, and 1.051 /
+1.065 / 1.067 / 1.080 / 1.084 / 1.090 at 1280 / 1536 / 1792 / 2048 / 2304 / 2560. Every cell is
+inside the +-1.2% envelope; the one that moved most is 512, which reads 1.006 in this pass and 1.000
+in the table above on a width neither arm re-routes, so that is the floor measuring itself.
+
 ### Numerics
 
 `tests/ops/linear_swiglu/test_nvfp4.cpp` qualifies **both** routes against the FP64 oracle today -
@@ -162,6 +174,37 @@ frame:
 > The criterion belongs to the activation-compute profile, not the weight storage format or a
 > private materialized/fused implementation.
 
+### The lower bound
+
+`kPrimaryT` is where the fused route is registered today and I kept it, but I can no longer
+say it is where the fused path starts winning, because it is not. A probe that lowers only the
+route predicate to `kTmaBlockM`, three runs (`median_us` over 50 after 5 warmup,
+materialising against fused):
+
+| T | 256 | 512 | 768 | 1024 | 1280 |
+|---|---:|---:|---:|---:|---:|
+| fused speedup | x1.12 | x1.35 | x1.28 | x1.00 | x1.05 |
+
+The three runs agree to within 0.011 at 256 and to the third decimal at 512 and 768. 1024 reads
+0.995-0.999 because both arms already take the fused route there; that row is the control.
+
+The numerics hold at those widths too. `kA4Cases` extended to 256/512/768, both arms:
+
+| T | master rel_L2 | lowered rel_L2 | master gross | lowered gross |
+|---:|---:|---:|---:|---:|
+| 256 | 0.059000 | **0.058382** | 0.531 | **0.486** |
+| 512 | 0.057068 | **0.056556** | 0.531 | **0.486** |
+| 768 | 0.054019 | **0.053731** | 0.408 | **0.373** |
+
+The fused route is the closer of the two at all three widths, on both statistics.
+
+What stops the bound from simply moving is not numerics but a second copy of the bound. With only
+the route predicate lowered the test fails at 256, 512 and 768 with `exact workspace query/execution
+high-water mismatch`: `nvfp4_linear_swiglu_workspace_capacity_bytes` gates its fused term on
+`max_tokens >= kPrimaryT` as well, so below 1024 the query and the executed route disagree. Moving
+the bound properly means moving both, over a set of widths no test covers on either arm today. That
+is a second mechanism and it is not in this change.
+
 ### Resources
 
 No kernel is edited, so registers and shared memory cannot move, and `cuobjdump --dump-resource-usage`
@@ -174,9 +217,10 @@ Graph step to measure.
 
 ### Suite
 
-`ctest -j1` on both arms: the same set, 92 pass, 1 skipped, 1 fails. The skip needs a 27B artifact
-this box does not have; the failure is `ninfer_qwen3_6_27b_prefix_real_test`, which is #105 and
-unrelated to this change.
+`ctest -j1` on the rebased base: **94 tests, 0 failed, 1 skipped**, on master and on this branch.
+The skip needs a 27B artifact this box does not have. On the old base this suite had one failure,
+`ninfer_qwen3_6_27b_prefix_real_test`, which we reported as #105; `fd48e2fa` between the two bases
+rewrites that test's oracle, so it now passes.
 
 ### End to end
 
@@ -215,9 +259,10 @@ small numeric differences at the argmax, and these routes are not required to ag
 - All workspace measurements use `--max-context 131072`, which pins KV capacity explicitly (headroom
   reads 0 B on both arms). They establish that the two arms request identical workspace, not how an
   auto-sized KV policy would respond to a wider chunk.
-- I kept `kPrimaryT` as the lower bound so no width that resolves to a route today changes route. I
-  did not measure the fused kernel below 1024, so the clause is conservative rather than optimal and
-  the crossover may be lower.
+- I kept `kPrimaryT` as the lower bound. The fused kernel does win below it and is the closer
+  of the two against the oracle there - measured, above - so the clause is conservative rather
+  than optimal. Moving it needs the capacity query's own copy of the bound to move with it,
+  which is a second mechanism and is not in this change.
 - The oracle sweep stops at 4096. 8192 went through the benchmark and the product but not the FP64
   oracle.
 - The output gate is one prompt, one run per arm at each chunk width.

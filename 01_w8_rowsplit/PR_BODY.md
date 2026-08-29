@@ -292,6 +292,21 @@ evidence: GPU busy time is 99.5% of prefill wall
 clock here, so the kernel sum and the end-to-end prefill figure are the same quantity read off two
 clocks.
 
+
+**Re-taken on the current base.** Both arms were rebuilt on `1fc1cb76` after the rebase and the
+whole grid re-measured, one more pass:
+
+| n, k | T=1024 | 2048 | 4096 | 8192 |
+|---|---:|---:|---:|---:|
+| 12288, 2048 | 1.088 | 1.090 | 1.089 | 1.088 |
+| 9216, 2048 | 1.103 | 1.090 | 1.089 | 1.089 |
+| 2048, 4096 | 1.091 | 1.084 | 1.096 | 1.092 |
+| 2048, 16384 | 1.089 | 1.121 | 1.097 | 1.093 |
+
+Median **x1.090**, range x1.084 to x1.121 - the same median as the campaign above and the same top
+of range. Three cells in the first row land 0.1 to 0.3% above their earlier per-pass range and two
+land just below theirs, all of it inside the run-to-run envelope stated below.
+
 ### Resources
 
 The binary carries 158 instantiations of this kernel. 120 match by name between the two builds; the
@@ -312,9 +327,11 @@ matched-set maximum reads 127 here. The MoE row is there
 because those kernels are #106's subject; this branch leaves them untouched, register for register.
 Workspace, resident memory, transfers and graph nodes are unchanged.
 
-`cuobjdump -sass`, compared body by body. Of the 2893 name-matched device functions, **120 differ in
-instruction count or per-opcode census and 2773 are identical in both**, and all 120 are
-instantiations of this kernel. Over those 120 bodies the instruction count falls 179,948 -> 161,238
+`cuobjdump -sass`, compared body by body. Of the 2899 name-matched device functions, **120 differ in
+instruction count or per-opcode census and 2779 are identical in both**, and all 120 are
+instantiations of this kernel. The census was re-taken after rebasing onto the current base: the
+function total moves from 2931 to 2937 because master added six of its own, and every opcode figure
+below reproduces to the unit. Over those 120 bodies the instruction count falls 179,948 -> 161,238
 (-10.4%), per body between 1.6% and 33.3%, median 4.9%.
 
 The whole shuffle machinery leaves: `SHFL` **1150 -> 0**, `WARPSYNC` **1360 -> 0**,

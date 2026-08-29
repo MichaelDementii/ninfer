@@ -68,6 +68,15 @@ Worth noting for its own sake: on `master` the materialising path at 1025 costs 
 417.8 for the fused path at 1024, so the current table has a sawtooth at every 256-wide step above
 1024. This change removes it at the accepted widths and leaves it in between.
 
+
+**Re-taken on the current base.** Master moved to `1fc1cb76` while this was in review; both arms
+were rebuilt there and both sweeps re-run in one more pass. The operator reads 1.000 / 1.006 / 1.000
+/ 1.000 at 256 / 512 / 768 / 1024, then 1.053 at 1280, 1.091 at 2048, 1.130 at 4096 and 1.122 at
+8192. The predicate sweep reads 1.000 at every width that is not a multiple of 256, and 1.051 /
+1.065 / 1.067 / 1.080 / 1.084 / 1.090 at 1280 / 1536 / 1792 / 2048 / 2304 / 2560. Every cell is
+inside the +-1.2% envelope; the one that moved most is 512, which reads 1.006 in this pass and 1.000
+in the table above on a width neither arm re-routes, so that is the floor measuring itself.
+
 ## Tradeoffs
 
 **Workspace capacity.** The commit edits `nvfp4_linear_swiglu_workspace_capacity_bytes`, and
@@ -131,13 +140,45 @@ frame I am working from, and it is yours:
 > The criterion belongs to the activation-compute profile, not the weight storage format or a
 > private materialized/fused implementation.
 
+**The lower bound is conservative, and I measured by how much.** `kPrimaryT` is where the fused
+route is registered today and I kept it, but I can no longer say it is where the fused path
+starts winning, because it is not. A probe that lowers only the route predicate to `kTmaBlockM`,
+three runs (`median_us` over 50 after 5 warmup, materialising against fused):
+
+| T | 256 | 512 | 768 | 1024 | 1280 |
+|---|---:|---:|---:|---:|---:|
+| fused speedup | x1.12 | x1.35 | x1.28 | x1.00 | x1.05 |
+
+The three runs agree to within 0.011 at 256 and to the third decimal at 512 and 768. 1024 reads
+0.995-0.999 because both arms already take the fused route there; that row is the control.
+
+The numerics hold at those widths too. `kA4Cases` extended to 256/512/768, both arms:
+
+| T | master rel_L2 | lowered rel_L2 | master gross | lowered gross |
+|---:|---:|---:|---:|---:|
+| 256 | 0.059000 | **0.058382** | 0.531 | **0.486** |
+| 512 | 0.057068 | **0.056556** | 0.531 | **0.486** |
+| 768 | 0.054019 | **0.053731** | 0.408 | **0.373** |
+
+The fused route is the closer of the two at all three widths, on both statistics.
+
+What stops the bound from simply moving is not numerics but a second copy of the bound. With only
+the route predicate lowered the test fails at 256, 512 and 768 with `exact workspace query/execution
+high-water mismatch`: `nvfp4_linear_swiglu_workspace_capacity_bytes` gates its fused term on
+`max_tokens >= kPrimaryT` as well, so below 1024 the query and the executed route disagree. Moving
+the bound properly means moving both, over a set of widths no test covers on either arm today. That
+is a second mechanism and it is not in this change.
+
 **Other execution paths.** The diff is one predicate and one capacity branch in a host-side route
 table, and the compiled result says the same thing: `cuobjdump -sass` over the two binaries finds
-**0 of 2931 device functions changed**, with registers, shared memory and spills identical
+**0 of 2899 comparable device functions changed** - 2937 enumerated, 38 unmatched by name because
+they are concat symbols with internal linkage - with registers, shared memory and spills identical
 everywhere. No kernel is compiled differently; only which one a given width reaches.
 
-`ctest -j1` on both arms: same set, 92 pass, 1 skipped, 1 fails. The skip needs a 27B artifact this
-box does not have; the failure is `ninfer_qwen3_6_27b_prefix_real_test`, which is #105 and unrelated.
+`ctest -j1` on the rebased base: **94 tests, 0 failed, 1 skipped**, on master and on this branch.
+The skip needs a 27B artifact this box does not have. On the old base this suite had one failure,
+the one we reported as #105; `fd48e2fa` between the two bases rewrites that test's oracle and it
+now passes.
 
 ## End-to-end observation
 
@@ -177,9 +218,10 @@ small numeric differences at the argmax, and the routes are not required to agre
 - All workspace measurements use `--max-context 131072`, which pins KV capacity explicitly (headroom
   reads 0 B on both arms). They establish that the two arms request identical workspace, not how an
   auto-sized KV policy would respond to a wider chunk.
-- I kept `kPrimaryT` as the lower bound so no width that resolves to a route today changes route. I
-  did not measure the fused kernel below 1024, so the clause is conservative rather than optimal and
-  the crossover may be lower.
+- I kept `kPrimaryT` as the lower bound. The fused kernel does win below it and is the closer
+  of the two against the oracle there - measured, above - so the clause is conservative rather
+  than optimal. Moving it needs the capacity query's own copy of the bound to move with it,
+  which is a second mechanism and is not in this change.
 - The oracle sweep stops at 4096; 8192 was not run through the FP64 oracle, only through the
   benchmark and the product.
 - The output gate is one prompt and one run per arm at each chunk width.
@@ -195,3 +237,8 @@ small numeric differences at the argmax, and the routes are not required to agre
 2. Should extending `kA4Cases` in `tests/ops/linear_swiglu/test_nvfp4.cpp` to cover the widths this
    re-routes be part of the change? The repo asks for relevant shapes and execution routes to be
    exercised, and those widths are currently unqualified on either route.
+3. Should the lower bound be `kTmaBlockM` rather than `kPrimaryT`? By the measurement above the
+   fused route wins from 256 up and is the numerically closer of the two there, so this change as
+   written leaves x1.12 to x1.35 on the table at three widths. I left it out because it needs the
+   capacity query's own copy of the bound to move with it, and because those widths are unqualified
+   on either route today - but the probe exists and I can prepare it as a separate change.
