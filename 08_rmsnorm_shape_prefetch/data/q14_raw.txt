@@ -1,0 +1,7 @@
+трасса B0 снята
+трасса B3 снята
+Traceback (most recent call last):
+  File "<stdin>", line 20, in <module>
+  File "<stdin>", line 7, in load
+StopIteration
+Q14_DONE
