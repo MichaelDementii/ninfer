@@ -86,12 +86,21 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   Caller-owned transient storage reported by
  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
  */
+// draft_probs, when non-null, carries q(draft_i) under the proposal's own truncated
+// distribution, laid out [batch][drafts] with batch contiguous. The accept test then uses the
+// full Metropolis ratio min(1, p/q); a null pointer keeps the one-hot rule u < p.
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* draft_probs         = nullptr,
+                                      bool nucleus_accept               = false,
+                                      const Tensor* draft_support_ids   = nullptr,
+                                      const Tensor* draft_support_probs = nullptr,
+                                      const Tensor* draft_support_n     = nullptr,
+                                      const Tensor* draft_recorded      = nullptr);
 
 /**
  * Op: speculative_select_accepted_hidden

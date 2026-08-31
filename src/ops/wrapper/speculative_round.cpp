@@ -111,7 +111,12 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* draft_probs, bool nucleus_accept,
+                                      const Tensor* draft_support_ids,
+                                      const Tensor* draft_support_probs,
+                                      const Tensor* draft_support_n,
+                                      const Tensor* draft_recorded) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -143,9 +148,19 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     const std::size_t bytes =
         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+    if (draft_probs != nullptr && draft_probs->data != nullptr) {
+        // Первое измерение — максимум конкурентности, он может быть больше активных строк.
+        if (draft_probs->dtype != DType::FP32 || draft_probs->ne[0] < batch ||
+            draft_probs->ne[1] != k || !draft_probs->is_contiguous()) {
+            throw std::invalid_argument(
+                "speculative_accept_greedy_drafts: draft_probs must be a contiguous "
+                "FP32 [rows>=B,K] matrix");
+        }
+    }
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, draft_probs,
+        nucleus_accept, draft_support_ids, draft_support_probs, draft_support_n, draft_recorded);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

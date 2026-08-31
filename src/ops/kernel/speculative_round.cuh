@@ -74,7 +74,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    std::int32_t k, const float* draft_probs, std::int32_t draft_prob_stride,
+    bool nucleus_accept, const std::int32_t* sup_idx, const float* sup_prob,
+    const std::int32_t* sup_n, std::int32_t sup_cap, const std::int32_t* recorded) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -157,13 +159,38 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 }
                 const float u =
                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                if (u < pd) {
+                // q — вероятность того, что черновик предложит именно этот токен.
+                // При жадном предложении q = 1, и правило вырождается в прежнее «u < p».
+                // q записана для конкретного токена. Если строка конкурентности сменила
+                // жильца, черновик придёт из хоста, а q останется от прежнего — тогда позиция
+                // считается отклонённой, а замена берётся из полного p. Это обычный шаг без
+                // спекуляции, то есть распределение сохраняется точно.
+                const bool q_stale =
+                    draft_probs != nullptr && recorded != nullptr &&
+                    recorded[static_cast<std::int64_t>(i) * draft_prob_stride + row] != d;
+                const float qd =
+                    draft_probs != nullptr
+                        ? draft_probs[static_cast<std::int64_t>(i) * draft_prob_stride + row]
+                        : 1.0f;
+                if (!q_stale && (nucleus_accept ? (pd > 0.0f) : (u * qd < pd))) {
                     a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
-                    done_sh        = 1;
+                    // Остаток берём точным: (p - q)+ по опоре черновика. При одноточечном q
+                    // это то же самое, что p с маской на предложенном токене.
+                    const std::int64_t sup_base =
+                        (static_cast<std::int64_t>(i) * draft_prob_stride + row) * sup_cap;
+                    tstar_sh =
+                        q_stale ? sampling_pick_from_support(cand_idx, prob, n_support, -1, ur)
+                        : sup_idx != nullptr
+                            ? sampling_pick_from_residual(
+                                  cand_idx, prob, n_support, sup_idx + sup_base,
+                                  sup_prob + sup_base,
+                                  sup_n[static_cast<std::int64_t>(i) * draft_prob_stride + row], d,
+                                  ur)
+                            : sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+                    done_sh = 1;
                 }
             } else {
                 // Every draft accepted: bonus token from the last verify column.
@@ -255,7 +282,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
     std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::size_t workspace_row_stride, const float* draft_probs, std::int32_t draft_prob_stride,
+    bool nucleus_accept, const std::int32_t* sup_idx, const float* sup_prob,
+    const std::int32_t* sup_n, std::int32_t sup_cap, const std::int32_t* recorded) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -395,13 +424,35 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     }
                     const float u =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    if (u < pd) {
+                    // q — вероятность того, что черновик предложит именно этот токен.
+                    // При жадном предложении q = 1, и правило вырождается в прежнее «u < p».
+                    // q записана для конкретного токена. Если строка конкурентности сменила
+                    // жильца, черновик придёт из хоста, а q останется от прежнего — тогда позиция
+                    // считается отклонённой, а замена берётся из полного p. Это обычный шаг без
+                    // спекуляции, то есть распределение сохраняется точно.
+                    const bool q_stale =
+                        draft_probs != nullptr && recorded != nullptr &&
+                        recorded[static_cast<std::int64_t>(i) * draft_prob_stride + row] != d;
+                    const float qd =
+                        draft_probs != nullptr
+                            ? draft_probs[static_cast<std::int64_t>(i) * draft_prob_stride + row]
+                            : 1.0f;
+                    if (!q_stale && (nucleus_accept ? (pd > 0.0f) : (u * qd < pd))) {
                         a = i + 1;
                         continue;
                     }
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    const std::int64_t sup_base =
+                        (static_cast<std::int64_t>(i) * draft_prob_stride + row) * sup_cap;
+                    tstar = q_stale ? sampling_pick_from_support(dist_idx, dist_prob, n, -1, ur)
+                            : sup_idx != nullptr
+                                ? sampling_pick_from_residual(
+                                      dist_idx, dist_prob, n, sup_idx + sup_base,
+                                      sup_prob + sup_base,
+                                      sup_n[static_cast<std::int64_t>(i) * draft_prob_stride + row],
+                                      d, ur)
+                                : sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
                     break;
                 }
                 const float u =

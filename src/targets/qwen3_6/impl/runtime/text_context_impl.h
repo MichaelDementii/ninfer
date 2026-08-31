@@ -548,6 +548,26 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
+bool mtp_nucleus_accept_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_MTP_NUCLEUS_ACCEPT");
+        return value != nullptr && value[0] == 0x31;
+    }();
+    return enabled;
+}
+
+bool mtp_sampled_draft_enabled() {
+    static const bool enabled = [] {
+        // Включено по умолчанию: сэмплированное предложение черновика даёт приёмку
+        // sum min(p, q) вместо E[p(argmax q)] и выигрывает на всех трёх целях
+        // (+9.5% nvfp4-27B, +4.2% 35B-A3B, +1.4% 27B). Под --greedy правило
+        // вырождается в прежнее побитово. Выключатель: NINFER_MTP_SAMPLED_DRAFT=0.
+        const char* value = std::getenv("NINFER_MTP_SAMPLED_DRAFT");
+        return value == nullptr || value[0] != 0x30;
+    }();
+    return enabled;
+}
+
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
     const int T = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
@@ -781,12 +801,65 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
-void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
+void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                    Tensor* draft_probs, const Tensor* positions,
+                                    std::int32_t purpose_offset,
+                                    const ops::SamplingConfig* sampling, Tensor* support_ids,
+                                    Tensor* support_probs, Tensor* support_n) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
+    const ops::SamplingConfig* cfg = sampling != nullptr ? sampling : sampling_config_;
+    if (mtp_sampled_draft_enabled() && draft_probs != nullptr && positions != nullptr &&
+        cfg != nullptr) {
+        proposal_sample(hidden, logits, draft_tokens, *draft_probs, *positions, purpose_offset,
+                        cfg, support_ids, support_probs, support_n);
+        return;
+    }
     proposal_argmax(hidden, logits, draft_tokens);
+}
+
+// Черновик берётся из собственного усечённого распределения головы предложений, а не из её
+// argmax. Одноточечное предложение вырождает правило Метрополиса в «принять с вероятностью
+// p(x*)»; полноценное q даёт ожидаемую приёмку sum_x min(p, q), что для откалиброванной головы
+// заметно больше. Возвращаем и q(выбранного) — ядру приёмки оно нужно для min(1, p/q).
+void TextContext::proposal_sample(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                                  Tensor& proposal_probs, const Tensor& positions,
+                                  std::int32_t purpose_offset,
+                                  const ops::SamplingConfig* sampling, Tensor* support_ids,
+                                  Tensor* support_probs, Tensor* support_n) {
+    const int T = hidden.ne[1];
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
+    require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
+    require_tensor_shape(proposal_probs, DType::FP32, {T}, "proposal probabilities");
+    auto* probs      = static_cast<float*>(proposal_probs.data);
+    auto* sup_ids    = support_ids != nullptr ? static_cast<std::int32_t*>(support_ids->data)
+                                              : nullptr;
+    auto* sup_probs  = support_probs != nullptr ? static_cast<float*>(support_probs->data) : nullptr;
+    auto* sup_n      = support_n != nullptr ? static_cast<std::int32_t*>(support_n->data) : nullptr;
+    const auto cap   = static_cast<std::int32_t>(sup_ids != nullptr ? support_ids->ne[0] / T : 0);
+    if (proposal_head_ != nullptr) {
+        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
+        ops::sample(proposal_logits, proposal_tokens, proposal_head_n_, sampling, positions,
+                    ops::kSamplePurposeSpeculativeProposal + purpose_offset, work_, ctx_.stream,
+                    probs, sup_ids, sup_probs, sup_n, cap);
+        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                      ctx_.stream);
+        // Опора приходит в номерах строк головы предложений — переводим её в идентификаторы
+        // токенов, иначе сравнивать её с опорой цели нельзя.
+        if (support_ids != nullptr) {
+            ops::proposal_remap_token_ids(*support_ids, proposal_head_ids_, proposal_head_n_,
+                                          ctx_.stream);
+        }
+    } else {
+        Tensor output_logits = matrix_window(logits, T);
+        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
+        ops::sample(output_logits, proposal_tokens, kCfg.token_domain, sampling, positions,
+                    ops::kSamplePurposeSpeculativeProposal + purpose_offset, work_, ctx_.stream,
+                    probs, sup_ids, sup_probs, sup_n, cap);
+    }
 }
 
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {

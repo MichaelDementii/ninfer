@@ -15,7 +15,9 @@ __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
-                           std::int32_t physical_rows) {
+                           std::int32_t physical_rows, float* out_prob,
+                           std::int32_t* out_sup_idx, float* out_sup_prob,
+                           std::int32_t* out_sup_n, std::int32_t sup_cap) {
     const int row            = static_cast<int>(blockIdx.x);
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
@@ -46,7 +48,18 @@ __launch_bounds__(kSamplerBlock) __global__
             }
             __syncthreads();
         }
-        if (tid == 0) { out[row] = red_idx[0]; }
+        if (tid == 0) {
+            out[row] = red_idx[0];
+            // Жадная строка — одноточечное предложение, его вероятность равна единице.
+            if (out_prob != nullptr) { out_prob[row] = 1.0f; }
+            if (out_sup_idx != nullptr) {
+                for (int j = 0; j < sup_cap; ++j) {
+                    out_sup_idx[row * sup_cap + j]  = j == 0 ? red_idx[0] : 0;
+                    out_sup_prob[row * sup_cap + j] = j == 0 ? 1.0f : 0.0f;
+                }
+                out_sup_n[row] = 1;
+            }
+        }
         return;
     }
 
@@ -78,14 +91,26 @@ __launch_bounds__(kSamplerBlock) __global__
     const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
     float acc         = 0.0f;
     int picked        = cand_idx[support - 1];
+    float picked_prob = prob[support - 1];
     for (int j = 0; j < support; ++j) {
         acc += prob[j]; // prob is normalized: goal == u
         if (u < acc) {
-            picked = cand_idx[j];
+            picked      = cand_idx[j];
+            picked_prob = prob[j];
             break;
         }
     }
     out[row] = picked;
+    if (out_prob != nullptr) { out_prob[row] = picked_prob; }
+    if (out_sup_idx != nullptr) {
+        const int limit = support < sup_cap ? support : sup_cap;
+        for (int j = 0; j < sup_cap; ++j) {
+        out_sup_idx[row * sup_cap + j]  = j < limit ? cand_idx[j] : 0;
+        out_sup_prob[row * sup_cap + j] = j < limit ? prob[j] : 0.0f;
+        }
+        out_sup_n[row] = limit;
+    }
+
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
@@ -145,7 +170,9 @@ __launch_bounds__(kSamplerBlock) __global__
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace) {
+    std::int32_t group_count, SamplingWorkspace workspace, float* out_prob,
+    std::int32_t* out_sup_idx, float* out_sup_prob, std::int32_t* out_sup_n,
+    std::int32_t sup_cap) {
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
@@ -193,7 +220,17 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
-            out[col]                  = sampling_key_index(best);
+            const int picked          = sampling_key_index(best);
+            out[col]                  = picked;
+            // Жадная строка — одноточечное предложение, его вероятность равна единице.
+            if (out_prob != nullptr) { out_prob[col] = 1.0f; }
+            if (out_sup_idx != nullptr) {
+                for (int j = 0; j < sup_cap; ++j) {
+                    out_sup_idx[col * sup_cap + j]  = j == 0 ? picked : 0;
+                    out_sup_prob[col * sup_cap + j] = j == 0 ? 1.0f : 0.0f;
+                }
+                out_sup_n[col] = 1;
+            }
             workspace.group_done[col] = 0;
         }
         return;
@@ -264,14 +301,26 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
         float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
+        float picked_prob = prob[support - 1];
         for (int j = 0; j < support; ++j) {
             acc += prob[j];
             if (u < acc) {
-                picked = cand_idx[j];
+                picked      = cand_idx[j];
+                picked_prob = prob[j];
                 break;
             }
         }
         out[col] = picked;
+        if (out_prob != nullptr) { out_prob[col] = picked_prob; }
+        if (out_sup_idx != nullptr) {
+            const int limit = support < sup_cap ? support : sup_cap;
+            for (int j = 0; j < sup_cap; ++j) {
+                out_sup_idx[col * sup_cap + j]  = j < limit ? cand_idx[j] : 0;
+                out_sup_prob[col * sup_cap + j] = j < limit ? prob[j] : 0.0f;
+            }
+            out_sup_n[col] = limit;
+        }
+
         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
     }

@@ -328,4 +328,43 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+// Добор из остатка (p - q)+ по опоре цели. q ищется в опоре черновика; токена, которого там
+// нет, у черновика не было, значит q = 0. Если остаток вырожден (p <= q всюду по опоре),
+// падаем на прежнее правило — это возможно только при численном вырождении.
+__device__ __forceinline__ int
+sampling_pick_from_residual(const int* cand_idx, const float* prob, int n, const int* q_idx,
+                            const float* q_prob, int q_n, int exclude, float u) {
+    float total = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float qv = 0.0f;
+        for (int m = 0; m < q_n; ++m) {
+            if (q_idx[m] == cand_idx[j]) {
+                qv = q_prob[m];
+                break;
+            }
+        }
+        const float r = prob[j] - qv;
+        if (r > 0.0f) { total += r; }
+    }
+    if (!(total > 0.0f)) { return sampling_pick_from_support(cand_idx, prob, n, exclude, u); }
+    const float goal = u * total;
+    float acc        = 0.0f;
+    int picked       = -1;
+    for (int j = 0; j < n; ++j) {
+        float qv = 0.0f;
+        for (int m = 0; m < q_n; ++m) {
+            if (q_idx[m] == cand_idx[j]) {
+                qv = q_prob[m];
+                break;
+            }
+        }
+        const float r = prob[j] - qv;
+        if (r <= 0.0f) { continue; }
+        acc += r;
+        picked = cand_idx[j];
+        if (goal < acc) { return picked; }
+    }
+    return picked;
+}
+
 } // namespace ninfer::ops
