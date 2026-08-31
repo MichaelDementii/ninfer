@@ -152,6 +152,7 @@ const char* production_route(const Shape& shape, int rows) {
     (void)rows;
     if (!shape.unit_offset && !shape.gated && shape.d == 128) { return "fixed-d128-bf16x2-b128"; }
     if (!shape.unit_offset && !shape.gated && shape.d == 2048) { return "fixed-d2048-bf16x2-b512"; }
+    if (shape.d == 5120) { return "fixed-d5120-bf16x2-b512"; }
     if (shape.d <= 256) { return "warp-bf16x2-b512"; }
     if (shape.d <= 3072) { return "cta-bf16x2-b256"; }
     return "cta-bf16x2-b512";

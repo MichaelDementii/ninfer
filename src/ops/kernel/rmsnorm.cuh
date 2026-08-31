@@ -3,6 +3,7 @@
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
 #include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
@@ -28,7 +29,7 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block>
+template <RmsEpilogue Epilogue, int Block, bool Prefetch = true>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
@@ -44,6 +45,8 @@ __launch_bounds__(Block) __global__
     const int pairs             = d / 2;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[kMaxPairsPerLane];
+    __nv_bfloat162 weights[kMaxPairsPerLane];
+    __nv_bfloat162 gates[kMaxPairsPerLane];
     float sum = 0.0f;
 
 #pragma unroll
@@ -51,6 +54,10 @@ __launch_bounds__(Block) __global__
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             values[k]       = x[row_base + pair];
+            if constexpr (Prefetch) {
+                weights[k] = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -65,10 +72,10 @@ __launch_bounds__(Block) __global__
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
+            const float2 wf = __bfloat1622float2(Prefetch ? weights[k] : weight[pair]);
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) {
-                zf = __bfloat1622float2(z[row_base + pair]);
+                zf = __bfloat1622float2(Prefetch ? gates[k] : z[row_base + pair]);
             }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
@@ -123,7 +130,7 @@ __launch_bounds__(Block) __global__
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch = true>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
@@ -136,6 +143,10 @@ __launch_bounds__(Block) __global__
     const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
+    // Веса и гейт не зависят ни от суммы квадратов, ни от inv: грузим их до барьера, чтобы оба
+    // похода в память шли одним конвейером. Сетка тут 4 CTA на 170 SM, регистры не в дефиците.
+    __nv_bfloat162 weights[MaxPairsPerThread];
+    __nv_bfloat162 gates[MaxPairsPerThread];
     float sum = 0.0f;
 
 #pragma unroll
@@ -143,6 +154,10 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             values[k]       = x[row_base + pair];
+            if constexpr (Prefetch) {
+                weights[k] = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -160,15 +175,88 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
+            const float2 wf = __bfloat1622float2(Prefetch ? weights[k] : weight[pair]);
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) {
-                zf = __bfloat1622float2(z[row_base + pair]);
+                zf = __bfloat1622float2(Prefetch ? gates[k] : z[row_base + pair]);
             }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
+    }
+}
+
+// Implements: include/ninfer/ops/rmsnorm.h
+// Match: aligned contiguous BF16, D=5120, sm_120a.
+// Algorithm assumptions: одна CTA на строку; 2048 пар берутся по uint4 на нить, 512 — поштучно.
+template <RmsEpilogue Epilogue>
+__launch_bounds__(512) __global__
+    void rmsnorm_d5120_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                     const __nv_bfloat162* z, __nv_bfloat162* out,
+                                     std::int64_t rows, float eps) {
+    constexpr int kBlock     = 512;
+    constexpr int kPairs     = 2560;
+    constexpr int kVecPairs  = 4;
+    constexpr int kVecSpan   = kBlock * kVecPairs; // 2048
+    constexpr float kInvD    = 1.0f / 5120.0f;
+    const std::int64_t row   = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+    const std::int64_t base  = row * static_cast<std::int64_t>(kPairs);
+    const int tid            = static_cast<int>(threadIdx.x);
+    const int vec_pair       = tid * kVecPairs;
+    const int tail_pair      = kVecSpan + tid;
+
+    __align__(16) __nv_bfloat162 xs[kVecPairs];
+    __align__(16) __nv_bfloat162 ws[kVecPairs];
+    __align__(16) __nv_bfloat162 zs[kVecPairs];
+    store_vec(xs, load_vec<uint4>(x + base + vec_pair));
+    store_vec(ws, load_vec<uint4>(weight + vec_pair));
+    if constexpr (Epilogue == RmsEpilogue::Gated) {
+        store_vec(zs, load_vec<uint4>(z + base + vec_pair));
+    }
+    const __nv_bfloat162 xt = x[base + tail_pair];
+    const __nv_bfloat162 wt = weight[tail_pair];
+    __nv_bfloat162 zt{};
+    if constexpr (Epilogue == RmsEpilogue::Gated) { zt = z[base + tail_pair]; }
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kVecPairs; ++k) {
+        const float2 xf = __bfloat1622float2(xs[k]);
+        sum += xf.x * xf.x + xf.y * xf.y;
+    }
+    {
+        const float2 xf = __bfloat1622float2(xt);
+        sum += xf.x * xf.x + xf.y * xf.y;
+    }
+
+    __shared__ float warp_sums[kBlock / kWarpSize];
+    __shared__ float inv_shared;
+    const float block_sum = block_reduce_sum<kBlock>(sum, warp_sums);
+    if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum * kInvD + eps); }
+    __syncthreads();
+    const float inv = inv_shared;
+
+    __align__(16) __nv_bfloat162 os[kVecPairs];
+#pragma unroll
+    for (int k = 0; k < kVecPairs; ++k) {
+        const float2 xf = __bfloat1622float2(xs[k]);
+        const float2 wf = __bfloat1622float2(ws[k]);
+        float2 zf{0.0f, 0.0f};
+        if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(zs[k]); }
+        os[k] = __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                                      rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+    }
+    store_vec(out + base + vec_pair, load_vec<uint4>(os));
+    {
+        const float2 xf = __bfloat1622float2(xt);
+        const float2 wf = __bfloat1622float2(wt);
+        float2 zf{0.0f, 0.0f};
+        if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(zt); }
+        out[base + tail_pair] =
+            __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                                  rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
     }
 }
 

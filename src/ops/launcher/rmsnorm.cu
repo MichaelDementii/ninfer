@@ -11,6 +11,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Граница между латентным и полосным режимом ядра нормы: на карте 170 SM, берём две волны
+// с запасом. Ниже неё выигрывает предзагрузка весов, выше — занятость.
+constexpr std::int64_t kRmsPrefetchBlocks = 512;
+
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
@@ -35,7 +39,15 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kBlock         = 512;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock><<<blocks, kBlock, 0, stream>>>(
+        if (blocks <= kRmsPrefetchBlocks) {
+            rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, true><<<blocks, kBlock, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
+        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false><<<blocks, kBlock, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
@@ -55,8 +67,23 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
                 reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+    } else if (aligned2 && d == 5120 && rows <= kRmsPrefetchBlocks) {
+        rmsnorm_d5120_bf16x2_kernel<Epilogue><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8>
+        if (rows <= kRmsPrefetchBlocks) {
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, true>
+                <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
+        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>
             <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
