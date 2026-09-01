@@ -1,0 +1,32 @@
+снято P01
+снято P71
+Q29_TRACED
+--- P01: сегмент 8440.3 мс, GPU 8390.8 мс, узлов 21143
+   fp8_mma_kernel                                     n=2296    3097.46 мс  36.91%
+   gqa_attention_prefill_i8_kernel                    n=255     2223.03 мс  26.49%
+   nvfp4_linear_swiglu_w4a4_tma_kernel                n=896     1412.21 мс  16.83%
+   nvfp4_w4a4_tma_kernel                              n=896      645.93 мс   7.70%
+   state_passing_kernel                               n=767      264.04 мс   3.15%
+   prepare_wy_wu_kernel                               n=767      132.85 мс   1.58%
+   output_kernel                                      n=767      119.41 мс   1.42%
+   causal_conv1d_prefill_pairs_kernel                 n=768       94.80 мс   1.13%
+   nvfp4_w4a4_quantize_kernel                         n=1792      86.80 мс   1.03%
+   memcpy Device->Device                              n=2302      72.60 мс   0.87%
+   rmsnorm_warp_bf16x2_kernel                         n=1277      70.04 мс   0.83%
+   rmsnorm_cta_bf16x2_kernel                          n=2059      49.42 мс   0.59%
+   ИТОГ свёртка=96.67 мс  копии=72.62 мс
+--- P71: сегмент 8388.7 мс, GPU 8345.0 мс, узлов 18842
+   fp8_mma_kernel                                     n=2296    3109.62 мс  37.26%
+   gqa_attention_prefill_i8_kernel                    n=255     2230.57 мс  26.73%
+   nvfp4_linear_swiglu_w4a4_tma_kernel                n=896     1413.37 мс  16.94%
+   nvfp4_w4a4_tma_kernel                              n=896      646.65 мс   7.75%
+   state_passing_kernel                               n=767      266.90 мс   3.20%
+   prepare_wy_wu_kernel                               n=767      137.73 мс   1.65%
+   output_kernel                                      n=767      119.96 мс   1.44%
+   causal_conv1d_prefill_pairs_split_kernel           n=768      101.51 мс   1.22%
+   nvfp4_w4a4_quantize_kernel                         n=1792      86.95 мс   1.04%
+   rmsnorm_warp_bf16x2_kernel                         n=1277      70.91 мс   0.85%
+   rmsnorm_cta_bf16x2_kernel                          n=2059      49.49 мс   0.59%
+   bf16_gdn_gating_proj_gemm_mma_kernel               n=767       37.15 мс   0.45%
+   ИТОГ свёртка=103.38 мс  копии=0.01 мс
+Q29_DONE

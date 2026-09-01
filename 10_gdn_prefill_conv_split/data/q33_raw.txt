@@ -1,0 +1,28 @@
+дополнен src/ops/kernel/causal_conv1d.cuh
+пропатчен src/ops/launcher/causal_conv1d.h
+пропатчен src/ops/launcher/causal_conv1d.cu
+пропатчен include/ninfer/ops/causal_conv1d_silu.h
+пропатчен src/ops/wrapper/causal_conv1d_silu.cpp
+пропатчен src/targets/qwen3_6/impl/runtime/text_context_impl.h
+пропатчен src/targets/qwen3_6/impl/runtime/workspace_recipe.h
+готово
+пропатчен bench/ops/causal_conv1d_silu_bench.cu
+бенч дополнен
+пропатчен tests/ops/test_causal_conv1d_silu.cpp
+тест дополнен
+
+=== формат ===
+  include/ninfer/ops/causal_conv1d_silu.h: 0
+  src/ops/kernel/causal_conv1d.cuh: 0
+  src/ops/launcher/causal_conv1d.cu: 0
+  src/ops/launcher/causal_conv1d.h: 0
+  src/ops/wrapper/causal_conv1d_silu.cpp: 0
+  bench/ops/causal_conv1d_silu_bench.cu: 0
+  tests/ops/test_causal_conv1d_silu.cpp: 0
+  src/targets/qwen3_6/impl/runtime/workspace_recipe.h: 0
+сборка RC=0
+
+=== тест ===
+OK causal_conv1d_silu
+тест RC=0
+Q33_DONE

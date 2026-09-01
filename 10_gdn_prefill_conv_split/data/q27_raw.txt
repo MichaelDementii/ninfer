@@ -1,0 +1,43 @@
+=== заголовок CSV ===
+     1	label
+     2	kind
+     3	n_prompt
+     4	n_gen
+     5	target
+     6	weights_id
+     7	max_context
+     8	prefill_chunk
+     9	mtp_draft_tokens
+    10	proposal_head
+    11	decode_path
+    12	kv_cache
+    13	kv_payload_bytes
+    14	load_host_to_device_bytes
+    15	weights_capacity_bytes
+    16	sequence_capacity_bytes
+    17	workspace_capacity_bytes
+    18	request_transient_capacity_bytes
+    19	cuda_graph_allowance_bytes
+    20	workspace_peak_bytes
+    21	workspace_allocator_peak_bytes
+    22	spec_rounds
+    23	spec_fallback_steps
+    24	spec_acceptance_rate
+    25	repetitions
+    26	prefill_tok_s_mean
+    27	prefill_tok_s_stddev
+    28	decode_output_tok_s_mean
+    29	decode_output_tok_s_stddev
+    30	decode_engine_tok_s_mean
+    31	decode_engine_tok_s_stddev
+    32	prepare_seconds_mean
+    33	prefill_seconds_mean
+    34	decode_seconds_mean
+    35	total_seconds_mean
+
+=== жадная генерация, длинный промпт: P0 против P7 ===
+промпт 1: совпало побитово
+промпт 2: совпало побитово
+промпт 3: совпало побитово
+промпт 4: совпало побитово
+Q27_DONE

@@ -1,0 +1,10 @@
+сборка RC=0
+испорченный тест RC=1
+15
+causal_conv1d_silu split C=8192 T=33 rows=1025,1025,6142 query equals fused entry: exact mismatch at index 0
+causal_conv1d_silu split C=8192 T=33 rows=1025,1025,6142 key against oracle: reduction criterion failed at index 6560 actual=-0.111816 reference=8.44246
+causal_conv1d_silu split C=8192 T=33 rows=1025,1025,6142 key equals fused entry: exact mismatch at index 0
+FAIL causal_conv1d_silu
+восстановленный тест RC=0
+OK causal_conv1d_silu
+Q35_DONE

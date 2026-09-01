@@ -1,0 +1,59 @@
+дополнен src/ops/kernel/causal_conv1d.cuh
+пропатчен src/ops/launcher/causal_conv1d.h
+пропатчен src/ops/launcher/causal_conv1d.cu
+пропатчен include/ninfer/ops/causal_conv1d_silu.h
+пропатчен src/ops/wrapper/causal_conv1d_silu.cpp
+пропатчен src/targets/qwen3_6/impl/runtime/text_context_impl.h
+пропатчен src/targets/qwen3_6/impl/runtime/workspace_recipe.h
+готово
+пропатчен bench/ops/causal_conv1d_silu_bench.cu
+бенч дополнен
+сборка RC=0 
+
+=== операторный бенч: продовая форма GDN [10240, T] ===
+causal_conv1d split-control [10240,512,1] median=   32.92 us  min=   31.01 us  p95=   32.99 us     643.3 GB/s  (35.9% of 1792 GB/s roofline)
+causal_conv1d split [10240,512,1] median=   18.51 us  min=   16.53 us  p95=   18.54 us    1144.1 GB/s  (63.8% of 1792 GB/s roofline)
+causal_conv1d split-control [10240,1024,1] median=   53.67 us  min=   52.71 us  p95=   53.72 us     785.3 GB/s  (43.8% of 1792 GB/s roofline)
+causal_conv1d split [10240,1024,1] median=   32.71 us  min=   31.50 us  p95=   32.84 us    1288.6 GB/s  (71.9% of 1792 GB/s roofline)
+causal_conv1d split-control [10240,2048,1] median=  109.89 us  min=  106.62 us  p95=  111.16 us     765.2 GB/s  (42.7% of 1792 GB/s roofline)
+causal_conv1d split [10240,2048,1] median=   63.80 us  min=   60.37 us  p95=   64.29 us    1317.9 GB/s  (73.5% of 1792 GB/s roofline)
+causal_conv1d split-control [10240,4096,1] median=  223.88 us  min=  217.33 us  p95=  227.41 us     750.3 GB/s  (41.9% of 1792 GB/s roofline)
+causal_conv1d split [10240,4096,1] median=  148.08 us  min=  140.93 us  p95=  150.22 us    1134.4 GB/s  (63.3% of 1792 GB/s roofline)
+
+=== контроль формы, не затронутой правкой ===
+causal_conv1d prefill [10240,4096,1] median=  138.85 us  min=  121.27 us  p95=  143.76 us    1209.8 GB/s  (67.5% of 1792 GB/s roofline)
+causal_conv1d distinct [10240,4096,1] median=  135.71 us  min=  121.63 us  p95=  143.35 us    1237.8 GB/s  (69.1% of 1792 GB/s roofline)
+
+=== формат ===
+include/ninfer/ops/causal_conv1d_silu.h: 55 строк расхождения с clang-format
+src/ops/kernel/causal_conv1d.cuh: 554 строк расхождения с clang-format
+src/ops/launcher/causal_conv1d.cu: 276 строк расхождения с clang-format
+src/ops/launcher/causal_conv1d.h: 29 строк расхождения с clang-format
+src/ops/wrapper/causal_conv1d_silu.cpp: 250 строк расхождения с clang-format
+bench/ops/causal_conv1d_silu_bench.cu: 325 строк расхождения с clang-format
+src/targets/qwen3_6/impl/runtime/text_context_impl.h: 1285 строк расхождения с clang-format
+src/targets/qwen3_6/impl/runtime/workspace_recipe.h: 245 строк расхождения с clang-format
+
+=== ctest ===
+ctest RC=8
+85/89 Test #38: ninfer_gated_rmsnorm_test ......................   Passed    2.91 sec
+86/89 Test #52: ninfer_cast_test ...............................   Passed    2.60 sec
+87/89 Test #14: ninfer_state_store_test ........................   Passed    0.92 sec
+88/89 Test  #9: ninfer_request_memory_test .....................   Passed    0.88 sec
+89/89 Test #59: ninfer_prepare_masked_block_test ...............   Passed    3.17 sec
+
+99% tests passed, 1 tests failed out of 89
+
+Total Test time (real) =  29.18 sec
+
+The following tests did not run:
+	 18 - ninfer_qwen3_6_27b_prefix_real_test (Skipped)
+	 19 - ninfer_qwen3_6_27b_load_plan_test (Skipped)
+	 20 - ninfer_qwen3_6_35b_a3b_real_test (Skipped)
+	 21 - ninfer_qwen3_6_35b_a3b_dflash_real_test (Skipped)
+	 22 - ninfer_qwen3_6_35b_a3b_dflash_load_plan_test (Skipped)
+
+The following tests FAILED:
+	 16 - ninfer_qwen3_6_frontend_test (Subprocess aborted)
+Errors while running CTest
+Q31_DONE
