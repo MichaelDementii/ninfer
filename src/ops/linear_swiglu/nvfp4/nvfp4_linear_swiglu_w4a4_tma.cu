@@ -21,7 +21,7 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
                                          const std::uint8_t* weight_scales, std::int32_t tokens) {
     constexpr std::uint32_t kCodeColumns = 64;
     // Activation scales arrive tile-contiguous, one [BlockM tokens, 16 groups] tile per request.
-    constexpr std::uint32_t kScaleTileGroups = 16;
+    constexpr std::uint32_t kScaleTileGroups = 8;
     constexpr std::uint64_t kScaleTilesPerPlane =
         static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
     constexpr std::uint32_t kPairN = Schedule::kBlockN / 2;

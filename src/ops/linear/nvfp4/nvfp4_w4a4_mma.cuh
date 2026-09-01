@@ -391,7 +391,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 template <class Geometry, int BlockM>
 __device__ __forceinline__ std::int64_t nvfp4_blocked_scale_offset(int token, int group) {
     constexpr int kGroupsPerRow  = Geometry::kInputRows / 16;
-    constexpr int kGroupsPerTile = 16;
+    constexpr int kGroupsPerTile = 8;
     constexpr int kTilesPerPlane = kGroupsPerRow / kGroupsPerTile;
     const int token_tile         = token / BlockM;
     const int group_tile         = group / kGroupsPerTile;
