@@ -50,7 +50,7 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
     return layout.peak_bytes(1);
 }
 
-// The TMA route reads activation scales one [256 tokens, 16 groups] tile per request, and wants
+// The TMA route reads activation scales one [256 tokens, 8 groups] tile per request, and wants
 // that tile contiguous. Every route that shares make_nvfp4_w4a4_tma_descriptors asks the same
 // question, so the predicate lives here.
 inline constexpr std::int32_t kNvfp4TmaBlockM = 256;

@@ -48,6 +48,13 @@ inline CUtensorMap nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_typ
     return map;
 }
 
+// One stage of weight scales is a contiguous 1024-byte run. On the flat route -- one such
+// stream per stage -- describing it as four 256-byte rows instead of sixty-four 16-byte ones
+// leaves the bytes, their order and the shared image untouched and makes the route faster.
+// The fused SwiGLU route issues two of these streams a fixed large stride apart and gets slower
+// from the same descriptor, so it keeps 16-byte rows; both numbers are in the package notes.
+inline constexpr std::uint32_t kNvfp4WeightScaleRowBytes = 256;
+
 template <class Geometry, int BlockM>
 Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* activation_codes,
                                                         const std::uint8_t* activation_scales,
@@ -56,9 +63,9 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
                                                         std::int32_t tokens) {
     static_assert(BlockM == 128 || BlockM == 256);
     constexpr std::uint32_t kCodeColumns = 64;
-    // Activation scales arrive tile-contiguous: one [BlockM tokens, 16 groups] tile is BlockM
-    // bytes wide and 16 rows tall, so the request is wide instead of BlockM separate 16-byte ones.
-    // A K128 tile consumes the first eight of the sixteen group bytes; the rest is look-ahead.
+    // Activation scales arrive tile-contiguous: one [BlockM tokens, 8 groups] tile is BlockM
+    // bytes wide and 8 rows tall, so the request is wide instead of BlockM separate 16-byte ones.
+    // Eight groups is exactly what a K128 stage consumes, so no scale byte is fetched twice.
     constexpr std::uint32_t kScaleTileGroups = 8;
     constexpr std::uint64_t kScaleTilesPerPlane =
         static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
@@ -80,9 +87,13 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
         (static_cast<std::uint64_t>(tokens) / BlockM) * kScaleTilesPerPlane * kScaleTileGroups,
         BlockM, BlockM, kScaleTileGroups, CU_TENSOR_MAP_SWIZZLE_NONE,
         "encode activation scales TMA");
-    descriptors.b_scales = nvfp4_make_tma_2d(
-        const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
-        kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
+    static_assert(kWeightScaleBytes % kNvfp4WeightScaleRowBytes == 0,
+                  "weight scale plane must be a whole number of 256-byte rows");
+    descriptors.b_scales =
+        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                          kNvfp4WeightScaleRowBytes, kWeightScaleBytes / kNvfp4WeightScaleRowBytes,
+                          kNvfp4WeightScaleRowBytes, kNvfp4WeightScaleRowBytes, 4,
+                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
     return descriptors;
 }
 
@@ -202,10 +213,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                     (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile;
                 nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0, scale_tile * 8,
                                   &shared.full[stage]);
-                const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
-                                         k_tile * Schedule::kK64PerStage) *
-                                        32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0, b_scale_row,
+                const int b_scale_bytes = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
+                                           k_tile * Schedule::kK64PerStage) *
+                                          32 * 16;
+                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0,
+                                  b_scale_bytes / static_cast<int>(kNvfp4WeightScaleRowBytes),
                                   &shared.full[stage]);
             }
         }

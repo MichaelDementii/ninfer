@@ -20,7 +20,8 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, std::int32_t tokens) {
     constexpr std::uint32_t kCodeColumns = 64;
-    // Activation scales arrive tile-contiguous, one [BlockM tokens, 16 groups] tile per request.
+    // Activation scales arrive tile-contiguous, one [BlockM tokens, 8 groups] tile per request:
+    // eight groups is exactly what a K128 stage consumes.
     constexpr std::uint32_t kScaleTileGroups = 8;
     constexpr std::uint64_t kScaleTilesPerPlane =
         static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
