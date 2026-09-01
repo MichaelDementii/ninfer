@@ -24,11 +24,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
-    ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
-                                          frame.current_extents, frame.frontiers, frame.anchors,
-                                          frame.licensed_tokens, frame.licensed_counts,
-                                          frame.accepted_drafts, TextConfig::token_domain,
-                                          frame.sampling, execution.work, execution.device.stream);
+    ops::speculative_accept_greedy_drafts(
+        frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+        frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+        frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
+        execution.device.stream, mtp_sampled_draft_enabled() ? &frame.draft_probs : nullptr,
+        mtp_nucleus_accept_enabled(),
+        mtp_sampled_draft_enabled() ? &frame.draft_support_ids : nullptr,
+        mtp_sampled_draft_enabled() ? &frame.draft_support_probs : nullptr,
+        mtp_sampled_draft_enabled() ? &frame.draft_support_n : nullptr,
+        mtp_sampled_draft_enabled() ? &frame.draft_recorded_tokens : nullptr);
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,

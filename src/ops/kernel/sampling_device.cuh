@@ -328,4 +328,45 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+// Resampling from the residual (p - q)+ over the target's support. q is looked up in the draft's
+// support; a token that is not there was never proposed, so its q is zero. If the residual
+// degenerates (p <= q everywhere on the support) the previous rule is used instead, which can only
+// happen under numerical degeneracy.
+__device__ __forceinline__ int sampling_pick_from_residual(const int* cand_idx, const float* prob,
+                                                           int n, const int* q_idx,
+                                                           const float* q_prob, int q_n,
+                                                           int exclude, float u) {
+    float total = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float qv = 0.0f;
+        for (int m = 0; m < q_n; ++m) {
+            if (q_idx[m] == cand_idx[j]) {
+                qv = q_prob[m];
+                break;
+            }
+        }
+        const float r = prob[j] - qv;
+        if (r > 0.0f) { total += r; }
+    }
+    if (!(total > 0.0f)) { return sampling_pick_from_support(cand_idx, prob, n, exclude, u); }
+    const float goal = u * total;
+    float acc        = 0.0f;
+    int picked       = -1;
+    for (int j = 0; j < n; ++j) {
+        float qv = 0.0f;
+        for (int m = 0; m < q_n; ++m) {
+            if (q_idx[m] == cand_idx[j]) {
+                qv = q_prob[m];
+                break;
+            }
+        }
+        const float r = prob[j] - qv;
+        if (r <= 0.0f) { continue; }
+        acc += r;
+        picked = cand_idx[j];
+        if (goal < acc) { return picked; }
+    }
+    return picked;
+}
+
 } // namespace ninfer::ops

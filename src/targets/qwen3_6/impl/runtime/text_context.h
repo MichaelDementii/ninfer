@@ -229,7 +229,12 @@ public:
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* draft_probs = nullptr, const Tensor* positions = nullptr,
+                           std::int32_t purpose_offset         = 0,
+                           const ops::SamplingConfig* sampling = nullptr,
+                           Tensor* support_ids = nullptr, Tensor* support_probs = nullptr,
+                           Tensor* support_n = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -274,6 +279,10 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    void proposal_sample(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                         Tensor& proposal_probs, const Tensor& positions,
+                         std::int32_t purpose_offset, const ops::SamplingConfig* sampling,
+                         Tensor* support_ids, Tensor* support_probs, Tensor* support_n);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;

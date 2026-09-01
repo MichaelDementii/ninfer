@@ -102,6 +102,9 @@ struct DFlashEnvelopes {
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
+bool mtp_sampled_draft_enabled();
+bool mtp_nucleus_accept_enabled();
+
 struct TargetVerifyFrameView {
     Tensor ids;
     Tensor cache_positions;
@@ -121,6 +124,11 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    Tensor draft_probs;
+    Tensor draft_support_ids;
+    Tensor draft_support_probs;
+    Tensor draft_support_n;
+    Tensor draft_recorded_tokens;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;

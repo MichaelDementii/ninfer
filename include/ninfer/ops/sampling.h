@@ -17,6 +17,7 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    kSamplePurposeSpeculativeProposal   = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
@@ -72,9 +73,21 @@ struct SamplingConfig {
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
  * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
  */
+// out_prob, when non-null, receives the drawn token's probability under the same truncated,
+// renormalized distribution the draw used; a greedy row reports 1.0. Device float[B].
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob = nullptr);
+
+// support_ids / support_probs / support_n, when non-null, receive the truncated support the draw
+// used: device int32[B*support_cap], float[B*support_cap] and int32[B], padded with (0, 0.0f)
+// beyond each row's support. This is what a speculative proposal needs to let the verifier build
+// the exact residual (p - q)+ on rejection.
+void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
+            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob,
+            std::int32_t* support_ids, float* support_probs, std::int32_t* support_n,
+            std::int32_t support_cap);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).

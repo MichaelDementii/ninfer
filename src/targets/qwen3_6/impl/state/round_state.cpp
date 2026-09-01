@@ -157,6 +157,19 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                        "MTP decode target continuation hidden");
         decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
                                             "MTP decode proposal logits");
+        // The draft's q by step: laid out [batch][drafts], the same as next_drafts.
+        decode.draft_probs =
+            add_tensor(builder, DType::FP32, {batch, drafts}, "MTP decode draft probabilities");
+        // The draft's support by step: 20 candidates per row, laid out [cap*batch][drafts].
+        decode.draft_support_ids =
+            add_tensor(builder, DType::I32, {20 * batch, drafts}, "MTP decode draft support ids");
+        decode.draft_support_probs = add_tensor(builder, DType::FP32, {20 * batch, drafts},
+                                                "MTP decode draft support probabilities");
+        decode.draft_support_n =
+            add_tensor(builder, DType::I32, {batch, drafts}, "MTP decode draft support sizes");
+        // The token q was recorded for: acceptance checks it against the verified draft.
+        decode.draft_recorded_tokens =
+            add_tensor(builder, DType::I32, {batch, drafts}, "MTP decode recorded draft tokens");
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =
@@ -278,6 +291,11 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     target_hidden    = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
+    draft_probs                = layout.draft_probs.bind(backing);
+    draft_support_ids          = layout.draft_support_ids.bind(backing);
+    draft_support_probs        = layout.draft_support_probs.bind(backing);
+    draft_support_n            = layout.draft_support_n.bind(backing);
+    draft_recorded_tokens      = layout.draft_recorded_tokens.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);
     alignment_hidden           = layout.alignment_hidden.bind(backing);
     ar_hidden                  = layout.ar_hidden.bind(backing);

@@ -22,7 +22,9 @@ std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
+                         float* out_prob, std::int32_t* out_sup_idx, float* out_sup_prob,
+                         std::int32_t* out_sup_n, std::int32_t sup_cap) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t batch             = logits.ne[1];
     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
@@ -30,7 +32,8 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     if (!layout.multiblock) {
         sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
-            configs, positions, purpose, token_domain, physical_rows);
+            configs, positions, purpose, token_domain, physical_rows, out_prob, out_sup_idx,
+            out_sup_prob, out_sup_n, sup_cap);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -46,7 +49,7 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
-        partial_blocks, groups, scratch);
+        partial_blocks, groups, scratch, out_prob, out_sup_idx, out_sup_prob, out_sup_n, sup_cap);
     CUDA_CHECK(cudaGetLastError());
 }
 
