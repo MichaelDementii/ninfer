@@ -1,0 +1,166 @@
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh b/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
+index 47cb9d71..7dc58b18 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
+@@ -391,7 +391,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+ template <class Geometry, int BlockM>
+ __device__ __forceinline__ std::int64_t nvfp4_blocked_scale_offset(int token, int group) {
+     constexpr int kGroupsPerRow  = Geometry::kInputRows / 16;
+-    constexpr int kGroupsPerTile = 16;
++    constexpr int kGroupsPerTile = 8;
+     constexpr int kTilesPerPlane = kGroupsPerRow / kGroupsPerTile;
+     const int token_tile         = token / BlockM;
+     const int group_tile         = group / kGroupsPerTile;
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h b/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
+index 179405f5..79e7eb0b 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
+@@ -50,7 +50,7 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
+     return layout.peak_bytes(1);
+ }
+ 
+-// The TMA route reads activation scales one [256 tokens, 16 groups] tile per request, and wants
++// The TMA route reads activation scales one [256 tokens, 8 groups] tile per request, and wants
+ // that tile contiguous. Every route that shares make_nvfp4_w4a4_tma_descriptors asks the same
+ // question, so the predicate lives here.
+ inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh b/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
+index 02e2a2c4..3549a035 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
+@@ -47,6 +47,13 @@ inline CUtensorMap nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_typ
+     return map;
+ }
+ 
++// One stage of weight scales is a contiguous 1024-byte run. On the flat route -- one such
++// stream per stage -- describing it as four 256-byte rows instead of sixty-four 16-byte ones
++// leaves the bytes, their order and the shared image untouched and makes the route faster.
++// The fused SwiGLU route issues two of these streams a fixed large stride apart and gets slower
++// from the same descriptor, so it keeps 16-byte rows; both numbers are in the package notes.
++inline constexpr std::uint32_t kNvfp4WeightScaleRowBytes = 256;
++
+ template <class Geometry, int BlockM>
+ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* activation_codes,
+                                                         const std::uint8_t* activation_scales,
+@@ -55,10 +62,10 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
+                                                         std::int32_t tokens) {
+     static_assert(BlockM == 128 || BlockM == 256);
+     constexpr std::uint32_t kCodeColumns = 64;
+-    // Activation scales arrive tile-contiguous: one [BlockM tokens, 16 groups] tile is BlockM
+-    // bytes wide and 16 rows tall, so the request is wide instead of BlockM separate 16-byte ones.
+-    // A K128 tile consumes the first eight of the sixteen group bytes; the rest is look-ahead.
+-    constexpr std::uint32_t kScaleTileGroups = 16;
++    // Activation scales arrive tile-contiguous: one [BlockM tokens, 8 groups] tile is BlockM
++    // bytes wide and 8 rows tall, so the request is wide instead of BlockM separate 16-byte ones.
++    // Eight groups is exactly what a K128 stage consumes, so no scale byte is fetched twice.
++    constexpr std::uint32_t kScaleTileGroups = 8;
+     constexpr std::uint64_t kScaleTilesPerPlane =
+         static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
+     constexpr std::uint32_t kBlockN = 128;
+@@ -79,9 +86,13 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
+         (static_cast<std::uint64_t>(tokens) / BlockM) * kScaleTilesPerPlane * kScaleTileGroups,
+         BlockM, BlockM, kScaleTileGroups, CU_TENSOR_MAP_SWIZZLE_NONE,
+         "encode activation scales TMA");
+-    descriptors.b_scales = nvfp4_make_tma_2d(
+-        const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
+-        kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
++    static_assert(kWeightScaleBytes % kNvfp4WeightScaleRowBytes == 0,
++                  "weight scale plane must be a whole number of 256-byte rows");
++    descriptors.b_scales =
++        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
++                          kNvfp4WeightScaleRowBytes, kWeightScaleBytes / kNvfp4WeightScaleRowBytes,
++                          kNvfp4WeightScaleRowBytes, kNvfp4WeightScaleRowBytes, 4,
++                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
+     return descriptors;
+ }
+ 
+@@ -106,7 +117,7 @@ struct Nvfp4W4a4TmaSchedule {
+     static constexpr int kMmaM             = kWarpM / 16;
+     static constexpr int kMmaN             = kWarpN / 8;
+     static constexpr int kK64PerStage      = 2;
+-    static constexpr int kScaleWordsPerRow = 4;
++    static constexpr int kScaleWordsPerRow = 2;
+     static constexpr int kCodeRowBytes     = 64;
+     static constexpr int kMinBlocksPerSm   = MinBlocksPerSm;
+ };
+@@ -231,15 +242,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+                                   &shared.full[stage]);
+                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
+-                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
++                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 8;
+                 const int scale_tile =
+-                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
+-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0,
+-                                  scale_tile * 16, &shared.full[stage]);
+-                const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
+-                                         k_tile * Schedule::kK64PerStage) *
+-                                        32;
+-                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0, b_scale_row,
++                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile;
++                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0, scale_tile * 8,
++                                  &shared.full[stage]);
++                const int b_scale_bytes = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
++                                           k_tile * Schedule::kK64PerStage) *
++                                          32 * 16;
++                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0,
++                                  b_scale_bytes / static_cast<int>(kNvfp4WeightScaleRowBytes),
+                                   &shared.full[stage]);
+             }
+         }
+@@ -290,8 +302,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+                             a_fragments[mma_m][3], smem_addr(address));
+                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
+                 a_scales[mma_m] =
+-                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow +
+-                                            (k_tile & 1) * Schedule::kK64PerStage + local_k64];
++                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow + local_k64];
+             }
+ 
+ #pragma unroll
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+index 1e2a990b..19b7de64 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+@@ -20,8 +20,9 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
+                                          const std::uint8_t* weight_codes,
+                                          const std::uint8_t* weight_scales, std::int32_t tokens) {
+     constexpr std::uint32_t kCodeColumns = 64;
+-    // Activation scales arrive tile-contiguous, one [BlockM tokens, 16 groups] tile per request.
+-    constexpr std::uint32_t kScaleTileGroups = 16;
++    // Activation scales arrive tile-contiguous, one [BlockM tokens, 8 groups] tile per request:
++    // eight groups is exactly what a K128 stage consumes.
++    constexpr std::uint32_t kScaleTileGroups = 8;
+     constexpr std::uint64_t kScaleTilesPerPlane =
+         static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
+     constexpr std::uint32_t kPairN = Schedule::kBlockN / 2;
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
+index 25f44019..67607338 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
+@@ -107,11 +107,11 @@ __global__ __launch_bounds__(
+                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
+                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                   pair_begin + kIntermediate, &shared.full[stage]);
+-                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
++                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 8;
+                 const int scale_tile =
+-                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
+-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0,
+-                                  scale_tile * 16, &shared.full[stage]);
++                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile;
++                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0, scale_tile * 8,
++                                  &shared.full[stage]);
+ 
+                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
+                                             k_tile * Schedule::kK64PerStage) *
+@@ -174,8 +174,7 @@ __global__ __launch_bounds__(
+                             a_fragments[mma_m][3], smem_addr(address));
+                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
+                 a_scales[mma_m] =
+-                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow +
+-                                            (k_tile & 1) * Schedule::kK64PerStage + local_k64];
++                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow + local_k64];
+             }
+ 
+ #pragma unroll

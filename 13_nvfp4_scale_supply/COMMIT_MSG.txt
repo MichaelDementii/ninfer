@@ -1,0 +1,36 @@
+perf(nvfp4): fetch exactly the scale bytes a stage consumes
+
+The TMA route's scale traffic did not match what the stage reads.
+
+Activation scales: the descriptor described a [BlockM tokens, 16 groups] tile, but a K128
+stage consumes eight of the sixteen group bytes per token. The producer therefore fetched
+every tile twice -- once for the even k-tile and once for the odd one -- and the consumer
+picked its half with a (k_tile & 1) selector. An eight-group tile is exactly one stage's
+worth, so the second fetch and the selector both go away. The stage drops from 29696 to
+27648 bytes, and the quantizer writes the same scale byte at the matching offset.
+
+Weight scales: one stage's weight scales are already a contiguous 1024-byte run, but the
+box described it as 16 bytes by 64 rows, so TMA issued sixty-four small requests instead of
+four 256-byte ones. Widening the box moves no bytes and leaves the shared image identical.
+
+The wider weight-scale box is applied to the flat route only. The fused SwiGLU route issues
+two such streams per stage a fixed large stride apart, and there the same descriptor makes
+the kernel 9% slower with nine times the run-to-run spread while its register and shared
+usage stay identical -- contention that depends on addresses, not extra work. Measured, so
+the fused route keeps its 16-byte rows; a comment next to the constant records why.
+
+Measured on RTX 5090 (sm_120a), qwen3_8_27b_nvfp4, int8 KV, prefill chunk 4096, T=4096,
+palindromic A B B A ordering:
+
+  linear_add [5120, 17408]     589.8 -> 577.5 us   (0.977)
+  linear_add [5120, 6144]      251.9 -> 245.8      (0.976)
+  fused SwiGLU [34816, 5120]  1181.7 -> 1171.5     (0.991)
+
+Per-kernel GPU time over a 32768-token prefill (nsys --cuda-graph-trace=node), which is the
+instrument that resolves this: all nvfp4 kernels 948.5 -> 936.7 ms (0.987), total prefill
+GPU time 4069.3 -> 4057.7 ms (0.997). The decode SwiGLU route and the quantizer are
+unchanged to three digits. Prefill wall clock cannot resolve a change this size and is not
+offered as evidence.
+
+Greedy generation matches the base bit for bit on four prompts. Decode is untouched by
+construction: the route needs at least 256 tokens.

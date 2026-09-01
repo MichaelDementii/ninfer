@@ -1,0 +1,27 @@
+=== стенд подвоза, форма плоского ядра (90_harness/tmascale2.cu) ===
+nvfp4, stadia podvoza: dva ostavshihsya defekta. T=4096, K=17408, N=5120
+
+kak seychas (paket 12)                         389.4 mks    6637 GB/s  stadia 29696 B
++ masshtaby vesov korobkoy 256x4               369.4 mks    6996 GB/s  stadia 29696 B   x0.9486
++ masshtaby aktivaciy taylom na 8 grupp        365.1 mks    6592 GB/s  stadia 27648 B   x0.9374
+oba                                            341.1 mks    7055 GB/s  stadia 27648 B   x0.8759
+
+povtor:
+kak seychas (paket 12)                         386.3 mks    6691 GB/s  stadia 29696 B   x0.9919
+oba                                            338.1 mks    7118 GB/s  stadia 27648 B   x0.8681
+
+=== стенд подвоза, форма СЛИТОГО SwiGLU (90_harness/tmawbox.cu) ===
+forma slitogo SwiGLU: dva potoka masshtabov vesov na stadiyu
+
+stroka  16 B, zaprosov na stadiyu 64:  sred   790.6  min   789.2  max   792.9 mks   x0.9953
+stroka  64 B, zaprosov na stadiyu 16:  sred   677.8  min   676.3  max   679.9 mks   x0.8533
+stroka 128 B, zaprosov na stadiyu  8:  sred   677.8  min   677.3  max   678.7 mks   x0.8533
+stroka 256 B, zaprosov na stadiyu  4:  sred   677.7  min   675.9  max   679.7 mks   x0.8532
+
+povtor:
+stroka  16 B, zaprosov na stadiyu 64:  sred   787.9  min   787.3  max   788.3 mks   x0.9919
+stroka 256 B, zaprosov na stadiyu  4:  sred   676.9  min   675.6  max   677.8 mks   x0.8522
+
+ВЫВОД СТЕНДА: широкая коробка масштабов весов выигрывает на ОБЕИХ формах, и промежуточные
+ширины 64/128 неотличимы от 256. В движке на слитом маршруте это оказалось неправдой — см.
+следующий файл. Стенд подвоза слитое ядро не предсказывает.
