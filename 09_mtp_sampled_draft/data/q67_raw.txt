@@ -1,0 +1,78 @@
+=== что меняет 09 (на своей базе) ===
+ include/ninfer/ops/sampling.h                      | 15 ++++-
+ include/ninfer/ops/speculative_round.h             | 11 +++-
+ src/ops/kernel/sampling.cuh                        | 61 ++++++++++++++++--
+ src/ops/kernel/sampling_device.cuh                 | 39 +++++++++++
+ src/ops/kernel/speculative_round.cuh               | 65 +++++++++++++++++--
+ src/ops/launcher/sampling.cu                       | 10 ++-
+ src/ops/launcher/sampling.h                        |  5 +-
+ src/ops/launcher/speculative_round.cu              | 34 +++++++++-
+ src/ops/launcher/speculative_round.h               |  8 ++-
+ src/ops/wrapper/sampling.cpp                       | 14 +++-
+ src/ops/wrapper/speculative_round.cpp              | 19 +++++-
+ .../export/ninfer/targets/qwen3_6/round_state.h    | 10 +++
+ src/targets/qwen3_6/impl/runtime/mtp_impl.h        | 42 ++++++++++--
+ src/targets/qwen3_6/impl/runtime/schedule.h        |  8 +++
+ .../qwen3_6/impl/runtime/speculative_target_impl.h | 14 +++-
+ src/targets/qwen3_6/impl/runtime/text_context.h    | 11 +++-
+ .../qwen3_6/impl/runtime/text_context_impl.h       | 75 +++++++++++++++++++++-
+ src/targets/qwen3_6/impl/state/round_state.cpp     | 18 ++++++
+ 18 files changed, 425 insertions(+), 34 deletions(-)
+
+=== пробую перенести на upstream/master ===
+Auto-merging include/ninfer/ops/sampling.h
+Auto-merging include/ninfer/ops/speculative_round.h
+Auto-merging src/ops/kernel/sampling.cuh
+CONFLICT (content): Merge conflict in src/ops/kernel/sampling.cuh
+Auto-merging src/ops/kernel/speculative_round.cuh
+Auto-merging src/ops/launcher/sampling.cu
+Auto-merging src/ops/launcher/sampling.h
+Auto-merging src/ops/wrapper/sampling.cpp
+Auto-merging src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h
+Auto-merging src/targets/qwen3_6/impl/runtime/mtp_impl.h
+CONFLICT (content): Merge conflict in src/targets/qwen3_6/impl/runtime/mtp_impl.h
+Auto-merging src/targets/qwen3_6/impl/runtime/schedule.h
+Auto-merging src/targets/qwen3_6/impl/runtime/speculative_target_impl.h
+Auto-merging src/targets/qwen3_6/impl/runtime/text_context.h
+CONFLICT (content): Merge conflict in src/targets/qwen3_6/impl/runtime/text_context.h
+Auto-merging src/targets/qwen3_6/impl/runtime/text_context_impl.h
+Auto-merging src/targets/qwen3_6/impl/state/round_state.cpp
+error: could not apply ce71f787... perf(mtp): sample the speculative draft instead of taking its argmax
+hint: after resolving the conflicts, mark the corrected paths
+hint: with 'git add <paths>' or 'git rm <paths>'
+--- конфликты ---
+src/ops/kernel/sampling.cuh
+src/targets/qwen3_6/impl/runtime/mtp_impl.h
+src/targets/qwen3_6/impl/runtime/text_context.h
+--- размер конфликтов по файлам ---
+src/ops/kernel/sampling.cuh: 2 гнёзд, 351 строк
+src/targets/qwen3_6/impl/runtime/mtp_impl.h: 3 гнёзд, 328 строк
+src/targets/qwen3_6/impl/runtime/text_context.h: 1 гнёзд, 350 строк
+
+=== апстримный коммит, который переписал ту же область ===
+commit 70434721b1ae29d0616f3de9b376c8a4d91590b5
+Author: Neroued <neroued@gmail.com>
+Date:   Fri Aug 28 15:56:43 2026 +0800
+
+    fix(engine): close tool output and sampling contracts
+
+ apps/cli/options.cpp                               |   4 +-
+ docs/cli.md                                        |   2 +-
+ docs/maintainer/engine-architecture.md             |   2 +-
+ docs/serving.md                                    |   5 +-
+ include/ninfer/ops/sampling.h                      |  20 ++-
+ include/ninfer/ops/speculative_round.h             |   9 +-
+ include/ninfer/types.h                             |  12 +-
+ src/CMakeLists.txt                                 |   1 -
+ src/ops/kernel/sampling.cuh                        |  39 ++--
+ src/ops/kernel/speculative_round.cuh               | 134 +++++++++++++-
+ src/ops/launcher/sampling.cu                       |  16 ++
+ src/ops/launcher/sampling.h                        |   3 +
+ src/ops/wrapper/sampling.cpp                       |  16 ++
+ src/runtime/contract/sampling.cpp                  |   8 +-
+ src/runtime/engine/engine_core.h                   |   1 +
+ src/serve/generation_service.cpp                   |  54 +++---
+ src/serve/generation_service.h                     |  10 +-
+ src/serve/http_server.cpp                          |  43 ++---
+ src/serve/serve_options.cpp                        |   5 +-
+Q67_DONE

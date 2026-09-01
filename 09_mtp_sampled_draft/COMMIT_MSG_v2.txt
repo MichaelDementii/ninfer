@@ -1,0 +1,37 @@
+perf(mtp): sample the speculative draft instead of taking its argmax
+
+The proposal head proposes greedily, so its distribution q is a single point and the acceptance
+rule degenerates into "accept with probability p(x*)" under the truncated target. Drawing the
+draft from the head's own truncated distribution makes the expected acceptance sum_x min(p, q)
+instead of E[p(argmax q)], which is larger whenever the target keeps useful mass outside its mode.
+
+The sampler returns the probability of the chosen token together with its whole truncated support,
+the acceptance kernel applies min(1, p/q), and a rejection resamples from the normalised residual
+(p - q)+. Both schemes are exact speculative sampling: the output distribution equals the truncated
+target before and after, only the fraction of accepted drafts moves. With a one-point q every
+formula collapses to the previous one, so under --greedy the result has to match bit for bit, and
+it does.
+
+The q buffer lives in device rows while drafts travel through the host ingress and egress, and
+rows are reassigned when a request finishes. The token q was recorded for is therefore stored next
+to it: on a mismatch the position is rejected and the replacement is drawn from the full truncated
+p, which is an ordinary non-speculative step. The distribution is preserved exactly; the cost is
+one lost speculation per change of tenant.
+
+Measured on RTX 5090, sm_120a, CUDA 13.1.115, qwen3_8_27b_nvfp4, KV int8, MTP3 with
+--lm-head-draft, eight prose prompts of 256 new tokens each.
+
+  arm            rounds  drafted  accepted  acceptance  tokens/round  tok/s
+  master            861     2571      1175      45.70%         2.365  145.27
+  this, off         861     2571      1175      45.70%         2.365  142.47
+  this, on          727     2172      1153      53.08%         2.586  158.99
+
+The off arm reproduces master to the token, which is the control that matters: an earlier
+implementation passed the q pointer unconditionally while filling it only under the flag, so the
+disabled arm read zeros, u*q < p degenerated into p > 0, and the baseline reported 88.28%
+acceptance instead of 45.70%. The pointer is now bound under the same condition as the fill.
+
+Under --greedy all three arms agree to the token (729 rounds, 2177 drafted, 1240 accepted,
+56.96%), and greedy generation over three ~15K-token prompts matches master byte for byte.
+
+ctest is 97 of 98; ninfer_qwen3_6_frontend_test fails on clean master too.

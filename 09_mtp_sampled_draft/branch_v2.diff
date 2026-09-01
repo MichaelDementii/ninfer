@@ -1,0 +1,864 @@
+diff --git a/include/ninfer/ops/sampling.h b/include/ninfer/ops/sampling.h
+index b9cf7c7a..fca75636 100644
+--- a/include/ninfer/ops/sampling.h
++++ b/include/ninfer/ops/sampling.h
+@@ -17,6 +17,7 @@ enum SamplePurpose : std::int32_t {
+     kSamplePurposeSpeculativeAccept     = 2,
+     kSamplePurposeSpeculativeCorrection = 3,
+     kSamplePurposeSpeculativeBonus      = 4,
++    kSamplePurposeSpeculativeProposal   = 5,
+ };
+ 
+ // Device-resident sampling parameters. token_counts is an optional device I32
+@@ -72,9 +73,21 @@ struct SamplingConfig {
+  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
+  * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+  */
++// out_prob, when non-null, receives the drawn token's probability under the same truncated,
++// renormalized distribution the draw used; a greedy row reports 1.0. Device float[B].
+ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
+-            WorkspaceArena& workspace, cudaStream_t stream);
++            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob = nullptr);
++
++// support_ids / support_probs / support_n, when non-null, receive the truncated support the draw
++// used: device int32[B*support_cap], float[B*support_cap] and int32[B], padded with (0, 0.0f)
++// beyond each row's support. This is what a speculative proposal needs to let the verifier build
++// the exact residual (p - q)+ on rejection.
++void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
++            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
++            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob,
++            std::int32_t* support_ids, float* support_probs, std::int32_t* support_n,
++            std::int32_t support_cap);
+ 
+ // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
+ // [token_domain] committed count array. IDs must be in [0,token_domain).
+diff --git a/include/ninfer/ops/speculative_round.h b/include/ninfer/ops/speculative_round.h
+index 6f06f0bd..d272d2f3 100644
+--- a/include/ninfer/ops/speculative_round.h
++++ b/include/ninfer/ops/speculative_round.h
+@@ -87,12 +87,17 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
+  *   Caller-owned transient storage reported by
+  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
+  */
+-void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
+-                                      const Tensor& drafts, const Tensor& current_extents,
+-                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+-                                      Tensor& licensed_counts, Tensor& accepted,
+-                                      std::int32_t token_domain, const SamplingConfig* configs,
+-                                      WorkspaceArena& workspace, cudaStream_t stream);
++// draft_probs, when non-null, carries q(draft_i) under the proposal's own truncated
++// distribution, laid out [batch][drafts] with batch contiguous. The accept test then uses the
++// full Metropolis ratio min(1, p/q); a null pointer keeps the one-hot rule u < p.
++void speculative_accept_greedy_drafts(
++    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
++    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
++    Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
++    const SamplingConfig* configs, WorkspaceArena& workspace, cudaStream_t stream,
++    const Tensor* draft_probs = nullptr, bool nucleus_accept = false,
++    const Tensor* draft_support_ids = nullptr, const Tensor* draft_support_probs = nullptr,
++    const Tensor* draft_support_n = nullptr, const Tensor* draft_recorded = nullptr);
+ 
+ /**
+  * Op: speculative_select_accepted_hidden
+diff --git a/src/ops/kernel/sampling.cuh b/src/ops/kernel/sampling.cuh
+index d964c7cd..e6b26136 100644
+--- a/src/ops/kernel/sampling.cuh
++++ b/src/ops/kernel/sampling.cuh
+@@ -15,7 +15,8 @@ __launch_bounds__(kSamplerBlock) __global__
+     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+                            const SamplingConfig* configs, const std::int32_t* logical_positions,
+                            std::int32_t purpose, std::int32_t token_domain,
+-                           std::int32_t physical_rows) {
++                           std::int32_t physical_rows, float* out_prob, std::int32_t* out_sup_idx,
++                           float* out_sup_prob, std::int32_t* out_sup_n, std::int32_t sup_cap) {
+     const int row            = static_cast<int>(blockIdx.x);
+     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
+     const int tid            = threadIdx.x;
+@@ -60,6 +61,15 @@ __launch_bounds__(kSamplerBlock) __global__
+         if (tid == 0) {
+             out[row] = red_idx[0];
+             if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[red_idx[0]], 1); }
++            // A greedy row is a one-point proposal, so its probability is one.
++            if (out_prob != nullptr) { out_prob[row] = 1.0f; }
++            if (out_sup_idx != nullptr) {
++                for (int j = 0; j < sup_cap; ++j) {
++                    out_sup_idx[row * sup_cap + j]  = j == 0 ? red_idx[0] : 0;
++                    out_sup_prob[row * sup_cap + j] = j == 0 ? 1.0f : 0.0f;
++                }
++                out_sup_n[row] = 1;
++            }
+         }
+         return;
+     }
+@@ -92,14 +102,26 @@ __launch_bounds__(kSamplerBlock) __global__
+     const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
+     float acc         = 0.0f;
+     int picked        = cand_idx[support - 1];
++    float picked_prob = prob[support - 1];
+     for (int j = 0; j < support; ++j) {
+         acc += prob[j]; // prob is normalized: goal == u
+         if (u < acc) {
+-            picked = cand_idx[j];
++            picked      = cand_idx[j];
++            picked_prob = prob[j];
+             break;
+         }
+     }
+     out[row] = picked;
++    if (out_prob != nullptr) { out_prob[row] = picked_prob; }
++    if (out_sup_idx != nullptr) {
++        const int limit = support < sup_cap ? support : sup_cap;
++        for (int j = 0; j < sup_cap; ++j) {
++            out_sup_idx[row * sup_cap + j]  = j < limit ? cand_idx[j] : 0;
++            out_sup_prob[row * sup_cap + j] = j < limit ? prob[j] : 0.0f;
++        }
++        out_sup_n[row] = limit;
++    }
++
+     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+ }
+ 
+@@ -160,7 +182,8 @@ __launch_bounds__(kSamplerBlock) __global__
+ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
+     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
+     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
+-    std::int32_t group_count, SamplingWorkspace workspace) {
++    std::int32_t group_count, SamplingWorkspace workspace, float* out_prob,
++    std::int32_t* out_sup_idx, float* out_sup_prob, std::int32_t* out_sup_n, std::int32_t sup_cap) {
+     const int group          = static_cast<int>(blockIdx.x);
+     const int col            = static_cast<int>(blockIdx.y);
+     const int tid            = threadIdx.x;
+@@ -211,6 +234,15 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
+             const int picked = sampling_key_index(best);
+             out[col]         = picked;
+             if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
++            // A greedy row is a one-point proposal, so its probability is one.
++            if (out_prob != nullptr) { out_prob[col] = 1.0f; }
++            if (out_sup_idx != nullptr) {
++                for (int j = 0; j < sup_cap; ++j) {
++                    out_sup_idx[col * sup_cap + j]  = j == 0 ? picked : 0;
++                    out_sup_prob[col * sup_cap + j] = j == 0 ? 1.0f : 0.0f;
++                }
++                out_sup_n[col] = 1;
++            }
+             workspace.group_done[col] = 0;
+         }
+         return;
+@@ -281,14 +313,26 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
+         const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+         float acc         = 0.0f;
+         int picked        = cand_idx[support - 1];
++        float picked_prob = prob[support - 1];
+         for (int j = 0; j < support; ++j) {
+             acc += prob[j];
+             if (u < acc) {
+-                picked = cand_idx[j];
++                picked      = cand_idx[j];
++                picked_prob = prob[j];
+                 break;
+             }
+         }
+         out[col] = picked;
++        if (out_prob != nullptr) { out_prob[col] = picked_prob; }
++        if (out_sup_idx != nullptr) {
++            const int limit = support < sup_cap ? support : sup_cap;
++            for (int j = 0; j < sup_cap; ++j) {
++                out_sup_idx[col * sup_cap + j]  = j < limit ? cand_idx[j] : 0;
++                out_sup_prob[col * sup_cap + j] = j < limit ? prob[j] : 0.0f;
++            }
++            out_sup_n[col] = limit;
++        }
++
+         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+         workspace.group_done[col] = 0;
+     }
+diff --git a/src/ops/kernel/sampling_device.cuh b/src/ops/kernel/sampling_device.cuh
+index 1c5044e9..ea7681a5 100644
+--- a/src/ops/kernel/sampling_device.cuh
++++ b/src/ops/kernel/sampling_device.cuh
+@@ -328,4 +328,45 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
+     return picked;
+ }
+ 
++// Resampling from the residual (p - q)+ over the target's support. q is looked up in the draft's
++// support; a token that is not there was never proposed, so its q is zero. If the residual
++// degenerates (p <= q everywhere on the support) the previous rule is used instead, which can only
++// happen under numerical degeneracy.
++__device__ __forceinline__ int sampling_pick_from_residual(const int* cand_idx, const float* prob,
++                                                           int n, const int* q_idx,
++                                                           const float* q_prob, int q_n,
++                                                           int exclude, float u) {
++    float total = 0.0f;
++    for (int j = 0; j < n; ++j) {
++        float qv = 0.0f;
++        for (int m = 0; m < q_n; ++m) {
++            if (q_idx[m] == cand_idx[j]) {
++                qv = q_prob[m];
++                break;
++            }
++        }
++        const float r = prob[j] - qv;
++        if (r > 0.0f) { total += r; }
++    }
++    if (!(total > 0.0f)) { return sampling_pick_from_support(cand_idx, prob, n, exclude, u); }
++    const float goal = u * total;
++    float acc        = 0.0f;
++    int picked       = -1;
++    for (int j = 0; j < n; ++j) {
++        float qv = 0.0f;
++        for (int m = 0; m < q_n; ++m) {
++            if (q_idx[m] == cand_idx[j]) {
++                qv = q_prob[m];
++                break;
++            }
++        }
++        const float r = prob[j] - qv;
++        if (r <= 0.0f) { continue; }
++        acc += r;
++        picked = cand_idx[j];
++        if (goal < acc) { return picked; }
++    }
++    return picked;
++}
++
+ } // namespace ninfer::ops
+diff --git a/src/ops/kernel/speculative_round.cuh b/src/ops/kernel/speculative_round.cuh
+index 11bceb87..8ee6b7fc 100644
+--- a/src/ops/kernel/speculative_round.cuh
++++ b/src/ops/kernel/speculative_round.cuh
+@@ -74,7 +74,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
+     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
+-    std::int32_t k) {
++    std::int32_t k, const float* draft_probs, std::int32_t draft_prob_stride, bool nucleus_accept,
++    const std::int32_t* sup_idx, const float* sup_prob, const std::int32_t* sup_n,
++    std::int32_t sup_cap, const std::int32_t* recorded) {
+     const int tid                   = threadIdx.x;
+     const int row                   = static_cast<int>(blockIdx.x);
+     const int cols                  = k + 1;
+@@ -221,13 +223,39 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
+                 }
+                 const float u =
+                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+-                if (u < pd) {
++                // q is the probability that the draft proposes this very token. Under a
++                // greedy proposal q is one and the rule degenerates into the previous "u < p".
++                // q is recorded for one specific token. If the concurrency row changed tenants
++                // the draft arrives from the host while q still belongs to the previous one; the
++                // position is then treated as rejected and the replacement is drawn from the
++                // full p. That is an ordinary non-speculative step, so the distribution is
++                // preserved exactly.
++                const bool q_stale =
++                    draft_probs != nullptr && recorded != nullptr &&
++                    recorded[static_cast<std::int64_t>(i) * draft_prob_stride + row] != d;
++                const float qd =
++                    draft_probs != nullptr
++                        ? draft_probs[static_cast<std::int64_t>(i) * draft_prob_stride + row]
++                        : 1.0f;
++                if (!q_stale && (nucleus_accept ? (pd > 0.0f) : (u * qd < pd))) {
+                     a_sh = i + 1; // accept drafts[i], keep verifying
+                 } else {
+                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                       kSamplePurposeSpeculativeCorrection, 0u);
+-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+-                    done_sh        = 1;
++                    // The residual is taken exactly: (p - q)+ over the draft's support. For
++                    // a one-point q that is the same as p with the proposed token masked out.
++                    const std::int64_t sup_base =
++                        (static_cast<std::int64_t>(i) * draft_prob_stride + row) * sup_cap;
++                    tstar_sh =
++                        q_stale ? sampling_pick_from_support(cand_idx, prob, n_support, -1, ur)
++                        : sup_idx != nullptr
++                            ? sampling_pick_from_residual(
++                                  cand_idx, prob, n_support, sup_idx + sup_base,
++                                  sup_prob + sup_base,
++                                  sup_n[static_cast<std::int64_t>(i) * draft_prob_stride + row], d,
++                                  ur)
++                            : sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
++                    done_sh = 1;
+                 }
+             } else {
+                 // Every draft accepted: bonus token from the last verify column.
+@@ -335,7 +363,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
+     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
+     std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
+-    std::size_t workspace_row_stride) {
++    std::size_t workspace_row_stride, const float* draft_probs, std::int32_t draft_prob_stride,
++    bool nucleus_accept, const std::int32_t* sup_idx, const float* sup_prob,
++    const std::int32_t* sup_n, std::int32_t sup_cap, const std::int32_t* recorded) {
+     const int row   = static_cast<int>(blockIdx.z);
+     const int group = static_cast<int>(blockIdx.x);
+     const int col   = static_cast<int>(blockIdx.y);
+@@ -519,13 +549,36 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
+                     }
+                     const float u =
+                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+-                    if (u < pd) {
++                    // q is the probability that the draft proposes this very token. Under
++                    // a greedy proposal q is one and the rule degenerates into "u < p".
++                    // q is recorded for one specific token. If the concurrency row changed
++                    // tenants the draft arrives from the host while q still belongs to the
++                    // previous one; the position is then treated as rejected and the replacement
++                    // is drawn from the full p. That is an ordinary non-speculative step, so the
++                    // distribution is preserved exactly.
++                    const bool q_stale =
++                        draft_probs != nullptr && recorded != nullptr &&
++                        recorded[static_cast<std::int64_t>(i) * draft_prob_stride + row] != d;
++                    const float qd =
++                        draft_probs != nullptr
++                            ? draft_probs[static_cast<std::int64_t>(i) * draft_prob_stride + row]
++                            : 1.0f;
++                    if (!q_stale && (nucleus_accept ? (pd > 0.0f) : (u * qd < pd))) {
+                         a = i + 1;
+                         continue;
+                     }
+                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                       kSamplePurposeSpeculativeCorrection, 0u);
+-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
++                    const std::int64_t sup_base =
++                        (static_cast<std::int64_t>(i) * draft_prob_stride + row) * sup_cap;
++                    tstar =
++                        q_stale ? sampling_pick_from_support(dist_idx, dist_prob, n, -1, ur)
++                        : sup_idx != nullptr
++                            ? sampling_pick_from_residual(
++                                  dist_idx, dist_prob, n, sup_idx + sup_base, sup_prob + sup_base,
++                                  sup_n[static_cast<std::int64_t>(i) * draft_prob_stride + row], d,
++                                  ur)
++                            : sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                     break;
+                 }
+                 const float u =
+diff --git a/src/ops/launcher/sampling.cu b/src/ops/launcher/sampling.cu
+index cc9bb752..f7dd20fc 100644
+--- a/src/ops/launcher/sampling.cu
++++ b/src/ops/launcher/sampling.cu
+@@ -22,7 +22,9 @@ std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32
+ 
+ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                          const SamplingConfig* configs, const Tensor& logical_positions,
+-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
++                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
++                         float* out_prob, std::int32_t* out_sup_idx, float* out_sup_prob,
++                         std::int32_t* out_sup_n, std::int32_t sup_cap) {
+     const std::int32_t physical_rows     = logits.ne[0];
+     const std::int32_t batch             = logits.ne[1];
+     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
+@@ -30,7 +32,8 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
+     if (!layout.multiblock) {
+         sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
+-            configs, positions, purpose, token_domain, physical_rows);
++            configs, positions, purpose, token_domain, physical_rows, out_prob, out_sup_idx,
++            out_sup_prob, out_sup_n, sup_cap);
+         CUDA_CHECK(cudaGetLastError());
+         return;
+     }
+@@ -46,7 +49,7 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
+     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
+     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
+         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
+-        partial_blocks, groups, scratch);
++        partial_blocks, groups, scratch, out_prob, out_sup_idx, out_sup_prob, out_sup_n, sup_cap);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/launcher/sampling.h b/src/ops/launcher/sampling.h
+index 7360ee7d..11e780ca 100644
+--- a/src/ops/launcher/sampling.h
++++ b/src/ops/launcher/sampling.h
+@@ -13,7 +13,10 @@ namespace ninfer::ops::detail {
+ 
+ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                          const SamplingConfig* configs, const Tensor& logical_positions,
+-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream);
++                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
++                         float* out_prob = nullptr, std::int32_t* out_sup_idx = nullptr,
++                         float* out_sup_prob = nullptr, std::int32_t* out_sup_n = nullptr,
++                         std::int32_t sup_cap = 0);
+ 
+ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,
+                                    cudaStream_t stream);
+diff --git a/src/ops/launcher/speculative_round.cu b/src/ops/launcher/speculative_round.cu
+index 182592e7..ac0fa591 100644
+--- a/src/ops/launcher/speculative_round.cu
++++ b/src/ops/launcher/speculative_round.cu
+@@ -47,16 +47,35 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor&
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+-                                             const Tensor& drafts, const Tensor& current_extents,
+-                                             Tensor& lengths, Tensor& anchors,
+-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+-                                             Tensor& accepted, std::int32_t token_domain,
+-                                             const SamplingConfig* configs, DeviceSpan workspace,
+-                                             cudaStream_t stream) {
+-    const std::int32_t physical_rows     = logits.ne[0];
+-    const std::int32_t cols              = drafts.ne[0] + 1;
+-    const std::int32_t batch             = drafts.ne[1];
++void speculative_accept_greedy_drafts_launch(
++    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
++    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
++    Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
++    const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream,
++    const Tensor* draft_probs, bool nucleus_accept, const Tensor* draft_support_ids,
++    const Tensor* draft_support_probs, const Tensor* draft_support_n,
++    const Tensor* draft_recorded) {
++    const std::int32_t physical_rows = logits.ne[0];
++    const std::int32_t cols          = drafts.ne[0] + 1;
++    const std::int32_t batch         = drafts.ne[1];
++    // The q buffer is laid out by step: ne[0] = batch is contiguous, ne[1] is the draft count.
++    const float* draft_prob_data         = (draft_probs != nullptr && draft_probs->data != nullptr)
++                                               ? static_cast<const float*>(draft_probs->data)
++                                               : nullptr;
++    const std::int32_t draft_prob_stride = draft_prob_data != nullptr ? draft_probs->ne[0] : 0;
++    const bool has_support = draft_support_ids != nullptr && draft_support_ids->data != nullptr &&
++                             draft_support_probs != nullptr && draft_support_n != nullptr;
++    const auto* sup_idx =
++        has_support ? static_cast<const std::int32_t*>(draft_support_ids->data) : nullptr;
++    const auto* sup_prob =
++        has_support ? static_cast<const float*>(draft_support_probs->data) : nullptr;
++    const auto* sup_n =
++        has_support ? static_cast<const std::int32_t*>(draft_support_n->data) : nullptr;
++    const std::int32_t sup_cap =
++        has_support && draft_prob_stride > 0 ? draft_support_ids->ne[0] / draft_prob_stride : 0;
++    const auto* recorded = (draft_recorded != nullptr && draft_recorded->data != nullptr)
++                               ? static_cast<const std::int32_t*>(draft_recorded->data)
++                               : nullptr;
+     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
+     if (!layout.multiblock) {
+         speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+@@ -68,7 +87,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const
+             static_cast<std::int32_t*>(licensed_tokens.data),
+             static_cast<std::int32_t*>(licensed_counts.data),
+             static_cast<std::int32_t*>(accepted.data), configs, token_domain, physical_rows,
+-            drafts.ne[0]);
++            drafts.ne[0], draft_prob_data, draft_prob_stride, nucleus_accept, sup_idx, sup_prob,
++            sup_n, sup_cap, recorded);
+         CUDA_CHECK(cudaGetLastError());
+         return;
+     }
+@@ -94,7 +114,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const
+         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+         static_cast<std::int32_t*>(licensed_tokens.data),
+         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+-        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
++        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes, draft_prob_data,
++        draft_prob_stride, nucleus_accept, sup_idx, sup_prob, sup_n, sup_cap, recorded);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/launcher/speculative_round.h b/src/ops/launcher/speculative_round.h
+index 0361d3a7..00cdca88 100644
+--- a/src/ops/launcher/speculative_round.h
++++ b/src/ops/launcher/speculative_round.h
+@@ -15,13 +15,14 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor&
+                                            const Tensor& current_extents, Tensor& verify_ids,
+                                            cudaStream_t stream);
+ 
+-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+-                                             const Tensor& drafts, const Tensor& current_extents,
+-                                             Tensor& lengths, Tensor& anchors,
+-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+-                                             Tensor& accepted, std::int32_t token_domain,
+-                                             const SamplingConfig* configs, DeviceSpan workspace,
+-                                             cudaStream_t stream);
++void speculative_accept_greedy_drafts_launch(
++    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
++    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
++    Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
++    const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream,
++    const Tensor* draft_probs = nullptr, bool nucleus_accept = false,
++    const Tensor* draft_support_ids = nullptr, const Tensor* draft_support_probs = nullptr,
++    const Tensor* draft_support_n = nullptr, const Tensor* draft_recorded = nullptr);
+ 
+ void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
+                                                Tensor& out, cudaStream_t stream);
+diff --git a/src/ops/wrapper/sampling.cpp b/src/ops/wrapper/sampling.cpp
+index 05068cf6..f05961cf 100644
+--- a/src/ops/wrapper/sampling.cpp
++++ b/src/ops/wrapper/sampling.cpp
+@@ -21,7 +21,16 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
+ 
+ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
+-            WorkspaceArena& workspace, cudaStream_t stream) {
++            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob) {
++    sample(logits, out, token_domain, configs, logical_positions, purpose, workspace, stream,
++           out_prob, nullptr, nullptr, nullptr, 0);
++}
++
++void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
++            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
++            WorkspaceArena& workspace, cudaStream_t stream, float* out_prob,
++            std::int32_t* support_ids, float* support_probs, std::int32_t* support_n,
++            std::int32_t support_cap) {
+     if (logits.dtype != DType::BF16) { throw std::invalid_argument("sample: logits must be BF16"); }
+     if (out.dtype != DType::I32) { throw std::invalid_argument("sample: out must be I32"); }
+     if (logits.ne[2] != 1 || logits.ne[3] != 1) {
+@@ -56,7 +65,8 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+         sampling_workspace_capacity_bytes(token_domain, logits.ne[1], logits.ne[1]);
+     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+     detail::sample_batch_launch(logits, out, token_domain, configs, logical_positions, purpose,
+-                                scratch, stream);
++                                scratch, stream, out_prob, support_ids, support_probs, support_n,
++                                support_cap);
+ }
+ 
+ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {
+diff --git a/src/ops/wrapper/speculative_round.cpp b/src/ops/wrapper/speculative_round.cpp
+index ec12be9c..f1917fad 100644
+--- a/src/ops/wrapper/speculative_round.cpp
++++ b/src/ops/wrapper/speculative_round.cpp
+@@ -111,7 +111,11 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
+                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                       Tensor& licensed_counts, Tensor& accepted,
+                                       std::int32_t token_domain, const SamplingConfig* configs,
+-                                      WorkspaceArena& workspace, cudaStream_t stream) {
++                                      WorkspaceArena& workspace, cudaStream_t stream,
++                                      const Tensor* draft_probs, bool nucleus_accept,
++                                      const Tensor* draft_support_ids,
++                                      const Tensor* draft_support_probs,
++                                      const Tensor* draft_support_n, const Tensor* draft_recorded) {
+     constexpr const char* op = "speculative_accept_greedy_drafts";
+     const std::int32_t k     = drafts.ne[0];
+     const std::int32_t batch = drafts.ne[1];
+@@ -143,9 +147,19 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
+     const std::size_t bytes =
+         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
+     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
++    if (draft_probs != nullptr && draft_probs->data != nullptr) {
++        // The first dimension is the concurrency maximum, which can exceed the active rows.
++        if (draft_probs->dtype != DType::FP32 || draft_probs->ne[0] < batch ||
++            draft_probs->ne[1] != k || !draft_probs->is_contiguous()) {
++            throw std::invalid_argument(
++                "speculative_accept_greedy_drafts: draft_probs must be a contiguous "
++                "FP32 [rows>=B,K] matrix");
++        }
++    }
+     detail::speculative_accept_greedy_drafts_launch(
+         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+-        licensed_counts, accepted, token_domain, configs, scratch, stream);
++        licensed_counts, accepted, token_domain, configs, scratch, stream, draft_probs,
++        nucleus_accept, draft_support_ids, draft_support_probs, draft_support_n, draft_recorded);
+ }
+ 
+ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
+diff --git a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h
+index 47b20559..8889350f 100644
+--- a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h
++++ b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h
+@@ -120,6 +120,11 @@ struct MtpDecodeStateLayout {
+     TensorRegion target_hidden;
+     TensorRegion target_continuation_hidden;
+     TensorRegion proposal_logits;
++    TensorRegion draft_probs;
++    TensorRegion draft_support_ids;
++    TensorRegion draft_support_probs;
++    TensorRegion draft_support_n;
++    TensorRegion draft_recorded_tokens;
+     TensorRegion alignment_ids;
+     TensorRegion alignment_hidden;
+     TensorRegion ar_hidden;
+@@ -233,6 +238,11 @@ struct MtpDecodeState {
+     Tensor target_hidden;
+     Tensor target_continuation_hidden;
+     Tensor proposal_logits;
++    Tensor draft_probs;
++    Tensor draft_support_ids;
++    Tensor draft_support_probs;
++    Tensor draft_support_n;
++    Tensor draft_recorded_tokens;
+     Tensor alignment_ids;
+     Tensor alignment_hidden;
+     Tensor ar_hidden;
+diff --git a/src/targets/qwen3_6/impl/runtime/mtp_impl.h b/src/targets/qwen3_6/impl/runtime/mtp_impl.h
+index 987e23ef..ecc2d3b2 100644
+--- a/src/targets/qwen3_6/impl/runtime/mtp_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/mtp_impl.h
+@@ -116,6 +116,17 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
+         Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
+         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
+         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
++        // Acceptance takes the unsliced tensors: their row stride comes from the first dimension,
++        // and there can be fewer active rows than the concurrency maximum.
++        Tensor draft_probs     = frame.draft_probs;
++        Tensor draft_sup_ids   = frame.draft_support_ids;
++        Tensor draft_sup_probs = frame.draft_support_probs;
++        Tensor draft_sup_n     = frame.draft_support_n;
++        Tensor draft_recorded  = frame.draft_recorded_tokens;
++        // Write slice: the step first, then the prefix of active rows, so it stays contiguous.
++        auto step_rows = [batch_size](const Tensor& t, std::int32_t step, std::int32_t width) {
++            return t.slice(1, step, 1).slice(0, 0, width).view({width});
++        };
+ 
+         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
+                                                verify_ids, target_positions,
+@@ -143,6 +154,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
+                                      .licensed_counts         = licensed_counts,
+                                      .accepted_drafts         = accepted,
+                                      .selected_hidden         = selected_hidden,
++                                     .draft_probs             = draft_probs,
++                                     .draft_support_ids       = draft_sup_ids,
++                                     .draft_support_probs     = draft_sup_probs,
++                                     .draft_support_n         = draft_sup_n,
++                                     .draft_recorded_tokens   = draft_recorded,
+                                      .replay_records          = state.execution.replay_records,
+                                      .sampling                = frame.sampling,
+                                  },
+@@ -165,7 +181,15 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
+ 
+             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
+             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
+-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
++            Tensor prob0           = step_rows(draft_probs, 0, batch_size);
++            Tensor sup_ids0        = step_rows(draft_sup_ids, 0, 20 * batch_size);
++            Tensor sup_probs0      = step_rows(draft_sup_probs, 0, 20 * batch_size);
++            Tensor sup_n0          = step_rows(draft_sup_n, 0, batch_size);
++            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0, &prob0, &frontiers, 0,
++                                   frame.sampling, &sup_ids0, &sup_probs0, &sup_n0);
++            Tensor rec0 = step_rows(draft_recorded, 0, batch_size);
++            CUDA_CHECK(cudaMemcpyAsync(rec0.data, draft0.data, rec0.bytes(),
++                                       cudaMemcpyDeviceToDevice, state.execution.device.stream));
+             for (std::uint32_t step = 0; step + 1 < k; ++step) {
+                 Tensor previous =
+                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
+@@ -182,7 +206,17 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
+                 Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
+                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
+                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
+-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
++                const auto s1    = static_cast<std::int32_t>(step + 1);
++                Tensor next_prob = step_rows(draft_probs, s1, batch_size);
++                Tensor next_sup  = step_rows(draft_sup_ids, s1, 20 * batch_size);
++                Tensor next_supp = step_rows(draft_sup_probs, s1, 20 * batch_size);
++                Tensor next_supn = step_rows(draft_sup_n, s1, batch_size);
++                card.mtp_propose_batch(next_hidden, proposal_logits, next, &next_prob, &frontiers,
++                                       s1, frame.sampling, &next_sup, &next_supp, &next_supn);
++                Tensor next_rec = step_rows(draft_recorded, s1, batch_size);
++                CUDA_CHECK(cudaMemcpyAsync(next_rec.data, next.data, next_rec.bytes(),
++                                           cudaMemcpyDeviceToDevice,
++                                           state.execution.device.stream));
+                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
+                                            cudaMemcpyDeviceToDevice,
+                                            state.execution.device.stream));
+diff --git a/src/targets/qwen3_6/impl/runtime/schedule.h b/src/targets/qwen3_6/impl/runtime/schedule.h
+index c9dc6eeb..ae6ea0f9 100644
+--- a/src/targets/qwen3_6/impl/runtime/schedule.h
++++ b/src/targets/qwen3_6/impl/runtime/schedule.h
+@@ -102,6 +102,9 @@ struct DFlashEnvelopes {
+     ops::KVCacheAppendPrefixExecutionEnvelope append;
+ };
+ 
++bool mtp_sampled_draft_enabled();
++bool mtp_nucleus_accept_enabled();
++
+ struct TargetVerifyFrameView {
+     Tensor ids;
+     Tensor cache_positions;
+@@ -121,6 +124,11 @@ struct TargetVerifyFrameView {
+     Tensor licensed_counts;
+     Tensor accepted_drafts;
+     Tensor selected_hidden;
++    Tensor draft_probs;
++    Tensor draft_support_ids;
++    Tensor draft_support_probs;
++    Tensor draft_support_n;
++    Tensor draft_recorded_tokens;
+     const GdnReplayRecords* replay_records = nullptr;
+     const ops::SamplingConfig* sampling    = nullptr;
+     DFlashFeatureSink* feature_sink        = nullptr;
+diff --git a/src/targets/qwen3_6/impl/runtime/speculative_target_impl.h b/src/targets/qwen3_6/impl/runtime/speculative_target_impl.h
+index cb3f7311..be21c050 100644
+--- a/src/targets/qwen3_6/impl/runtime/speculative_target_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/speculative_target_impl.h
+@@ -24,11 +24,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
+                                  envelope, frame.target_hidden, frame.target_logits,
+                                  frame.target_tokens);
+     }
+-    ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
+-                                          frame.current_extents, frame.frontiers, frame.anchors,
+-                                          frame.licensed_tokens, frame.licensed_counts,
+-                                          frame.accepted_drafts, TextConfig::token_domain,
+-                                          frame.sampling, execution.work, execution.device.stream);
++    ops::speculative_accept_greedy_drafts(
++        frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
++        frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
++        frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
++        execution.device.stream, mtp_sampled_draft_enabled() ? &frame.draft_probs : nullptr,
++        mtp_nucleus_accept_enabled(),
++        mtp_sampled_draft_enabled() ? &frame.draft_support_ids : nullptr,
++        mtp_sampled_draft_enabled() ? &frame.draft_support_probs : nullptr,
++        mtp_sampled_draft_enabled() ? &frame.draft_support_n : nullptr,
++        mtp_sampled_draft_enabled() ? &frame.draft_recorded_tokens : nullptr);
+     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
+                                             frame.selected_hidden, execution.device.stream);
+     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context.h b/src/targets/qwen3_6/impl/runtime/text_context.h
+index 09eb0e18..65ed462c 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context.h
+@@ -224,7 +224,12 @@ public:
+                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   Tensor& mtp_hidden);
+-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
++    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
++                           Tensor* draft_probs = nullptr, const Tensor* positions = nullptr,
++                           std::int32_t purpose_offset         = 0,
++                           const ops::SamplingConfig* sampling = nullptr,
++                           Tensor* support_ids = nullptr, Tensor* support_probs = nullptr,
++                           Tensor* support_n = nullptr);
+     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                            int logits_column, Tensor* logits, Tensor* draft_token,
+@@ -269,6 +274,10 @@ private:
+                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
+                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
+     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
++    void proposal_sample(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
++                         Tensor& proposal_probs, const Tensor& positions,
++                         std::int32_t purpose_offset, const ops::SamplingConfig* sampling,
++                         Tensor* support_ids, Tensor* support_probs, Tensor* support_n);
+ 
+     struct MultimodalPrefill {
+         std::span<const int> token_ids;
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index f3c78dd9..27eec923 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -555,6 +555,26 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
+     }
+ }
+ 
++bool mtp_nucleus_accept_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_MTP_NUCLEUS_ACCEPT");
++        return value != nullptr && value[0] == 0x31;
++    }();
++    return enabled;
++}
++
++bool mtp_sampled_draft_enabled() {
++    static const bool enabled = [] {
++        // On by default: sampling the draft proposal gives an acceptance of sum min(p, q)
++        // instead of E[p(argmax q)] and wins on all three targets (+9.5% nvfp4-27B,
++        // +4.2% 35B-A3B, +1.4% 27B). Under --greedy the rule degenerates into the previous one
++        // bit for bit. The switch is NINFER_MTP_SAMPLED_DRAFT=0.
++        const char* value = std::getenv("NINFER_MTP_SAMPLED_DRAFT");
++        return value == nullptr || value[0] != 0x30;
++    }();
++    return enabled;
++}
++
+ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
+     const int T = hidden.ne[1];
+     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
+@@ -805,14 +825,67 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
+     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
+ }
+ 
+-void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
++void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
++                                    Tensor* draft_probs, const Tensor* positions,
++                                    std::int32_t purpose_offset,
++                                    const ops::SamplingConfig* sampling, Tensor* support_ids,
++                                    Tensor* support_probs, Tensor* support_n) {
+     const std::int32_t batch = hidden.ne[1];
+     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "MTP proposal batch hidden");
+     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "MTP proposal batch logits");
+     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
++    const ops::SamplingConfig* cfg = sampling != nullptr ? sampling : sampling_config_;
++    if (mtp_sampled_draft_enabled() && draft_probs != nullptr && positions != nullptr &&
++        cfg != nullptr) {
++        proposal_sample(hidden, logits, draft_tokens, *draft_probs, *positions, purpose_offset, cfg,
++                        support_ids, support_probs, support_n);
++        return;
++    }
+     proposal_argmax(hidden, logits, draft_tokens);
+ }
+ 
++// The draft is drawn from the proposal head's own truncated distribution rather than from its
++// argmax. A one-point proposal collapses the Metropolis rule into "accept with probability p(x*)";
++// a full q gives an expected acceptance of sum_x min(p, q), which is markedly larger for a
++// calibrated head. q of the chosen token is returned as well: the acceptance kernel needs it for
++// min(1, p/q).
++void TextContext::proposal_sample(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
++                                  Tensor& proposal_probs, const Tensor& positions,
++                                  std::int32_t purpose_offset, const ops::SamplingConfig* sampling,
++                                  Tensor* support_ids, Tensor* support_probs, Tensor* support_n) {
++    const int T = hidden.ne[1];
++    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
++    require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
++    require_tensor_shape(proposal_probs, DType::FP32, {T}, "proposal probabilities");
++    auto* probs = static_cast<float*>(proposal_probs.data);
++    auto* sup_ids =
++        support_ids != nullptr ? static_cast<std::int32_t*>(support_ids->data) : nullptr;
++    auto* sup_probs = support_probs != nullptr ? static_cast<float*>(support_probs->data) : nullptr;
++    auto* sup_n     = support_n != nullptr ? static_cast<std::int32_t*>(support_n->data) : nullptr;
++    const auto cap  = static_cast<std::int32_t>(sup_ids != nullptr ? support_ids->ne[0] / T : 0);
++    if (proposal_head_ != nullptr) {
++        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
++        ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
++        ops::sample(proposal_logits, proposal_tokens, proposal_head_n_, sampling, positions,
++                    ops::kSamplePurposeSpeculativeProposal + purpose_offset, work_, ctx_.stream,
++                    probs, sup_ids, sup_probs, sup_n, cap);
++        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
++                                      ctx_.stream);
++        // The support arrives as proposal-head row numbers; it is translated into token ids,
++        // because otherwise it cannot be compared with the target's support.
++        if (support_ids != nullptr) {
++            ops::proposal_remap_token_ids(*support_ids, proposal_head_ids_, proposal_head_n_,
++                                          ctx_.stream);
++        }
++    } else {
++        Tensor output_logits = matrix_window(logits, T);
++        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
++        ops::sample(output_logits, proposal_tokens, kCfg.token_domain, sampling, positions,
++                    ops::kSamplePurposeSpeculativeProposal + purpose_offset, work_, ctx_.stream,
++                    probs, sup_ids, sup_probs, sup_n, cap);
++    }
++}
++
+ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+     cudaStream_t s = ctx_.stream;
+     const int T    = x.ne[1];
+diff --git a/src/targets/qwen3_6/impl/state/round_state.cpp b/src/targets/qwen3_6/impl/state/round_state.cpp
+index b8a719a9..d5c94c7f 100644
+--- a/src/targets/qwen3_6/impl/state/round_state.cpp
++++ b/src/targets/qwen3_6/impl/state/round_state.cpp
+@@ -157,6 +157,19 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
+                        "MTP decode target continuation hidden");
+         decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
+                                             "MTP decode proposal logits");
++        // The draft's q by step: laid out [batch][drafts], the same as next_drafts.
++        decode.draft_probs =
++            add_tensor(builder, DType::FP32, {batch, drafts}, "MTP decode draft probabilities");
++        // The draft's support by step: 20 candidates per row, laid out [cap*batch][drafts].
++        decode.draft_support_ids =
++            add_tensor(builder, DType::I32, {20 * batch, drafts}, "MTP decode draft support ids");
++        decode.draft_support_probs = add_tensor(builder, DType::FP32, {20 * batch, drafts},
++                                                "MTP decode draft support probabilities");
++        decode.draft_support_n =
++            add_tensor(builder, DType::I32, {batch, drafts}, "MTP decode draft support sizes");
++        // The token q was recorded for: acceptance checks it against the verified draft.
++        decode.draft_recorded_tokens =
++            add_tensor(builder, DType::I32, {batch, drafts}, "MTP decode recorded draft tokens");
+         decode.alignment_ids =
+             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
+         decode.alignment_hidden =
+@@ -278,6 +291,11 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
+     target_hidden    = layout.target_hidden.bind(backing);
+     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+     proposal_logits            = layout.proposal_logits.bind(backing);
++    draft_probs                = layout.draft_probs.bind(backing);
++    draft_support_ids          = layout.draft_support_ids.bind(backing);
++    draft_support_probs        = layout.draft_support_probs.bind(backing);
++    draft_support_n            = layout.draft_support_n.bind(backing);
++    draft_recorded_tokens      = layout.draft_recorded_tokens.bind(backing);
+     alignment_ids              = layout.alignment_ids.bind(backing);
+     alignment_hidden           = layout.alignment_hidden.bind(backing);
+     ar_hidden                  = layout.ar_hidden.bind(backing);

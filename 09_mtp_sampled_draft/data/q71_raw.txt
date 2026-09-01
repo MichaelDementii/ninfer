@@ -1,0 +1,35 @@
+=== жадная генерация: мастер против 09 (вкл по умолчанию) ===
+промпт 1: совпало побитово
+промпт 2: совпало побитово
+промпт 3: совпало побитово
+
+=== формат ===
+  include/ninfer/ops/speculative_round.h: 20
+  src/ops/kernel/sampling.cuh: 12
+  src/ops/kernel/sampling_device.cuh: 7
+  src/ops/kernel/speculative_round.cuh: 22
+  src/ops/launcher/sampling.cu: 3
+  src/ops/launcher/speculative_round.cu: 45
+  src/ops/launcher/speculative_round.h: 21
+  src/ops/wrapper/sampling.cpp: 4
+  src/ops/wrapper/speculative_round.cpp: 3
+  src/targets/qwen3_6/impl/runtime/mtp_impl.h: 20
+  src/targets/qwen3_6/impl/runtime/speculative_target_impl.h: 27
+  src/targets/qwen3_6/impl/runtime/text_context_impl.h: 21
+  src/targets/qwen3_6/impl/state/round_state.cpp: 12
+  (пусто выше = чисто)
+
+=== ctest ===
+ctest RC=8
+99% tests passed, 1 tests failed out of 98
+The following tests FAILED:
+
+6bc9d69b perf(mtp): sample the speculative draft instead of taking its argmax
+ src/targets/qwen3_6/impl/runtime/schedule.h        |  8 +++
+ .../qwen3_6/impl/runtime/speculative_target_impl.h | 14 +++-
+ src/targets/qwen3_6/impl/runtime/text_context.h    | 11 +++-
+ .../qwen3_6/impl/runtime/text_context_impl.h       | 76 +++++++++++++++++++++-
+ src/targets/qwen3_6/impl/state/round_state.cpp     | 18 +++++
+ 18 files changed, 422 insertions(+), 30 deletions(-)
+бандл готов
+Q71_DONE

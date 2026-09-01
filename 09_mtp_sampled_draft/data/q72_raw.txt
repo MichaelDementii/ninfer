@@ -1,0 +1,14 @@
+=== после clang-format ===
+суммарное расхождение: 0
+сборка RC=0
+
+=== контроль после форматирования: жадная генерация против мастера ===
+промпт 1: совпало побитово
+промпт 2: совпало побитово
+промпт 3: совпало побитово
+f1d8cd32 perf(mtp): sample the speculative draft instead of taking its argmax
+ .../qwen3_6/impl/runtime/text_context_impl.h       | 75 +++++++++++++++++++++-
+ src/targets/qwen3_6/impl/state/round_state.cpp     | 18 ++++++
+ 18 files changed, 419 insertions(+), 54 deletions(-)
+бандл обновлён
+Q72_DONE
