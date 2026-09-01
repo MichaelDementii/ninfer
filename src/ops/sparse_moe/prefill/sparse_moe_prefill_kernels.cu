@@ -254,6 +254,10 @@ constexpr int kExpertBM                = 64;
 constexpr int kExpertBN                = 64;
 constexpr int kExpertBK                = 64;
 constexpr int kExpertStages            = 2;
+// The W8 pair decodes its codes into shared memory, so a weight tile stays resident one iteration
+// longer than an activation tile: three buffers keep the issue ahead of the multiply without a
+// second barrier. The activation path stays at kExpertStages.
+constexpr int kW8WeightStages          = 3;
 constexpr int kExpertWarps             = 8;
 constexpr int kExpertThreads           = 32 * kExpertWarps;
 constexpr int kRtx5090SmCount          = 170;
@@ -473,10 +477,10 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count) {
-    __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+    __shared__ __align__(16) __nv_bfloat16 As[kExpertStages][kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Sr[kExpertBM * 16];
+    __shared__ __align__(16) std::uint8_t Cr[kW8WeightStages][kExpertBM * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Sr[kW8WeightStages][kExpertBM * 16];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -527,7 +531,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
             }
         };
 
-        auto stage_weight = [&](int kt) {
+        auto stage_weight = [&](int stage, int kt) {
             constexpr int groups_per_tile   = kExpertBK / 32;
             constexpr int scale_cache_tiles = 8 / groups_per_tile;
             const int group0                = kt * groups_per_tile;
@@ -536,29 +540,32 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                 const int chunk = item - row * (kExpertBK / 16);
                 const std::int64_t gi =
                     static_cast<std::int64_t>(global_row(row)) * groups_per_row + group0;
-                cp_async<16, Cache::cg>(&Cr[row * kExpertBK + chunk * 16],
+                cp_async<16, Cache::cg>(&Cr[stage][row * kExpertBK + chunk * 16],
                                         &codes[gi * 32 + chunk * 16]);
             }
             if ((kt % scale_cache_tiles) == 0) {
+                const int scale_stage = (kt / scale_cache_tiles) % kW8WeightStages;
                 for (int row = tid; row < kExpertBM; row += kExpertThreads) {
                     const std::int64_t gi =
                         static_cast<std::int64_t>(global_row(row)) * groups_per_row + group0;
-                    cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
+                    cp_async<16, Cache::cg>(&Sr[scale_stage][row * 16], &scales[gi * 2]);
                 }
             }
         };
 
-        auto decode_weight = [&](int kt) {
+        auto decode_weight = [&](int a_stage, int stage, int kt) {
             constexpr int groups_per_tile   = kExpertBK / 32;
             constexpr int scale_cache_tiles = 8 / groups_per_tile;
             const int scale_offset          = (kt % scale_cache_tiles) * groups_per_tile * 2;
+            const int scale_stage           = (kt / scale_cache_tiles) % kW8WeightStages;
             const int half                  = lane >> 4;
             const int half_lane             = lane & 15;
             for (int row_pair = warp * 2; row_pair < kExpertBM; row_pair += kExpertWarps * 2) {
                 const int row = row_pair + half;
                 unsigned scale_pair =
                     half_lane == 0
-                        ? *reinterpret_cast<const std::uint32_t*>(&Sr[row * 16 + scale_offset])
+                        ? *reinterpret_cast<const std::uint32_t*>(
+                              &Sr[scale_stage][row * 16 + scale_offset])
                         : 0;
                 scale_pair = __shfl_sync(0xffffffffu, scale_pair, half * 16);
 #pragma unroll
@@ -567,32 +574,45 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                         static_cast<std::uint16_t>((scale_pair >> (group * 16)) & 0xffffu)));
                     const int col     = group * 32 + half_lane * 2;
                     const std::uint16_t packed =
-                        *reinterpret_cast<const std::uint16_t*>(&Cr[row * kExpertBK + col]);
+                        *reinterpret_cast<const std::uint16_t*>(
+                            &Cr[stage][row * kExpertBK + col]);
                     const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
                     const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                     const __nv_bfloat162 value = __floats2bfloat162_rn(
                         static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
+                    store_vec(&As[a_stage][row * kExpertBK + gemm_swz64(row, col)], value);
                 }
             }
         };
 
+        constexpr int kTiles = kHidden / kExpertBK;
         stage_x(0, 0);
-        stage_weight(0);
         cp_commit();
+#pragma unroll
+        for (int prologue = 0; prologue < kW8WeightStages; ++prologue) {
+            if (prologue < kTiles) { stage_weight(prologue % kW8WeightStages, prologue); }
+            cp_commit();
+        }
+        cp_wait<kW8WeightStages - 1>();
+        __syncthreads();
+        decode_weight(0, 0, 0);
 
 #pragma unroll 4
-        for (int kt = 0; kt < kHidden / kExpertBK; ++kt) {
-            const int stage = kt & 1;
-            cp_wait<0>();
+        for (int kt = 0; kt < kTiles; ++kt) {
+            const int x_stage = kt & 1;
+            const int next_kt = kt + 1;
+            if (next_kt < kTiles) {
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
             __syncthreads();
-            decode_weight(kt);
-            __syncthreads();
-
-            const int next = kt + 1;
-            if (next < kHidden / kExpertBK) {
-                stage_x(next & 1, next);
-                stage_weight(next);
+            if (next_kt < kTiles) {
+                decode_weight(next_kt & 1, next_kt % kW8WeightStages, next_kt);
+                if (next_kt < kTiles) { stage_x(next_kt & 1, next_kt); }
+                cp_commit();
+                const int next_w = next_kt + kW8WeightStages - 1;
+                if (next_w < kTiles) { stage_weight(next_w % kW8WeightStages, next_w); }
                 cp_commit();
             }
 
@@ -606,12 +626,12 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                     af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[x_stage][row * kExpertBK + gemm_swz64(row, col)]));
                     }
                     const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
                     ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                                smem_addr(&Bs[x_stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
                 };
                 load_fragments(0, 0);
 #pragma unroll
@@ -864,10 +884,10 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
     __nv_bfloat16* __restrict__ grouped_output, const float* __restrict__ routed_sum,
     const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens,
     const int* __restrict__ route_job_count) {
-    __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+    __shared__ __align__(16) __nv_bfloat16 As[kExpertStages][kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Sr[kExpertBM * 16];
+    __shared__ __align__(16) std::uint8_t Cr[kW8WeightStages][kExpertBM * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Sr[kW8WeightStages][kExpertBM * 16];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -913,7 +933,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
             }
         };
 
-        auto stage_weight = [&](int kt) {
+        auto stage_weight = [&](int stage, int kt) {
             constexpr int groups_per_tile   = kExpertBK / 32;
             constexpr int scale_cache_tiles = 8 / groups_per_tile;
             const int group0                = kt * groups_per_tile;
@@ -923,30 +943,33 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
                 const int global_row = (Routed ? expert * kHidden : 0) + row0 + row;
                 const std::int64_t gi =
                     static_cast<std::int64_t>(global_row) * groups_per_row + group0;
-                cp_async<16, Cache::cg>(&Cr[row * kExpertBK + chunk * 16],
+                cp_async<16, Cache::cg>(&Cr[stage][row * kExpertBK + chunk * 16],
                                         &codes[gi * 32 + chunk * 16]);
             }
             if ((kt % scale_cache_tiles) == 0) {
+                const int scale_stage = (kt / scale_cache_tiles) % kW8WeightStages;
                 for (int row = tid; row < kExpertBM; row += kExpertThreads) {
                     const int global_row = (Routed ? expert * kHidden : 0) + row0 + row;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(global_row) * groups_per_row + group0;
-                    cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
+                    cp_async<16, Cache::cg>(&Sr[scale_stage][row * 16], &scales[gi * 2]);
                 }
             }
         };
 
-        auto decode_weight = [&](int kt) {
+        auto decode_weight = [&](int a_stage, int stage, int kt) {
             constexpr int groups_per_tile   = kExpertBK / 32;
             constexpr int scale_cache_tiles = 8 / groups_per_tile;
             const int scale_offset          = (kt % scale_cache_tiles) * groups_per_tile * 2;
+            const int scale_stage           = (kt / scale_cache_tiles) % kW8WeightStages;
             const int half                  = lane >> 4;
             const int half_lane             = lane & 15;
             for (int row_pair = warp * 2; row_pair < kExpertBM; row_pair += kExpertWarps * 2) {
                 const int row = row_pair + half;
                 unsigned scale_pair =
                     half_lane == 0
-                        ? *reinterpret_cast<const std::uint32_t*>(&Sr[row * 16 + scale_offset])
+                        ? *reinterpret_cast<const std::uint32_t*>(
+                              &Sr[scale_stage][row * 16 + scale_offset])
                         : 0;
                 scale_pair = __shfl_sync(0xffffffffu, scale_pair, half * 16);
 #pragma unroll
@@ -955,32 +978,45 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
                         static_cast<std::uint16_t>((scale_pair >> (group * 16)) & 0xffffu)));
                     const int col     = group * 32 + half_lane * 2;
                     const std::uint16_t packed =
-                        *reinterpret_cast<const std::uint16_t*>(&Cr[row * kExpertBK + col]);
+                        *reinterpret_cast<const std::uint16_t*>(
+                            &Cr[stage][row * kExpertBK + col]);
                     const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
                     const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                     const __nv_bfloat162 value = __floats2bfloat162_rn(
                         static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
+                    store_vec(&As[a_stage][row * kExpertBK + gemm_swz64(row, col)], value);
                 }
             }
         };
 
+        constexpr int kTiles = kIntermediate / kExpertBK;
         stage_x(0, 0);
-        stage_weight(0);
         cp_commit();
+#pragma unroll
+        for (int prologue = 0; prologue < kW8WeightStages; ++prologue) {
+            if (prologue < kTiles) { stage_weight(prologue % kW8WeightStages, prologue); }
+            cp_commit();
+        }
+        cp_wait<kW8WeightStages - 1>();
+        __syncthreads();
+        decode_weight(0, 0, 0);
 
 #pragma unroll
-        for (int kt = 0; kt < kIntermediate / kExpertBK; ++kt) {
-            const int stage = kt & 1;
-            cp_wait<0>();
+        for (int kt = 0; kt < kTiles; ++kt) {
+            const int x_stage = kt & 1;
+            const int next_kt = kt + 1;
+            if (next_kt < kTiles) {
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
             __syncthreads();
-            decode_weight(kt);
-            __syncthreads();
-
-            const int next = kt + 1;
-            if (next < kIntermediate / kExpertBK) {
-                stage_x(next & 1, next);
-                stage_weight(next);
+            if (next_kt < kTiles) {
+                decode_weight(next_kt & 1, next_kt % kW8WeightStages, next_kt);
+                if (next_kt < kTiles) { stage_x(next_kt & 1, next_kt); }
+                cp_commit();
+                const int next_w = next_kt + kW8WeightStages - 1;
+                if (next_w < kTiles) { stage_weight(next_w % kW8WeightStages, next_w); }
                 cp_commit();
             }
 
@@ -994,12 +1030,12 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                     af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[x_stage][row * kExpertBK + gemm_swz64(row, col)]));
                     }
                     const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
                     ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                                smem_addr(&Bs[x_stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
                 };
                 load_fragments(0, 0);
 #pragma unroll
