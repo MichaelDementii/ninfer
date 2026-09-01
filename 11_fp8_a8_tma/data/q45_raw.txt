@@ -1,0 +1,29 @@
+=== fp8 linear_add, k=17408 (MLP down), a8 ===
+# fp8_fp32_accumulate_peak_tflops=419.0 cache=cold
+pol         N        K      T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s     TC_%
+A8       5120    17408   1024     471.008     468.960     473.088      309.5     387.54    92.49
+A8       5120    17408   2048     911.392     909.280     913.408      222.1     400.57    95.60
+A8       5120    17408   4096    1785.856    1781.728    1787.904      176.7     408.85    97.58
+
+=== fp8 linear_add, k=6144 (выход GDN), a8 ===
+# fp8_fp32_accumulate_peak_tflops=419.0 cache=cold
+pol         N        K      T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s     TC_%
+A8       5120     6144   1024     176.128     176.096     177.120      369.2     365.78    87.30
+A8       5120     6144   2048     335.840     333.792     337.888      293.5     383.66    91.57
+A8       5120     6144   4096     647.168     645.120     649.216      256.0     398.19    95.03
+
+=== nvfp4 linear_add, те же формы для сравнения ===
+Usage: /root/ninfer_d4/build/bench/ninfer_nvfp4_linear_add_bench --n 5120 --k 6144|17408 [--policy a16|a4] [--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]
+ninfer_nvfp4_linear_add_bench: NVFP4 LinearAdd supports N=5120 and K=6144|17408
+
+=== fp8 swiglu ===
+Usage: /root/ninfer_d4/build/bench/ninfer_fp8_linear_swiglu_bench [--policy a16|a8] [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--profile]
+# fp8_fp32_accumulate_peak_tflops=419.0 cache=cold
+pol       T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s     TC_%
+A8     1024     815.104     813.056     815.136      275.4     447.88   106.89
+A8     2048    1597.440    1595.392    1599.520      169.4     457.07   109.09
+A8     4096    3183.616    3128.320    3225.600      114.0     458.69   109.47
+
+=== nvfp4 swiglu ===
+ninfer_nvfp4_linear_swiglu_bench: A16 policy is registered only through T=16
+Q45_DONE

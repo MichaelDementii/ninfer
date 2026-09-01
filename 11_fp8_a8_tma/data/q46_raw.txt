@@ -1,0 +1,40 @@
+=== nvfp4 linear_add k=17408 ===
+op          pol        N        K      T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s
+linear_add   A4     5120    17408   1024     202.784     202.752     204.832      526.5     900.15
+linear_add   A4     5120    17408   2048     380.928     378.880     382.976      428.9     958.38
+linear_add   A4     5120    17408   4096     733.184     731.104     737.280      377.3     995.85
+
+=== nvfp4 linear_add k=6144 ===
+op          pol        N        K      T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s
+linear_add   A4     5120     6144   1024      81.952      81.888      86.016      625.4     786.12
+linear_add   A4     5120     6144   2048     151.552     151.552     153.632      559.6     850.20
+linear_add   A4     5120     6144   4096     290.816     288.768     292.864      522.4     886.12
+
+=== nvfp4 swiglu a4 ===
+op             pol        N        K      T   median_us      min_us      p95_us   eff_GB/s    TFLOP/s
+linear_swiglu   A4    34816     5120   1024     405.504     399.360     409.600      361.1     900.29
+linear_swiglu   A4    34816     5120   2048     739.328     735.232     743.456      260.4     987.58
+linear_swiglu   A4    34816     5120   4096    1413.120    1409.024    1417.216      201.6    1033.38
+
+=== какие потолки объявлены в дереве ===
+/root/ninfer_d4/bench/ops/ninfer_bench_common.h:31:constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
+/root/ninfer_d4/bench/ops/ninfer_bench_common.h:60:inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
+/root/ninfer_d4/bench/ops/ninfer_bench_common.h:336:        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
+/root/ninfer_d4/bench/ops/fp8_linear_add_bench.cu:196:        std::printf("# fp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n", kFp8Fp32AccumulatePeak);
+/root/ninfer_d4/bench/ops/fp8_linear_swiglu_bench.cu:153:        std::printf("# fp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n", kFp8Fp32AccumulatePeak);
+/root/ninfer_d4/bench/ops/linear_bench.cu:161:    double tensor_peak_tflops      = std::numeric_limits<double>::quiet_NaN();
+/root/ninfer_d4/bench/ops/linear_bench.cu:541:double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
+/root/ninfer_d4/bench/ops/linear_bench.cu:598:    result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
+/root/ninfer_d4/bench/ops/linear_bench.cu:599:    if (std::isfinite(result.tensor_peak_tflops)) {
+/root/ninfer_d4/bench/ops/linear_bench.cu:600:        result.tensor_peak_pct = result.useful_tflops / result.tensor_peak_tflops * 100.0;
+/root/ninfer_d4/bench/ops/linear_bench.cu:777:           "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
+/root/ninfer_d4/bench/ops/linear_bench.cu:789:        if (std::isfinite(result.tensor_peak_tflops)) { out << result.tensor_peak_tflops; }
+
+=== что мерил мой mmapeak ===
+3:// bf16 и s8 служат проверкой харнеса: прошлая кампания намерила на этой же карте
+13:__global__ __launch_bounds__(WARPS * 32) void bf16_peak(float* sink) {
+25:                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+49:                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+72:            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+107:    run("bf16", bf16_peak, 16.0, sink);
+Q46_DONE

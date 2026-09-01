@@ -1,0 +1,20 @@
+сборка после clang-format RC=0
+ninfer_linear_fp8_a8_test RC=0 : OK FP8 A8 Linear
+ninfer_linear_add_fp8_test RC=0 : OK FP8 linear_add
+ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+
+=== контрольный замер после форматирования ===
+префилл U6  мс=4073.3  ток/с=8045
+
+=== ветка ===
+745d8a06 perf(fp8): stage the A8 GEMM through TMA with warp specialization
+ src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu |  15 +
+ src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu   |  11 +
+ src/ops/linear/fp8/fp8_a8.cu                     |  33 ++-
+ src/ops/linear/fp8/fp8_a8_schedule.cuh           |  17 ++
+ src/ops/linear/fp8/fp8_a8_tma.cuh                | 351 +++++++++++++++++++++++
+ src/ops/linear_add/fp8/fp8_linear_add_a8.cu      |  13 +-
+ 6 files changed, 438 insertions(+), 2 deletions(-)
+бандл и диф готовы
+Q57_DONE

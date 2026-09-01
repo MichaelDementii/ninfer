@@ -1,0 +1,35 @@
+perf(fp8): stage the A8 GEMM through TMA with warp specialization
+
+The cp.async kernel keeps two stages because Stages * (BlockTokens + BlockRows) * BlockK has to
+fit the shared budget twice over: the schedule 64x128x128 at two CTAs per SM is the only point
+where the largest tile still leaves room for a second resident block. A sweep of thirteen
+schedules confirmed it — every point that drops MinBlocksPerSm to one loses 0.5% to 6.2%, and
+every point that raises it to four by shrinking K loses 3.0%. The resulting 72-85% of the fp8
+ceiling is a property of the structure, not of the tuning.
+
+The nvfp4 route already solved this differently: dedicated producer threads issue
+cp.async.bulk.tensor under an mbarrier ring, consumers wait on their own stage instead of a
+block-wide barrier, and one CTA per SM with a 256-token tile beats two CTAs with a 64-token one.
+This applies the same structure to fp8. Row scales make it simpler than the nvfp4 case: two tensor
+descriptors instead of four, and the scales are read straight from global in the epilogue.
+
+The K tile is 64 bytes, the same transfer width the nvfp4 kernel uses, so the shared layout, the
+64B swizzle formula and the ldmatrix addressing carry over unchanged.
+
+Accumulation order does not change: the same 32-wide MMA steps run over K in the same order into
+the same fp32 accumulator. Only which thread owns which output and how the tile is staged differ,
+so the produced values are bit-identical. Greedy generation over four ~15K-token prompts matched
+the previous binary byte for byte.
+
+The route is registered for gdn_input_proj, attn_input_proj, linear and linear_add, and it is
+taken only when the token count is a whole multiple of the 256-token tile; everything else keeps
+the cp.async kernel. linear_swiglu still uses the paired-row form the TMA kernel does not carry.
+
+Measured on RTX 5090, sm_120a, CUDA 13.1.115, qwen3_8_27b_nvfp4, KV int8, prefill chunk 4096.
+Operator, ninfer_linear_bench at T=4096 with the arm order alternated: 16384x5120 0.977,
+14336x5120 0.946, 34816x5120 0.953, NVFP4 control 1.0000. In-graph per-kernel over a 32768-token
+prefill, two traces per arm: the fp8 GEMMs 3106.8 -> 2875.5 us (-7.45%), everything else -0.75%,
+the whole segment -3.21%. End-to-end prefill 4231.7 -> 4091.4 ms (-3.31%), 7744 -> 8009 tok/s.
+Decode is untouched: its token counts never reach the tile.
+
+ctest is 97 of 98; ninfer_qwen3_6_frontend_test fails on clean master too.

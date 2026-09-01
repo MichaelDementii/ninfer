@@ -1,0 +1,34 @@
+ПРЕФИЛЛ 2x32768 на da49c0d6, GPU 9294.8 мс
+ядро [N x K]                                                 n        мс      %    мкс/шт
+causal_attention_prompt_i8_kernel                          256    2239.4  24.09    8747.5
+nvfp4_linear_swiglu_w4a4_tma_kernel [34816x5120]           896    1413.6  15.21    1577.7
+fp8_mma_kernel [16384x5120]                                768    1329.9  14.31    1731.6
+[CUDA memcpy Host-to-Device]                              1004     901.2   9.70     897.6
+fp8_mma_kernel [5120x6144]                                1024     689.1   7.41     672.9
+nvfp4_w4a4_tma_kernel [5120x17408]                         896     646.3   6.95     721.3
+fp8_mma_kernel [34816x5120]                                144     468.7   5.04    3254.9
+fp8_mma_kernel [14336x5120]                                256     389.8   4.19    1522.7
+state_passing_kernel                                       768     267.0   2.87     347.7
+fp8_mma_kernel [5120x17408]                                128     244.8   2.63    1912.8
+prepare_wy_wu_kernel                                       768     137.6   1.48     179.2
+output_kernel                                              768     120.1   1.29     156.3
+causal_conv1d_prefill_pairs_kernel                         768     101.7   1.09     132.5
+nvfp4_w4a4_quantize_kernel                                1792      86.8   0.93      48.5
+rmsnorm_warp_bf16x2_kernel                                1440      71.3   0.77      49.5
+rmsnorm_cta_bf16x2_kernel                                 2322      50.4   0.54      21.7
+bf16_gdn_gating_proj_gemm_mma_kernel                       768      37.1   0.40      48.3
+fp8_a8_quantize_kernel                                    2320      35.5   0.38      15.3
+l2norm_warp_bf16x2_kernel                                 1536      17.5   0.19      11.4
+sigmoid_gate_mul_bf16x8_kernel                             288      12.9   0.14      44.9
+nvfp4_linear_swiglu_decode_kernel                          112       7.0   0.08      62.9
+fp8_gemv_kernel [16384x5120]                                96       5.0   0.05      52.2
+
+=== КПД больших GEMM префилла ===
+  fp8_mma_kernel [34816x5120]: n=144, 468.7 мс, 3254.9 мкс/шт
+  fp8_mma_kernel [16384x5120]: n=768, 1329.9 мс, 1731.6 мкс/шт
+  fp8_mma_kernel [5120x6144]: n=1024, 689.1 мс, 672.9 мкс/шт
+  nvfp4_linear_swiglu_w4a4_tma_kernel [34816x5120]: n=896, 1413.6 мс, 1577.7 мкс/шт
+  nvfp4_w4a4_tma_kernel [5120x17408]: n=896, 646.3 мс, 721.3 мкс/шт
+  fp8_mma_kernel [14336x5120]: n=256, 389.8 мс, 1522.7 мкс/шт
+  fp8_mma_kernel [5120x17408]: n=128, 244.8 мс, 1912.8 мкс/шт
+Q44_DONE
