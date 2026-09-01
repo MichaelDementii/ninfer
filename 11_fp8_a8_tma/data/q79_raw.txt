@@ -1,0 +1,25 @@
+07016549 perf(fp8): stage the A8 GEMM through TMA with warp specialization
+пропатчен src/ops/linear/fp8/fp8_a8_tma.cuh
+пропатчен src/ops/linear/fp8/fp8_a8_schedule.cuh
+неполный тайл поддержан
+  формат src/ops/linear/fp8/fp8_a8_tma.cuh: 0
+  формат src/ops/linear/fp8/fp8_a8_schedule.cuh: 0
+сборка RC=0
+  ninfer_linear_fp8_a8_test RC=0 : OK FP8 A8 Linear
+  ninfer_linear_add_fp8_test RC=0 : OK FP8 linear_add
+  ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+  ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+  ninfer_linear_swiglu_fp8_test RC=0 : OK LinearSwiGLU FP8 correctness
+
+=== промпт, не кратный чанку: 30000 (7x4096 + 1712) ===
+  U0  мс=3782.8 ток/с=7931
+  U8  мс=3662.7 ток/с=8191
+  U9  мс=3675.7 ток/с=8162
+  U9  мс=3680.0 ток/с=8152
+  U8  мс=3674.3 ток/с=8165
+  U0  мс=3815.5 ток/с=7863
+
+=== кратный 32768, контроль что не сломали ===
+  U8  мс=4083.4 ток/с=8025
+  U9  мс=4087.9 ток/с=8016
+Q79_DONE

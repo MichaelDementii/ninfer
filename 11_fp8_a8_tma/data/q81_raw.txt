@@ -1,0 +1,11 @@
+c36abef0 perf(fp8): stage the A8 GEMM through TMA with warp specialization
+ src/ops/linear_add/fp8/fp8_linear_add_a8.cu       |  13 +-
+ src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu |  13 +
+ 7 files changed, 468 insertions(+), 2 deletions(-)
+формат суммарно: 0
+кириллица: 0
+ctest RC=8
+99% tests passed, 1 tests failed out of 98
+The following tests FAILED:
+бандл обновлён
+Q81_DONE

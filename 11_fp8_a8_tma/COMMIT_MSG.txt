@@ -37,3 +37,11 @@ the whole segment -3.00%. End-to-end prefill 4247.0 -> 4089.5 ms (-3.71%), 7716 
 Decode is untouched at 16.5226 -> 16.5007 ms per round: its token counts never reach the tile.
 
 ctest is 97 of 98; ninfer_qwen3_6_frontend_test fails on clean master too.
+
+A trailing token tile does not have to be full. TMA zero-fills the rows past the descriptor's
+extent, so their accumulators are harmless as long as they are never stored and their activation
+scale is never read; the epilogue skips them. Without that, any chunk whose token count is not a
+multiple of 256 fell back to cp.async entirely, which is the common case for the last chunk of a
+prompt. Prefill of a single unaligned chunk: 2000 tokens 218.94 -> 210.35 ms, 3000 tokens
+326.13 -> 314.09 ms, both against a master the aligned-only form reproduced exactly. On an aligned
+32768-token prompt the guard costs 0.11%.
