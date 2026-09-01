@@ -1,0 +1,7 @@
+пропатчен src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh
+баланс варпов вынесен в параметр
+база (без правки): 16151.5 мкс, пол модели 12546.8
+splits=2 (QK-варпов 8, PV-варпов 8): median=16152.576 мкс | тест: softmax_attention: PASS
+splits=1 (QK-варпов 4, PV-варпов 12): median=16990.208 мкс | тест: softmax_attention: PASS
+splits=2 (QK-варпов 8, PV-варпов 8): median=16149.504 мкс | тест: softmax_attention: PASS
+Q73_DONE
