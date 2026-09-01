@@ -1,0 +1,310 @@
+diff --git a/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu b/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+index 56835368..66cceea1 100644
+--- a/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
++++ b/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+@@ -83,7 +83,7 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
+ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
+                                   cudaStream_t stream) {
+-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
++    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
+     const std::int32_t tokens = x.ne[1];
+     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+diff --git a/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu b/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+index f56a4cd0..f33fca8e 100644
+--- a/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
++++ b/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+@@ -37,7 +37,7 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
+ 
+ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
+-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
++    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
+     const std::int32_t tokens = x.ne[1];
+     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4.cu b/src/ops/linear/nvfp4/nvfp4_w4a4.cu
+index 156871fb..1fb451ac 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4.cu
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4.cu
+@@ -38,14 +38,21 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
+ 
+ template <class ActivationGeometry>
+ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
+-                           cudaStream_t stream) {
++                           bool blocked_scales, cudaStream_t stream) {
+     const std::int32_t tokens = x.ne[1];
+     constexpr int kThreads    = 256;
+     const std::int32_t tasks  = tokens * ActivationGeometry::kGroupsPerRow;
+-    nvfp4_w4a4_quantize_kernel<ActivationGeometry>
+-        <<<(tasks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++    const int blocks          = (tasks + kThreads - 1) / kThreads;
++    if (blocked_scales) {
++        nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, true, kNvfp4TmaBlockM>
++            <<<blocks, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
++                                              workspace.codes, workspace.scales, tokens,
++                                              weight.input_scale_divisor);
++    } else {
++        nvfp4_w4a4_quantize_kernel<ActivationGeometry><<<blocks, kThreads, 0, stream>>>(
+             static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
+             weight.input_scale_divisor);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -89,19 +96,22 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
+ } // namespace
+ 
+ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
+-                                cudaStream_t stream) {
++                                bool blocked_scales, cudaStream_t stream) {
+     if (workspace.codes == nullptr || workspace.scales == nullptr) {
+         throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
+     }
+     switch (weight.k) {
+     case Nvfp4Activation5120Geometry::kInputRows:
+-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, stream);
++        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, blocked_scales,
++                                                           stream);
+         return;
+     case Nvfp4Activation6144Geometry::kInputRows:
+-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, stream);
++        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, blocked_scales,
++                                                           stream);
+         return;
+     case Nvfp4Activation17408Geometry::kInputRows:
+-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream);
++        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, blocked_scales,
++                                                            stream);
+         return;
+     default:
+         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
+@@ -110,7 +120,7 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
+ 
+ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
+                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
+-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
++    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
+     const std::int32_t tokens = x.ne[1];
+     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
+     case Nvfp4Problem::AttnInput:
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh b/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
+index 675df5b9..47cb9d71 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
+@@ -384,11 +384,29 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+     }
+ }
+ 
+-template <class Geometry, int Threads = 256>
++// The TMA route reads a whole [BlockM tokens, 16 groups] tile of activation scales per request.
++// Row-major by token that tile is 16 bytes per row with the scale plane's row stride, so one stage
++// costs BlockM tiny requests. Writing the same bytes tile-contiguous makes the request wide. The
++// byte order inside a tile is unchanged, so the shared image the consumer reads is identical.
++template <class Geometry, int BlockM>
++__device__ __forceinline__ std::int64_t nvfp4_blocked_scale_offset(int token, int group) {
++    constexpr int kGroupsPerRow  = Geometry::kInputRows / 16;
++    constexpr int kGroupsPerTile = 16;
++    constexpr int kTilesPerPlane = kGroupsPerRow / kGroupsPerTile;
++    const int token_tile         = token / BlockM;
++    const int group_tile         = group / kGroupsPerTile;
++    const int tile               = token_tile * kTilesPerPlane + group_tile;
++    return static_cast<std::int64_t>(tile) * BlockM * kGroupsPerTile +
++           static_cast<std::int64_t>(token - token_tile * BlockM) * kGroupsPerTile +
++           (group - group_tile * kGroupsPerTile);
++}
++
++template <class Geometry, int Threads = 256, bool BlockedScales = false, int BlockM = 256>
+ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_kernel(
+     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+     std::uint8_t* __restrict__ scales, std::int32_t tokens, float input_scale_divisor) {
+     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
++    static_assert(!BlockedScales || (Geometry::kInputRows / 16) % 16 == 0);
+     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+     const int task =
+         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+@@ -403,7 +421,11 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
+     auto* code_destination =
+         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
+     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
+-    scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
++    if constexpr (BlockedScales) {
++        scales[nvfp4_blocked_scale_offset<Geometry, BlockM>(token, group)] = quantized.scale;
++    } else {
++        scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
++    }
+ }
+ 
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h b/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
+index 9695374c..179405f5 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
+@@ -50,8 +50,17 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
+     return layout.peak_bytes(1);
+ }
+ 
++// The TMA route reads activation scales one [256 tokens, 16 groups] tile per request, and wants
++// that tile contiguous. Every route that shares make_nvfp4_w4a4_tma_descriptors asks the same
++// question, so the predicate lives here.
++inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
++
++[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
++    return tokens >= 1024 && (tokens % kNvfp4TmaBlockM) == 0;
++}
++
+ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
+-                                cudaStream_t stream);
++                                bool blocked_scales, cudaStream_t stream);
+ 
+ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
+                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);
+diff --git a/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh b/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
+index aa6914ec..02e2a2c4 100644
+--- a/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
+@@ -55,10 +55,13 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
+                                                         std::int32_t tokens) {
+     static_assert(BlockM == 128 || BlockM == 256);
+     constexpr std::uint32_t kCodeColumns = 64;
+-    // TMA's innermost box is at least one 16-byte transaction. A K128 tile consumes the
+-    // first eight bytes of each row; the second half is harmless look-ahead.
+-    constexpr std::uint32_t kScaleColumns = 16;
+-    constexpr std::uint32_t kBlockN       = 128;
++    // Activation scales arrive tile-contiguous: one [BlockM tokens, 16 groups] tile is BlockM
++    // bytes wide and 16 rows tall, so the request is wide instead of BlockM separate 16-byte ones.
++    // A K128 tile consumes the first eight of the sixteen group bytes; the rest is look-ahead.
++    constexpr std::uint32_t kScaleTileGroups = 16;
++    constexpr std::uint64_t kScaleTilesPerPlane =
++        static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
++    constexpr std::uint32_t kBlockN = 128;
+     constexpr std::uint64_t kWeightScaleBytes =
+         static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
+ 
+@@ -72,9 +75,10 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
+         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
+         kBlockN, CU_TENSOR_MAP_SWIZZLE_64B, "encode weight codes TMA");
+     descriptors.a_scales = nvfp4_make_tma_2d(
+-        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+-        Geometry::kGroupsPerRow, tokens, Geometry::kGroupsPerRow, kScaleColumns, BlockM,
+-        CU_TENSOR_MAP_SWIZZLE_NONE, "encode activation scales TMA");
++        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, BlockM,
++        (static_cast<std::uint64_t>(tokens) / BlockM) * kScaleTilesPerPlane * kScaleTileGroups,
++        BlockM, BlockM, kScaleTileGroups, CU_TENSOR_MAP_SWIZZLE_NONE,
++        "encode activation scales TMA");
+     descriptors.b_scales = nvfp4_make_tma_2d(
+         const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
+         kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
+@@ -227,8 +231,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+                                   &shared.full[stage]);
+                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
+-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
+-                                  token_begin, &shared.full[stage]);
++                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
++                const int scale_tile =
++                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
++                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0,
++                                  scale_tile * 16, &shared.full[stage]);
+                 const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
+                                          k_tile * Schedule::kK64PerStage) *
+                                         32;
+diff --git a/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu b/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+index 4dc44ba3..0fdf7448 100644
+--- a/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
++++ b/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+@@ -56,7 +56,7 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
+ 
+ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
+-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
++    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
+     const std::int32_t tokens  = x.ne[1];
+     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
+     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+index 6bc17459..81dcf667 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+@@ -125,7 +125,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
+     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
+         auto scope                       = workspace.scope();
+         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
+-        launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
++        // Inside the TMA case, so this route always reads tile-contiguous scales. Note its own
++        // predicate admits every multiple of 256 from 256 up, which is wider than the shared one.
++        launch_nvfp4_w4a4_quantize(x, weight, scratch, true, stream);
+         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+         launch_nvfp4_linear_swiglu_w4a4_tma(
+             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+index 6c1d12f2..77baaa16 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+@@ -82,7 +82,8 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena&
+     auto scope = workspace.scope();
+     const Nvfp4W4a4Workspace scratch =
+         allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
+-    launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
++    // This route runs the MMA kernel, never TMA, so the scale plane stays row-major.
++    launch_nvfp4_w4a4_quantize(x, weight, scratch, false, stream);
+     launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
+ }
+ 
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+index 0127a8d1..1e2a990b 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+@@ -19,9 +19,12 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
+                                          const std::uint8_t* activation_scales,
+                                          const std::uint8_t* weight_codes,
+                                          const std::uint8_t* weight_scales, std::int32_t tokens) {
+-    constexpr std::uint32_t kCodeColumns  = 64;
+-    constexpr std::uint32_t kScaleColumns = 16;
+-    constexpr std::uint32_t kPairN        = Schedule::kBlockN / 2;
++    constexpr std::uint32_t kCodeColumns = 64;
++    // Activation scales arrive tile-contiguous, one [BlockM tokens, 16 groups] tile per request.
++    constexpr std::uint32_t kScaleTileGroups = 16;
++    constexpr std::uint64_t kScaleTilesPerPlane =
++        static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
++    constexpr std::uint32_t kPairN = Schedule::kBlockN / 2;
+     constexpr std::uint64_t kWeightScaleBytes =
+         static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
+ 
+@@ -34,10 +37,13 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
+         const_cast<std::uint8_t*>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
+         kPairN, CU_TENSOR_MAP_SWIZZLE_64B, "encode LinearSwiGLU weight codes TMA");
+-    descriptors.a_scales = nvfp4_make_tma_2d(
+-        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+-        Geometry::kGroupsPerRow, tokens, Geometry::kGroupsPerRow, kScaleColumns, Schedule::kBlockM,
+-        CU_TENSOR_MAP_SWIZZLE_NONE, "encode LinearSwiGLU activation scales TMA");
++    descriptors.a_scales =
++        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(activation_scales),
++                          CU_TENSOR_MAP_DATA_TYPE_UINT8, Schedule::kBlockM,
++                          (static_cast<std::uint64_t>(tokens) / Schedule::kBlockM) *
++                              kScaleTilesPerPlane * kScaleTileGroups,
++                          Schedule::kBlockM, Schedule::kBlockM, kScaleTileGroups,
++                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode LinearSwiGLU activation scales TMA");
+     descriptors.b_scales =
+         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                           16, kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
+index a7664c7d..25f44019 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh
+@@ -107,8 +107,11 @@ __global__ __launch_bounds__(
+                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
+                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                   pair_begin + kIntermediate, &shared.full[stage]);
+-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
+-                                  token_begin, &shared.full[stage]);
++                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
++                const int scale_tile =
++                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
++                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0,
++                                  scale_tile * 16, &shared.full[stage]);
+ 
+                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
+                                             k_tile * Schedule::kK64PerStage) *

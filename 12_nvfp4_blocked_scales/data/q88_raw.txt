@@ -1,0 +1,19 @@
+формат суммарно: 0
+кириллица: 0
+сборка после формата RC=0
+  ninfer_linear_add_nvfp4_test RC=0 : OK NVFP4 linear_add
+  ninfer_linear_nvfp4_a16_test RC=0 : OK NVFP4_A16 Linear
+  ninfer_linear_nvfp4_a4_test RC=0 : OK NVFP4_A4 Linear
+  ninfer_linear_swiglu_nvfp4_test RC=0 : OK LinearSwiGLU NVFP4 correctness
+  ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+  ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+ctest RC=8
+99% tests passed, 1 tests failed out of 98
+The following tests FAILED:
+5e7f45a9 perf(nvfp4): make the TMA route read activation scales tile-contiguous
+ .../nvfp4/nvfp4_linear_swiglu_w4a4.cu              |  3 ++-
+ .../nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu          | 20 +++++++++++------
+ .../nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh         |  7 ++++--
+ 11 files changed, 94 insertions(+), 34 deletions(-)
+бандл готов
+Q88_DONE

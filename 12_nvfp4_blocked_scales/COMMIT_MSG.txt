@@ -1,0 +1,34 @@
+perf(nvfp4): make the TMA route read activation scales tile-contiguous
+
+The activation scale descriptor is encoded as a 16-byte box over the scale plane, so one stage of
+the TMA pipeline asks for BlockM separate 16-byte transfers to deliver 4 KiB. The codes next to it
+travel as one 64-byte box per row and cost nothing like that.
+
+The cost is measurable in isolation. A producer-only kernel with the same four descriptors, the
+same 29 696-byte stage and the same three-deep mbarrier ring, with no math at all, takes 575.9 us
+where the real kernel takes 712.7 us: the supply alone is 81% of the kernel. Taking that stage
+apart, codes alone move at 6977 GB/s; adding the weight scales costs 14.8% of the time for 4.2%
+more bytes; adding the activation scales costs 73.0% of the time for 16.7% more bytes.
+
+Writing the same bytes tile-contiguous - one [BlockM tokens, 16 groups] tile per request - restores
+the codes-only rate: 356.0 us against 527.4 us for the same payload, 7009 GB/s against 4732. The
+byte order inside a tile is unchanged, so the shared image the consumer reads is identical and the
+consumer is untouched.
+
+The quantizer therefore writes the scale plane blocked when the GEMM that follows will take the TMA
+route, and keeps the row-major plane otherwise: the same buffer is read by the small-T and GEMV
+routes. The predicate is the route's own, and the fused SwiGLU route admits every multiple of 256
+from 256 up, which is wider than the shared one.
+
+Measured on RTX 5090, sm_120a, CUDA 13.1.115, qwen3_8_27b_nvfp4, KV int8, prefill chunk 4096.
+Operator at T=4096: linear_add [5120,17408] 712.7 -> 555.0 us (0.779), linear_add [5120,6144]
+256.0 -> 210.9 (0.824), fused SwiGLU [34816,5120] 1411.1 -> 1187.8 (0.842). Against a measured
+feedable ceiling of 1886 TOP/s for this MMA in the kernel's own 4x8 tile ratio, that moves the
+route from 54% to 70% of what the hardware can be fed. End-to-end prefill of 32768 tokens
+4214.5 -> 4096.8 ms (-2.79%), 7775 -> 7999 tok/s. Decode is untouched at 16.4553 -> 16.4249 ms per
+round: its token counts never reach the tile.
+
+Values are unchanged - only the address the scale byte is written to moves - and greedy generation
+over four ~15K-token prompts matches the previous binary byte for byte.
+
+ctest is 97 of 98; ninfer_qwen3_6_frontend_test fails on clean master too.

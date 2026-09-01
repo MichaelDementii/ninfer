@@ -1,0 +1,7 @@
+компиляция RC=255
+ptxas /tmp/tmpxft_00092919_00000000-7_mmapeak4.compute_120.ptx, line 6494; error   : Instruction 'mma with block scale' not supported on .target 'sm_120'
+ptxas /tmp/tmpxft_00092919_00000000-7_mmapeak4.compute_120.ptx, line 6494; error   : Feature '.kind::mxf4nvf4' not supported on .target 'sm_120'
+ptxas /tmp/tmpxft_00092919_00000000-7_mmapeak4.compute_120.ptx, line 6494; error   : Feature '.block_scale' not supported on .target 'sm_120'
+ptxas /tmp/tmpxft_00092919_00000000-7_mmapeak4.compute_120.ptx, line 6494; error   : Feature '.scale_vec::4X' not supported on .target 'sm_120'
+ptxas /tmp/tmpxft_00092919_00000000-7_mmapeak4.compute_120.ptx, line 6498; error   : Instruction 'mma with block scale' not supported on .target 'sm_120'
+Q83_DONE

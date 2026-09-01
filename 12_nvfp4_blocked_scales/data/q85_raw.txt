@@ -1,0 +1,26 @@
+пропатчен src/ops/linear/nvfp4/nvfp4_w4a4_plan.h
+пропатчен src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh
+пропатчен src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
+пропатчен src/ops/linear/nvfp4/nvfp4_w4a4.cu
+пропатчен src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+пропатчен src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+пропатчен src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+пропатчен src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+блочная раскладка масштабов заведена
+пропатчен src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+фьюзед-свиглу тоже поправлен
+сборка RC=0
+
+=== тесты nvfp4 ===
+  ninfer_linear_add_nvfp4_test RC=0 : OK NVFP4 linear_add
+  ninfer_linear_nvfp4_a16_test RC=0 : OK NVFP4_A16 Linear
+  ninfer_linear_nvfp4_a4_test RC=0 : OK NVFP4_A4 Linear
+  ninfer_linear_swiglu_nvfp4_test RC=0 : OK LinearSwiGLU NVFP4 correctness
+  ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+  ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+
+=== операторный бенч ===
+explicit                                     NVFP4  A4     5120    17408   4096     555.008     552.960     557.056      422.8   23.60   25.25    1315.56           -        -     23.60         -        -
+explicit                                     NVFP4  A4     5120     6144   4096     210.944     208.896     211.968      521.3   29.09   31.13    1221.64           -        -     29.09         -        -
+  (база: 712.704 и 256.000 мкс)
+Q85_DONE
