@@ -1,0 +1,27 @@
+src/ops/linear/fp8/fp8_a8_tma.cuh: 0
+src/ops/linear/fp8/fp8_a8.cu: 0
+src/ops/linear/fp8/fp8_a8_schedule.cuh: 0
+src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu: 0
+src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu: 0
+src/ops/linear_add/fp8/fp8_linear_add_a8.cu: 0
+src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu: 0
+сборка RC=0
+ninfer_linear_fp8_a8_test RC=0 : OK FP8 A8 Linear
+ninfer_linear_add_fp8_test RC=0 : OK FP8 linear_add
+ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+ninfer_linear_swiglu_fp8_test RC=0 : OK LinearSwiGLU FP8 correctness
+ctest RC=8
+99% tests passed, 1 tests failed out of 98
+The following tests FAILED:
+
+07016549 perf(fp8): stage the A8 GEMM through TMA with warp specialization
+ src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu  |  15 +
+ src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu    |  11 +
+ src/ops/linear/fp8/fp8_a8.cu                      |  20 +-
+ src/ops/linear/fp8/fp8_a8_schedule.cuh            |  17 +
+ src/ops/linear/fp8/fp8_a8_tma.cuh                 | 376 ++++++++++++++++++++++
+ src/ops/linear_add/fp8/fp8_linear_add_a8.cu       |  13 +-
+ src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu |  13 +
+ 7 files changed, 463 insertions(+), 2 deletions(-)
+Q62_DONE

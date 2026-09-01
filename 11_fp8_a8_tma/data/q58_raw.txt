@@ -1,0 +1,13 @@
+пропатчен src/ops/linear/fp8/fp8_a8_tma.cuh
+пропатчен src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+парная запись строк заведена, linear_swiglu на TMA
+пропатчен src/ops/linear/fp8/fp8_a8.cu
+плоский linear переведён на общую функцию
+сборка RC=0
+
+ninfer_linear_swiglu_fp8_test RC=0 : OK LinearSwiGLU FP8 correctness
+ninfer_linear_fp8_a8_test RC=0 : OK FP8 A8 Linear
+ninfer_linear_add_fp8_test RC=0 : OK FP8 linear_add
+ninfer_gdn_input_proj_test RC=0 : OK gdn_input_proj
+ninfer_attn_input_proj_test RC=0 : OK attn_input_proj
+Q58_DONE

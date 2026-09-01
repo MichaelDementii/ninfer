@@ -1,0 +1,6 @@
+ninfer_linear_fp8_a8_test: инстанциаций TMA=5, cp.async=0
+ninfer_linear_add_fp8_test: инстанциаций TMA=2, cp.async=0
+ninfer_gdn_input_proj_test: инстанциаций TMA=1, cp.async=0
+ninfer_attn_input_proj_test: инстанциаций TMA=1, cp.async=0
+ninfer_linear_swiglu_fp8_test: инстанциаций TMA=1, cp.async=0
+Q59_DONE

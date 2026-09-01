@@ -1,0 +1,5 @@
+ядра в ninfer_linear_fp8_a8_test:
+  fp8_a8_quantize_kernel                   23
+  fp8_mma_kernel                           18
+  fp8_a8_tma_kernel                        5
+Q61_DONE

@@ -47,7 +47,7 @@ index 0f5cf8a9..7756b703 100644
          launch_mma<true>(weight, qkv, z, workspace, x.ne[1], stream);
      } else {
 diff --git a/src/ops/linear/fp8/fp8_a8.cu b/src/ops/linear/fp8/fp8_a8.cu
-index a937254f..a92265f7 100644
+index a937254f..8a55fc4f 100644
 --- a/src/ops/linear/fp8/fp8_a8.cu
 +++ b/src/ops/linear/fp8/fp8_a8.cu
 @@ -4,6 +4,7 @@
@@ -58,7 +58,7 @@ index a937254f..a92265f7 100644
  #include "ops/linear/fp8/fp8_config.h"
  #include "ops/linear/fp8/fp8_output.cuh"
  
-@@ -100,10 +101,40 @@ void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream
+@@ -100,10 +101,27 @@ void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -67,23 +67,10 @@ index a937254f..a92265f7 100644
 +template <class Geometry, class Schedule>
 +void launch_tma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
 +                cudaStream_t stream) {
-+    constexpr std::size_t kSharedBytes = sizeof(Fp8A8TmaSharedStorage<Schedule>);
-+    static_assert(kSharedBytes <= 99 * 1024);
-+    const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-+    const Fp8A8TmaDescriptors descriptors =
-+        make_fp8_a8_tma_descriptors<Geometry, Schedule::kBlockM, Schedule::kBlockN>(
-+            workspace.codes, static_cast<const std::uint8_t*>(weight.qdata), tokens);
-+
-+    static const cudaError_t attribute = cudaFuncSetAttribute(
-+        fp8_a8_tma_kernel<Geometry, Schedule, Fp8IdentityEpilogue, Fp8ContiguousOutput>,
-+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes));
-+    CUDA_CHECK(attribute);
-+
-+    const dim3 blocks(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
-+    fp8_a8_tma_kernel<Geometry, Schedule, Fp8IdentityEpilogue, Fp8ContiguousOutput>
-+        <<<blocks, Schedule::kThreads, kSharedBytes, stream>>>(
-+            descriptors, workspace.scales, static_cast<const __nv_bfloat16*>(weight.scales),
-+            Fp8IdentityEpilogue{}, output);
++    fp8_a8_tma_launch<Geometry, Schedule>(
++        workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
++        Fp8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows}, stream);
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -135,10 +122,10 @@ index 61345219..8d05cb93 100644
  } // namespace ninfer::ops::detail
 diff --git a/src/ops/linear/fp8/fp8_a8_tma.cuh b/src/ops/linear/fp8/fp8_a8_tma.cuh
 new file mode 100644
-index 00000000..db1a56d5
+index 00000000..b9fc24d0
 --- /dev/null
 +++ b/src/ops/linear/fp8/fp8_a8_tma.cuh
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,376 @@
 +#pragma once
 +
 +// Row-scaled E4M3 weight x row-scaled E4M3 activation GEMM, staged by TMA with warp
@@ -150,6 +137,7 @@ index 00000000..db1a56d5
 +#include "ops/common/math.cuh"
 +#include "ops/common/memory.cuh"
 +#include "ops/common/mma.cuh"
++#include "ops/linear/fp8/fp8_a8_mma.cuh" // Fp8MmaIdentityRows
 +#include "ops/linear/fp8/fp8_output.cuh"
 +
 +#include <cuda.h>
@@ -194,11 +182,14 @@ index 00000000..db1a56d5
 +
 +// A is [tokens, K] and B is [output rows, K], both one byte per element and K-contiguous. The
 +// innermost box is the 64-byte K tile that 64B swizzle expects.
-+template <class Geometry, int BlockM, int BlockN>
++template <class Geometry, int BlockM, int BlockN, bool PairRows = false>
 +Fp8A8TmaDescriptors make_fp8_a8_tma_descriptors(const std::uint8_t* activation_codes,
 +                                                const std::uint8_t* weight_codes,
 +                                                std::int32_t tokens) {
 +    constexpr std::uint32_t kRowBytes = 64;
++    // A paired block computes both branches, so its weight box is one branch tall and the
++    // producer issues one request per branch.
++    constexpr std::uint32_t kWeightBoxRows = PairRows ? BlockN / 2 : BlockN;
 +    Fp8A8TmaDescriptors descriptors{};
 +    descriptors.a_codes =
 +        fp8_make_tma_2d(const_cast<std::uint8_t*>(activation_codes), Geometry::kInputRows,
@@ -206,7 +197,7 @@ index 00000000..db1a56d5
 +                        "encode fp8 activation codes TMA");
 +    descriptors.b_codes = fp8_make_tma_2d(
 +        const_cast<std::uint8_t*>(weight_codes), Geometry::kInputRows, Geometry::kOutputRows,
-+        Geometry::kInputRows, kRowBytes, BlockN, "encode fp8 weight codes TMA");
++        Geometry::kInputRows, kRowBytes, kWeightBoxRows, "encode fp8 weight codes TMA");
 +    return descriptors;
 +}
 +
@@ -306,18 +297,22 @@ index 00000000..db1a56d5
 +    return ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
 +}
 +
-+template <class Geometry, class Schedule, class Epilogue, class Output>
++template <class Geometry, class Schedule, class Epilogue, class Output,
++          class RowPolicy = Fp8MmaIdentityRows, bool PairRows = false>
 +__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_kernel(
 +    const __grid_constant__ Fp8A8TmaDescriptors descriptors,
 +    const float* __restrict__ activation_scales, const __nv_bfloat16* __restrict__ weight_scales,
-+    const __grid_constant__ Epilogue epilogue, const __grid_constant__ Output output) {
++    const __grid_constant__ Epilogue epilogue, const __grid_constant__ Output output,
++    const __grid_constant__ RowPolicy row_policy) {
 +    static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
 +    static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
++    static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
 +
 +    extern __shared__ __align__(128) unsigned char shared_bytes[];
-+    auto& shared          = *reinterpret_cast<Fp8A8TmaSharedStorage<Schedule>*>(shared_bytes);
-+    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-+    const int row_begin   = static_cast<int>(blockIdx.x) * Schedule::kBlockN;
++    auto& shared              = *reinterpret_cast<Fp8A8TmaSharedStorage<Schedule>*>(shared_bytes);
++    constexpr int kBranchRows = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
++    const int token_begin     = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
++    const int row_begin       = static_cast<int>(blockIdx.x) * kBranchRows;
 +
 +    if (threadIdx.x == 0) {
 +#pragma unroll
@@ -348,8 +343,18 @@ index 00000000..db1a56d5
 +                auto& tensors = shared.scratch.tensors;
 +                fp8_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
 +                                k_tile * Schedule::kRowBytes, token_begin, &shared.full[stage]);
-+                fp8_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
-+                                k_tile * Schedule::kRowBytes, row_begin, &shared.full[stage]);
++                if constexpr (PairRows) {
++                    fp8_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
++                                    k_tile * Schedule::kRowBytes,
++                                    row_policy.weight_row(row_begin, 0), &shared.full[stage]);
++                    fp8_tma_load_2d(tensors.b_codes[stage] + kBranchRows * Schedule::kRowBytes,
++                                    &descriptors.b_codes, k_tile * Schedule::kRowBytes,
++                                    row_policy.weight_row(row_begin, kBranchRows),
++                                    &shared.full[stage]);
++                } else {
++                    fp8_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
++                                    k_tile * Schedule::kRowBytes, row_begin, &shared.full[stage]);
++                }
 +            }
 +        }
 +        return;
@@ -431,8 +436,8 @@ index 00000000..db1a56d5
 +#pragma unroll
 +        for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
 +            const int local_row0  = warp_n * Schedule::kWarpN + mma_n * 8 + accumulator_row;
-+            const int parent_row0 = row_begin + local_row0;
-+            const int parent_row1 = parent_row0 + 1;
++            const int parent_row0 = row_policy.weight_row(row_begin, local_row0);
++            const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
 +            const std::uint32_t scale_bits = load_vec<std::uint32_t>(weight_scales + parent_row0);
 +            const float2 weight_scale      = bf16x2_bits_to_float2(scale_bits);
 +            const float value00 =
@@ -457,36 +462,43 @@ index 00000000..db1a56d5
 +    }
 +
 +    asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory");
-+    constexpr int kVectorsPerRow = Schedule::kBlockN / 8;
++    constexpr int kVectorsPerRow = kBranchRows / 8;
 +    constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
 +    for (int task = consumer_thread; task < kOutputVectors; task += Schedule::kConsumerThreads) {
 +        const int local_token = task / kVectorsPerRow;
 +        const int row_vector  = task - local_token * kVectorsPerRow;
-+        const uint4 values =
-+            load_vec<uint4>(shared_output + local_token * kOutputStride + row_vector * 8);
-+        output.store_vector(row_begin + row_vector * 8, token_begin + local_token, values);
++        const auto* row_base  = shared_output + local_token * kOutputStride + row_vector * 8;
++        const uint4 values    = load_vec<uint4>(row_base);
++        if constexpr (PairRows) {
++            output.store_pair_vector(row_begin + row_vector * 8, token_begin + local_token, values,
++                                     load_vec<uint4>(row_base + kBranchRows));
++        } else {
++            output.store_vector(row_begin + row_vector * 8, token_begin + local_token, values);
++        }
 +    }
 +}
 +
 +// One launch path for every Op family: they differ only in the epilogue and output policies.
-+template <class Geometry, class Schedule, class Epilogue, class Output>
++template <class Geometry, class Schedule, class Epilogue, class Output,
++          class RowPolicy = Fp8MmaIdentityRows, bool PairRows = false>
 +void fp8_a8_tma_launch(const std::uint8_t* activation_codes, const float* activation_scales,
 +                       const std::uint8_t* weight_codes, const __nv_bfloat16* weight_scales,
-+                       std::int32_t tokens, Epilogue epilogue, Output output, cudaStream_t stream) {
++                       std::int32_t tokens, Epilogue epilogue, Output output, cudaStream_t stream,
++                       RowPolicy row_policy = {}) {
 +    constexpr std::size_t kSharedBytes = sizeof(Fp8A8TmaSharedStorage<Schedule>);
 +    static_assert(kSharedBytes <= 99 * 1024);
 +    static const cudaError_t attribute = cudaFuncSetAttribute(
-+        fp8_a8_tma_kernel<Geometry, Schedule, Epilogue, Output>,
++        fp8_a8_tma_kernel<Geometry, Schedule, Epilogue, Output, RowPolicy, PairRows>,
 +        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes));
 +    if (attribute != cudaSuccess) { throw std::runtime_error("fp8 TMA shared memory attribute"); }
 +
 +    const Fp8A8TmaDescriptors descriptors =
-+        make_fp8_a8_tma_descriptors<Geometry, Schedule::kBlockM, Schedule::kBlockN>(
++        make_fp8_a8_tma_descriptors<Geometry, Schedule::kBlockM, Schedule::kBlockN, PairRows>(
 +            activation_codes, weight_codes, tokens);
 +    const dim3 blocks(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
-+    fp8_a8_tma_kernel<Geometry, Schedule, Epilogue, Output>
-+        <<<blocks, Schedule::kThreads, kSharedBytes, stream>>>(descriptors, activation_scales,
-+                                                               weight_scales, epilogue, output);
++    fp8_a8_tma_kernel<Geometry, Schedule, Epilogue, Output, RowPolicy, PairRows>
++        <<<blocks, Schedule::kThreads, kSharedBytes, stream>>>(
++            descriptors, activation_scales, weight_scales, epilogue, output, row_policy);
 +}
 +
 +} // namespace ninfer::ops::detail
@@ -513,4 +525,35 @@ index db246d93..f059b351 100644
 +    }
      if ((tokens % Schedule::kBlockTokens) == 0) {
          launch_mma<Geometry, true>(weight, residual, workspace, tokens, stream);
+     } else {
+diff --git a/src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu b/src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+index c2d1e03d..aa9c5aeb 100644
+--- a/src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
++++ b/src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+@@ -4,6 +4,7 @@
+ #include "ops/linear/fp8/fp8_a8_mma.cuh"
+ #include "ops/linear/fp8/fp8_a8_plan.h"
+ #include "ops/linear/fp8/fp8_a8_schedule.cuh"
++#include "ops/linear/fp8/fp8_a8_tma.cuh"
+ #include "ops/linear/fp8/fp8_config.h"
+ #include "ops/linear/fp8/fp8_output.cuh"
+ #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_output.cuh"
+@@ -54,6 +55,18 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor&
+     const Fp8A8Workspace scratch =
+         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);
+     launch_fp8_a8_quantize(x, weight, scratch, stream);
++    using TmaSchedule = typename Fp8LinearA8TmaSchedule<Geometry>::Type;
++    using TmaRows     = Fp8SwiGluRows<TmaSchedule::kBlockN / 2, kIntermediate>;
++    if (fp8_a8_tma_applies<Geometry, TmaSchedule>(x.ne[1])) {
++        fp8_a8_tma_launch<Geometry, TmaSchedule, Fp8IdentityEpilogue, Fp8SwiGluOutput, TmaRows,
++                          true>(
++            scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
++            static_cast<const __nv_bfloat16*>(weight.scales), x.ne[1], Fp8IdentityEpilogue{},
++            Fp8SwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate}, stream,
++            TmaRows{});
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
+         launch_mma<true>(weight, out, scratch, x.ne[1], stream);
      } else {
