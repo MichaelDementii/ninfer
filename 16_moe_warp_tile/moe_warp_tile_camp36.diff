@@ -1,0 +1,295 @@
+diff --git a/src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu b/src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+index 928945d4..a0788294 100644
+--- a/src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
++++ b/src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+@@ -293,11 +293,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+     __nv_bfloat16* __restrict__ activation) {
+     constexpr int ExpertThreads = ExpertWarps * 32;
+     constexpr int GroupsPerRow  = kHidden / 64;
+-    constexpr int WarpCols      = ExpertBN / ExpertWarps;
+-    constexpr int WarpNT        = WarpCols / 8;
+-    constexpr int StageChunks   = kExpertBK / 8;
+-    constexpr int StageIters    = ExpertBN * StageChunks / ExpertThreads;
+-    static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
++    // A 2x2 warp layout: half the warps hold the upper row tile pair, half the lower, and each
++    // takes twice as many columns. A warp's row pair is {rp, rp + 2}, a gate tile and its matching
++    // up tile, so the epilogue gate stays inside the warp.
++    constexpr int ColGroups   = ExpertWarps / 2;
++    constexpr int WarpCols    = ExpertBN / ColGroups;
++    constexpr int WarpNT      = WarpCols / 8;
++    constexpr int StageChunks = kExpertBK / 8;
++    constexpr int StageIters  = ExpertBN * StageChunks / ExpertThreads;
++    static_assert(ExpertWarps % 2 == 0 && ExpertBN % ColGroups == 0 && WarpCols % 8 == 0);
+     static_assert(StageIters * ExpertThreads == ExpertBN * StageChunks,
+                   "the staging loop is unrolled, so every thread must take the same column count");
+     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+@@ -317,6 +321,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+     const int b_koff         = ((lane >> 3) & 1) << 3;
+     const int gid            = lane >> 2;
+     const int lid            = lane & 3;
++    const int row_pair       = warp / ColGroups;
++    const int col_group      = warp - row_pair * ColGroups;
+     constexpr int row_blocks = kIntermediate / (kExpertBM / 2);
+     const int total_work     = *route_job_count * row_blocks;
+     for (int work = static_cast<int>(blockIdx.x); work < total_work;
+@@ -341,7 +347,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+             const int row = packed_token[col < cols ? begin + column_base + col : begin];
+             src_row[i]    = x + static_cast<std::int64_t>(row) * kHidden;
+         }
+-        float acc[4][WarpNT][4] = {};
++        float acc[2][WarpNT][4] = {};
+ 
+         auto global_row = [&](int local_row) {
+             const int logical = logical0 + (local_row & (kExpertBM / 2 - 1));
+@@ -414,36 +420,37 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+             decode_weight(stage);
+             __syncthreads();
+ 
+-            if (warp * WarpCols < cols) {
+-                float partial[4][WarpNT][4] = {};
++            if (col_group * WarpCols < cols) {
++                float partial[2][WarpNT][4] = {};
+ #pragma unroll
+                 for (int ki = 0; ki < kExpertBK / 16; ++ki) {
+-                    unsigned af[4][4];
++                    unsigned af[2][4];
+                     unsigned bf[WarpNT][2];
+ #pragma unroll
+-                    for (int mi = 0; mi < 4; ++mi) {
+-                        const int row = mi * 16 + a_rowoff;
++                    for (int mh = 0; mh < 2; ++mh) {
++                        const int row = (row_pair + mh * 2) * 16 + a_rowoff;
+                         const int col = ki * 16 + a_coloff;
+-                        ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
++                        ldmatrix_x4(af[mh][0], af[mh][1], af[mh][2], af[mh][3],
+                                     smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                     }
+ #pragma unroll
+                     for (int ni = 0; ni < WarpNT; ++ni) {
+-                        const int brow = warp * WarpCols + ni * 8 + b_rin;
++                        const int brow = col_group * WarpCols + ni * 8 + b_rin;
+                         const int bcol = ki * 16 + b_koff;
+                         ldmatrix_x2(
+                             bf[ni][0], bf[ni][1],
+                             smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+ #pragma unroll
+-                        for (int mi = 0; mi < 4; ++mi) {
+-                            mma_bf16(partial[mi][ni][0], partial[mi][ni][1], partial[mi][ni][2],
+-                                     partial[mi][ni][3], af[mi][0], af[mi][1], af[mi][2], af[mi][3],
++                        for (int mh = 0; mh < 2; ++mh) {
++                            mma_bf16(partial[mh][ni][0], partial[mh][ni][1], partial[mh][ni][2],
++                                     partial[mh][ni][3], af[mh][0], af[mh][1], af[mh][2], af[mh][3],
+                                      bf[ni][0], bf[ni][1]);
+                         }
+                     }
+                 }
+ #pragma unroll
+-                for (int mi = 0; mi < 4; ++mi) {
++                for (int mh = 0; mh < 2; ++mh) {
++                    const int mi   = row_pair + mh * 2;
+                     const int row0 = mi * 16 + gid;
+                     const int row1 = row0 + 8;
+                     float scale0 =
+@@ -460,10 +467,10 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+                     scale1 = __shfl_sync(0xffffffffu, scale1, gid * 4);
+ #pragma unroll
+                     for (int ni = 0; ni < WarpNT; ++ni) {
+-                        acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
+-                        acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
+-                        acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
+-                        acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
++                        acc[mh][ni][0] = fmaf(partial[mh][ni][0], scale0, acc[mh][ni][0]);
++                        acc[mh][ni][1] = fmaf(partial[mh][ni][1], scale0, acc[mh][ni][1]);
++                        acc[mh][ni][2] = fmaf(partial[mh][ni][2], scale1, acc[mh][ni][2]);
++                        acc[mh][ni][3] = fmaf(partial[mh][ni][3], scale1, acc[mh][ni][3]);
+                     }
+                 }
+             }
+@@ -476,29 +483,28 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
+         cp_wait<0>();
+         __syncthreads();
+ 
+-        if (warp * WarpCols < cols) {
+-#pragma unroll
+-            for (int mi = 0; mi < 2; ++mi) {
+-                const int row0 = logical0 + mi * 16 + gid;
+-                const int row1 = row0 + 8;
++        if (col_group * WarpCols < cols) {
++            // The warp holds the gate tile in acc[0] and its matching up tile in acc[1], so the
++            // gate is applied right here without an exchange through shared memory.
++            const int row0 = logical0 + row_pair * 16 + gid;
++            const int row1 = row0 + 8;
+ #pragma unroll
+-                for (int ni = 0; ni < WarpNT; ++ni) {
+-                    const int col0       = begin + column_base + warp * WarpCols + ni * 8 + 2 * lid;
+-                    const int col1       = col0 + 1;
+-                    const int local_col0 = warp * WarpCols + ni * 8 + 2 * lid;
+-                    const int local_col1 = local_col0 + 1;
+-                    if (local_col0 < cols) {
+-                        activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
+-                            __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
+-                        activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
+-                            __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + 2][ni][2]);
+-                    }
+-                    if (local_col1 < cols) {
+-                        activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
+-                            __float2bfloat16_rn(silu(acc[mi][ni][1]) * acc[mi + 2][ni][1]);
+-                        activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
+-                            __float2bfloat16_rn(silu(acc[mi][ni][3]) * acc[mi + 2][ni][3]);
+-                    }
++            for (int ni = 0; ni < WarpNT; ++ni) {
++                const int local_col0 = col_group * WarpCols + ni * 8 + 2 * lid;
++                const int local_col1 = local_col0 + 1;
++                const int col0       = begin + column_base + local_col0;
++                const int col1       = col0 + 1;
++                if (local_col0 < cols) {
++                    activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
++                        __float2bfloat16_rn(silu(acc[0][ni][0]) * acc[1][ni][0]);
++                    activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
++                        __float2bfloat16_rn(silu(acc[0][ni][2]) * acc[1][ni][2]);
++                }
++                if (local_col1 < cols) {
++                    activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
++                        __float2bfloat16_rn(silu(acc[0][ni][1]) * acc[1][ni][1]);
++                    activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
++                        __float2bfloat16_rn(silu(acc[0][ni][3]) * acc[1][ni][3]);
+                 }
+             }
+         }
+@@ -726,6 +732,12 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
+     __nv_bfloat16* __restrict__ output) {
+     constexpr int ExpertThreads = ExpertWarps * 32;
+     constexpr int GroupsPerRow  = kIntermediate / 64;
++    // A 2x2 warp tile: two row tiles and two column tiles per warp instead of four and one, so
++    // each A fragment feeds two mma instead of one.
++    constexpr int ColGroups = ExpertWarps / 2;
++    constexpr int WarpCols  = ExpertBN / ColGroups;
++    constexpr int WarpNT    = WarpCols / 8;
++    static_assert(ExpertWarps % 2 == 0 && ExpertBN % ColGroups == 0 && WarpCols % 8 == 0);
+     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
+     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * 32];
+@@ -744,19 +756,21 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
+     const int b_koff         = ((lane >> 3) & 1) << 3;
+     const int gid            = lane >> 2;
+     const int lid            = lane & 3;
++    const int row_pair       = warp / ColGroups;
++    const int col_group      = warp - row_pair * ColGroups;
+     constexpr int row_blocks = kHidden / kExpertBM;
+     const int total_work     = *route_job_count * row_blocks;
+     for (int work = static_cast<int>(blockIdx.x); work < total_work;
+          work += static_cast<int>(gridDim.x)) {
+-        const int route_job   = work / row_blocks;
+-        const int row_block   = work - route_job * row_blocks;
+-        const int expert      = route_job_experts[route_job];
+-        const int row0        = row_block * kExpertBM;
+-        const int begin       = expert_offsets[expert];
+-        const int count       = expert_offsets[expert + 1] - begin;
+-        const int column_base = route_job_columns[route_job];
+-        const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
+-        float acc[4][4]       = {};
++        const int route_job     = work / row_blocks;
++        const int row_block     = work - route_job * row_blocks;
++        const int expert        = route_job_experts[route_job];
++        const int row0          = row_block * kExpertBM;
++        const int begin         = expert_offsets[expert];
++        const int count         = expert_offsets[expert + 1] - begin;
++        const int column_base   = route_job_columns[route_job];
++        const int cols          = count - column_base < ExpertBN ? count - column_base : ExpertBN;
++        float acc[2][WarpNT][4] = {};
+ 
+         auto stage_scales = [&] {
+             for (int row = tid; row < kExpertBM; row += ExpertThreads) {
+@@ -836,26 +850,31 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
+             decode_weight(stage, kt);
+             __syncthreads();
+ 
+-            if (warp * 8 < cols) {
++            if (col_group * WarpCols < cols) {
+ #pragma unroll
+                 for (int ki = 0; ki < kExpertBK / 16; ++ki) {
+-                    unsigned af[4][4];
+-                    unsigned bf[2];
++                    unsigned af[2][4];
++                    unsigned bf[WarpNT][2];
+ #pragma unroll
+-                    for (int mi = 0; mi < 4; ++mi) {
+-                        const int row = mi * 16 + a_rowoff;
++                    for (int mh = 0; mh < 2; ++mh) {
++                        const int row = (row_pair * 2 + mh) * 16 + a_rowoff;
+                         const int col = ki * 16 + a_coloff;
+-                        ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
++                        ldmatrix_x4(af[mh][0], af[mh][1], af[mh][2], af[mh][3],
+                                     smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                     }
+-                    const int brow = warp * 8 + b_rin;
+-                    const int bcol = ki * 16 + b_koff;
+-                    ldmatrix_x2(bf[0], bf[1],
+-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+ #pragma unroll
+-                    for (int mi = 0; mi < 4; ++mi) {
+-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
+-                                 af[mi][1], af[mi][2], af[mi][3], bf[0], bf[1]);
++                    for (int ni = 0; ni < WarpNT; ++ni) {
++                        const int brow = col_group * WarpCols + ni * 8 + b_rin;
++                        const int bcol = ki * 16 + b_koff;
++                        ldmatrix_x2(
++                            bf[ni][0], bf[ni][1],
++                            smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
++#pragma unroll
++                        for (int mh = 0; mh < 2; ++mh) {
++                            mma_bf16(acc[mh][ni][0], acc[mh][ni][1], acc[mh][ni][2], acc[mh][ni][3],
++                                     af[mh][0], af[mh][1], af[mh][2], af[mh][3], bf[ni][0],
++                                     bf[ni][1]);
++                        }
+                     }
+                 }
+             }
+@@ -868,26 +887,29 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
+         cp_wait<0>();
+         __syncthreads();
+ 
+-        if (warp * 8 < cols) {
++        if (col_group * WarpCols < cols) {
+ #pragma unroll
+-            for (int mi = 0; mi < 4; ++mi) {
+-                const int output_row0 = row0 + mi * 16 + gid;
++            for (int mh = 0; mh < 2; ++mh) {
++                const int output_row0 = row0 + (row_pair * 2 + mh) * 16 + gid;
+                 const int output_row1 = output_row0 + 8;
+-                const int col0        = begin + column_base + warp * 8 + 2 * lid;
+-                const int col1        = col0 + 1;
+-                const int local_col0  = warp * 8 + 2 * lid;
+-                const int local_col1  = local_col0 + 1;
+-                if (local_col0 < cols) {
+-                    output[static_cast<std::int64_t>(col0) * kHidden + output_row0] =
+-                        __float2bfloat16_rn(acc[mi][0]);
+-                    output[static_cast<std::int64_t>(col0) * kHidden + output_row1] =
+-                        __float2bfloat16_rn(acc[mi][2]);
+-                }
+-                if (local_col1 < cols) {
+-                    output[static_cast<std::int64_t>(col1) * kHidden + output_row0] =
+-                        __float2bfloat16_rn(acc[mi][1]);
+-                    output[static_cast<std::int64_t>(col1) * kHidden + output_row1] =
+-                        __float2bfloat16_rn(acc[mi][3]);
++#pragma unroll
++                for (int ni = 0; ni < WarpNT; ++ni) {
++                    const int local_col0 = col_group * WarpCols + ni * 8 + 2 * lid;
++                    const int local_col1 = local_col0 + 1;
++                    const int col0       = begin + column_base + local_col0;
++                    const int col1       = col0 + 1;
++                    if (local_col0 < cols) {
++                        output[static_cast<std::int64_t>(col0) * kHidden + output_row0] =
++                            __float2bfloat16_rn(acc[mh][ni][0]);
++                        output[static_cast<std::int64_t>(col0) * kHidden + output_row1] =
++                            __float2bfloat16_rn(acc[mh][ni][2]);
++                    }
++                    if (local_col1 < cols) {
++                        output[static_cast<std::int64_t>(col1) * kHidden + output_row0] =
++                            __float2bfloat16_rn(acc[mh][ni][1]);
++                        output[static_cast<std::int64_t>(col1) * kHidden + output_row1] =
++                            __float2bfloat16_rn(acc[mh][ni][3]);
++                    }
+                 }
+             }
+         }
