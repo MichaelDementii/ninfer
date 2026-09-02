@@ -206,11 +206,12 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    float acc[PVNt][4];
+    // FP16 PV accumulator: two f16x2 registers per n-tile, not four floats.
+    unsigned acc[PVNt][2];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) acc[n][i] = 0.0F;
+        for (int i = 0; i < 2; ++i) { acc[n][i] = 0u; }
     }
     float m0             = -CUDART_INF_F;
     float m1             = -CUDART_INF_F;
@@ -338,10 +339,10 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
         m1 = nm1;
 #pragma unroll
         for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            const __half2 r0 = __hmul2(half2_from_bits(acc[n][0]), __float2half2_rn(alpha0));
+            const __half2 r1 = __hmul2(half2_from_bits(acc[n][1]), __float2half2_rn(alpha1));
+            acc[n][0]        = load_vec<std::uint32_t>(&r0);
+            acc[n][1]        = load_vec<std::uint32_t>(&r1);
         }
 
         cta_mbarrier_wait(&barriers->v_full, full_phase);
@@ -364,9 +365,9 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
                               causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
                                                      ckv, v_as, v_r));
             }
-            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
+            mma_f16_acc16(acc[n2][0], acc[n2][1], p_frag[k][0], p_frag[k][1],
                     p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
+            mma_f16_acc16(acc[n2 + 1][0], acc[n2 + 1][1], p_frag[k][0],
                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
         asm volatile("bar.sync 2, 128;" : : : "memory");
@@ -385,11 +386,11 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
         const int row1 = row0 + 8;
         if (row0 < tile_rows) {
             *reinterpret_cast<float2*>(&rotated_out[row0 * D + d0]) =
-                make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                make_float2(__low2float(half2_from_bits(acc[n][0])) * inv_l0, __high2float(half2_from_bits(acc[n][0])) * inv_l0);
         }
         if (row1 < tile_rows) {
             *reinterpret_cast<float2*>(&rotated_out[row1 * D + d0]) =
-                make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                make_float2(__low2float(half2_from_bits(acc[n][1])) * inv_l1, __high2float(half2_from_bits(acc[n][1])) * inv_l1);
         }
     }
     asm volatile("bar.sync 2, 128;" : : : "memory");

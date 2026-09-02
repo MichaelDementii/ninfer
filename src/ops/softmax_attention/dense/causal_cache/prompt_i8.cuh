@@ -225,11 +225,12 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         }
     }
 
-    float acc[PVNtPerWarp][4];
+    // FP16 PV accumulator: two f16x2 registers per n-tile, not four floats.
+    unsigned acc[PVNtPerWarp][2];
 #pragma unroll
     for (int n = 0; n < PVNtPerWarp; ++n) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+        for (int i = 0; i < 2; ++i) { acc[n][i] = 0u; }
     }
     float running_m0     = -CUDART_INF_F;
     float running_m1     = -CUDART_INF_F;
@@ -403,10 +404,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         const float alpha1 = alpha_s[row_base + gid + 8];
 #pragma unroll
         for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            const __half2 r0 = __hmul2(half2_from_bits(acc[n][0]), __float2half2_rn(alpha0));
+            const __half2 r1 = __hmul2(half2_from_bits(acc[n][1]), __float2half2_rn(alpha1));
+            acc[n][0]        = load_vec<std::uint32_t>(&r0);
+            acc[n][1]        = load_vec<std::uint32_t>(&r1);
         }
 
 #pragma unroll
@@ -424,7 +425,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                mma_f16_acc16(acc[n][0], acc[n][1], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
             }
         }
@@ -453,12 +454,12 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         if (row0 < tile_rows) {
             *reinterpret_cast<unsigned*>(
                 &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                pack_bf16x2(__low2float(half2_from_bits(acc[n][0])) * inv_l0, __high2float(half2_from_bits(acc[n][0])) * inv_l0);
         }
         if (row1 < tile_rows) {
             *reinterpret_cast<unsigned*>(
                 &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                pack_bf16x2(__low2float(half2_from_bits(acc[n][1])) * inv_l1, __high2float(half2_from_bits(acc[n][1])) * inv_l1);
         }
     }
     causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
