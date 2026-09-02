@@ -8,7 +8,8 @@
 //   * Q, K, V staged in 96 KiB of dynamic shared memory (single-buffered), with
 //     the cp.async of the next K/V tile overlapped against the current
 //     QK / PV tensor-core work (exactly FA's single-buffer overlap pattern).
-//   * m16n8k16 BF16 MMA for S = Q Kᵀ, FP16 MMA for O += P V, and FP32 accumulation.
+//   * m16n8k16 BF16 MMA for S = Q Kᵀ, FP16 MMA for O += P V accumulated in FP16, and
+//     FP32 softmax statistics.
 //   * Persistent V is already FP16; FP32 softmax probabilities are rounded once to FP16 at the
 //     PV operand boundary.
 //
@@ -173,11 +174,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         }
     }
 
-    float acc[PVNt][4];
+    // O lives in registers for the whole key loop, so its width sets the kernel's occupancy
+    // floor: four floats per n-tile is 128 of the 255 registers a thread may hold. The half
+    // accumulator halves that. P is post-exp and bounded by 1 and V is FP16 storage, so a block
+    // sum cannot approach the f16 range; the price is accumulation precision.
+    unsigned acc[PVNt][2];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+        for (int i = 0; i < 2; ++i) { acc[n][i] = 0u; }
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
@@ -345,12 +350,14 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         l1 = __fmaf_rn(l1, alpha1, bl1);
         m0 = nm0;
         m1 = nm1;
+        const __half2 alpha0_h2 = __float2half2_rn(alpha0);
+        const __half2 alpha1_h2 = __float2half2_rn(alpha1);
 #pragma unroll
         for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            const __half2 r0 = __hmul2(half2_from_bits(acc[n][0]), alpha0_h2);
+            const __half2 r1 = __hmul2(half2_from_bits(acc[n][1]), alpha1_h2);
+            acc[n][0]        = load_vec<std::uint32_t>(&r0);
+            acc[n][1]        = load_vec<std::uint32_t>(&r1);
         }
 
         ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s.
@@ -391,10 +398,10 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                               causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
                                                      ckv, v_as, v_r));
             }
-            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                    p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                    p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+            mma_f16_acc16(acc[n2][0], acc[n2][1], p_frag[k][0], p_frag[k][1], p_frag[k][2],
+                          p_frag[k][3], vf[cur][0], vf[cur][1]);
+            mma_f16_acc16(acc[n2 + 1][0], acc[n2 + 1][1], p_frag[k][0], p_frag[k][1], p_frag[k][2],
+                          p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     }
 
@@ -409,13 +416,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         const int d0    = n * 8 + 2 * lid;
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = q0 + warp_row0 + gid + 8;
+        const float2 o0 = __half22float2(half2_from_bits(acc[n][0]));
+        const float2 o1 = __half22float2(half2_from_bits(acc[n][1]));
         if (qrow0 < tokens) {
             *reinterpret_cast<unsigned*>(&out[causal_prompt_q_index<Geometry>(q_head, d0, qrow0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                pack_bf16x2(o0.x * inv_l0, o0.y * inv_l0);
         }
         if (qrow1 < tokens) {
             *reinterpret_cast<unsigned*>(&out[causal_prompt_q_index<Geometry>(q_head, d0, qrow1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                pack_bf16x2(o1.x * inv_l1, o1.y * inv_l1);
         }
     }
     causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
