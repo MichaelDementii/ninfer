@@ -1,0 +1,94 @@
+[19:56:54] ===== PROTOKOL AVTORA: polnyy korpus 65536/32768 =====
+[19:56:54] --- L_bf16: ctx=65536 stride=32768 kv=bf16
+    rc=0 za 105 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.599606        4.951083
+    english_long_form                 261408        1.996358        7.362198
+    english_reference                 261223        1.725297        5.614185
+    ninfer_code                       259904        0.503424        1.654377
+    overall                          1044557        1.457580        4.295551
+[19:58:39] --- L_int8: ctx=65536 stride=32768 kv=int8
+    rc=0 za 106 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.599868        4.952378
+    english_long_form                 261408        1.996421        7.362655
+    english_reference                 261223        1.725195        5.613615
+    ninfer_code                       259904        0.503448        1.654415
+    overall                          1044557        1.457641        4.295815
+[20:00:25] --- L_fp8: ctx=65536 stride=32768 kv=fp8
+    rc=0 za 103 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.599830        4.952188
+    english_long_form                 261408        1.996337        7.362038
+    english_reference                 261223        1.725574        5.615744
+    ninfer_code                       259904        0.503983        1.655301
+    overall                          1044557        1.457839        4.296663
+[20:02:08] --- L_k8v4: ctx=65536 stride=32768 kv=k8v4
+    rc=0 za 102 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.601204        4.959001
+    english_long_form                 261408        1.997776        7.372643
+    english_reference                 261223        1.726624        5.621644
+    ninfer_code                       259904        0.504442        1.656061
+    overall                          1044557        1.458921        4.301315
+[20:03:50] --- L_nvfp4: ctx=65536 stride=32768 kv=nvfp4
+    rc=0 za 106 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.602404        4.964951
+    english_long_form                 261408        1.998872        7.380729
+    english_reference                 261223        1.728249        5.630784
+    ninfer_code                       259904        0.505869        1.658426
+    overall                          1044557        1.460257        4.307067
+
+[20:05:36] ===== PROTOKOL PO UMOLCHANIYU: polnyy korpus 4096/2048 =====
+[20:05:36] --- S_bf16: ctx=4096 stride=2048 kv=bf16
+    rc=0 za 126 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.658660        5.252269
+    english_long_form                 261408        2.049583        7.764661
+    english_reference                 261223        1.790990        5.995385
+    ninfer_code                       259904        0.608427        1.837539
+    overall                          1044557        1.528268        4.610186
+[20:07:42] --- S_int8: ctx=4096 stride=2048 kv=int8
+    rc=0 za 124 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.658779        5.252891
+    english_long_form                 261408        2.049809        7.766418
+    english_reference                 261223        1.790615        5.993139
+    ninfer_code                       259904        0.608418        1.837521
+    overall                          1044557        1.528258        4.610141
+[20:09:46] --- S_fp8: ctx=4096 stride=2048 kv=fp8
+    rc=0 za 123 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.659107        5.254617
+    english_long_form                 261408        2.049922        7.767295
+    english_reference                 261223        1.791813        6.000320
+    ninfer_code                       259904        0.608611        1.837877
+    overall                          1044557        1.528717        4.612254
+[20:11:49] --- S_k8v4: ctx=4096 stride=2048 kv=k8v4
+    rc=0 za 124 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.660322        5.261007
+    english_long_form                 261408        2.051494        7.779514
+    english_reference                 261223        1.793612        6.011128
+    ninfer_code                       259904        0.609687        1.839855
+    overall                          1044557        1.530133        4.618789
+[20:13:53] --- S_nvfp4: ctx=4096 stride=2048 kv=nvfp4
+    rc=0 za 124 s
+    Perplexity result
+    domain                            tokens        mean_nll             ppl
+    chinese_reference                 262022        1.661986        5.269767
+    english_long_form                 261408        2.052121        7.784398
+    english_reference                 261223        1.794397        6.015843
+    ninfer_code                       259904        0.610970        1.842217
+    overall                          1044557        1.531222        4.623825
+KV_PPL_DONE

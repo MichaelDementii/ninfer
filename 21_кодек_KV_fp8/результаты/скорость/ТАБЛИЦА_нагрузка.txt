@@ -1,0 +1,47 @@
+### Skorost pod nastoyashchey nagruzkoy
+
+===== aime_both =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+bf16            60    11.4695       295.28         4055.5    0.7888      27886
+int8            60    10.8831       312.01         4283.2    0.7914      27468
+fp8             60    10.8438       307.58         4066.3    0.7883      27812 (+0.36% k int8)
+nvfp4           60    10.7550       312.57         4315.2    0.7872      28043 (+1.18% k int8)
+k8v4            60    10.8410       310.47         4338.3    0.7891      28203 (+0.39% k int8)
+
+===== gpqa =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+int8           198    10.7011       289.19         6485.1    0.7159       5876
+fp8            198    10.6369       293.06         6635.1    0.7150       6017 (+0.60% k int8)
+nvfp4          198    10.5041       296.85         6438.6    0.7130       6271 (+1.84% k int8)
+k8v4           198    10.5757       293.33         6600.9    0.7146       6416 (+1.17% k int8)
+
+===== ifbench =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+int8           300    10.5487       301.80         2570.3    0.7290       4407
+fp8            300    10.3658       304.80         2601.5    0.7204       4478 (+1.73% k int8)
+nvfp4          300    10.2059       308.08         2528.0    0.7154       4385 (+3.25% k int8)
+k8v4           300    10.4941       303.56         2580.7    0.7286       4731 (+0.52% k int8)
+
+===== long_128k =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+bf16            22        nan       232.34         8616.0       nan         24
+int8            22        nan       282.47         8677.9       nan         24
+fp8             22        nan       297.94         9210.4       nan         24 (+nan% k int8)
+
+===== long_260k =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+bf16            22        nan       172.23         5484.3       nan         24
+int8            22        nan       229.41         5514.4       nan         24
+fp8             22        nan       243.81         5957.3       nan         24 (+nan% k int8)
+
+===== long_64k =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+bf16            22        nan       283.67        12161.3       nan         24
+int8            22        nan       320.69        12161.7       nan         24
+fp8             22        nan       339.28        12687.2       nan         24 (+nan% k int8)
+
+===== standard =====
+kodek     zaprosov   ms/raund  dekod tok/s  prefill tok/s  priyomka  tok/otvet
+bf16           200        nan       350.10        17019.5       nan         24
+int8           200        nan       367.24        17059.0       nan         24
+fp8            200        nan       382.21        17253.2       nan         24 (+nan% k int8)

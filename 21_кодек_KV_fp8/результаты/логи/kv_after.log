@@ -1,0 +1,26 @@
+[20:11:19] zhdem KV_NIGHT_DONE
+[01:52:24] noch zavershena
+[01:52:24] 1) testy na realnom artefakte 35B
+    [01:52:24] ctest na realnom artefakte 35B
+      rc=0 -- 100% tests passed, 0 tests failed out of 3
+        1/3 Test #27: ninfer_qwen3_6_35b_a3b_real_test ...............   Passed   43.45 sec
+        2/3 Test #28: ninfer_qwen3_6_35b_a3b_dflash_real_test ........   Passed   68.30 sec
+        3/3 Test #29: ninfer_qwen3_6_35b_a3b_dflash_load_plan_test ...   Passed    0.02 sec
+    KV_TESTS35_DONE
+[01:54:16] 2) perplexiya na sklennom dokumente 260k pri kontekste 262144
+    [01:54:16] --- bf16, kontekst 262144, shag 131072
+        rc=0 za 60 s
+        overall                           261169        1.408566        4.090086
+    [01:55:16] --- int8, kontekst 262144, shag 131072
+        rc=0 za 61 s
+        overall                           261169        1.408745        4.090818
+    [01:56:17] --- fp8, kontekst 262144, shag 131072
+        rc=0 za 57 s
+        overall                           261169        1.408781        4.090964
+    [01:57:14] --- k8v4, kontekst 262144, shag 131072
+        rc=0 za 58 s
+        overall                           261169        1.409614        4.094373
+    [01:58:12] --- nvfp4, kontekst 262144, shag 131072
+        rc=0 za 63 s
+        overall                           261169        1.411649        4.102715
+KV_AFTER_DONE

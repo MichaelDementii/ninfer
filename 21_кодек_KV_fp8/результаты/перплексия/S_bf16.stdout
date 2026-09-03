@@ -1,0 +1,13 @@
+Perplexity result
+artifact: qwen3.6-35b-a3b / groupwise-int
+kv: bf16, corpus: ninfer-ppl-1m-v1 / full, context/stride: 4096/2048
+
+domain                            tokens        mean_nll             ppl
+chinese_reference                 262022        1.658660        5.252269
+english_long_form                 261408        2.049583        7.764661
+english_reference                 261223        1.790990        5.995385
+ninfer_code                       259904        0.608427        1.837539
+overall                          1044557        1.528268        4.610186
+
+score rate: 9292.4 tok/s
+report: "/root/exp/kv/ppl/S_bf16/report.json"

@@ -1,0 +1,7 @@
+[00:27:53] zhdem KV_NIAHCTL_DONE
+  konfig s semenem 4243 sozdan, otlichiy ot ishodnogo: 12 strok
+[02:21:42] gpqaB_int8
+    gpqaB_int8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.838400 | 198 | 0 | 2256.3s |
+[02:59:48] gpqaB_fp8
+    gpqaB_fp8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.833300 | 198 | 0 | 2086.5s |
+KV_SEEDCTL_DONE

@@ -1,0 +1,77 @@
+[19:18:50] === START. bin=CAND (camp36 + 2x2 + porog 1280) ===
+
+[19:18:50] ##### mtp-draft-tokens = 0 #####
+  mtp0/bf16/a                  pp=1024   pref_tok_s= 21449.67 pref_s=  0.0478 dec_tok_s= 381.127 ms_round=  2.6251 acc= kv_B=673710080
+  mtp0/bf16/a                  pp=8192   pref_tok_s= 19873.92 pref_s=  0.4122 dec_tok_s= 358.257 ms_round=  2.7914 acc= kv_B=673710080
+  mtp0/bf16/a                  pp=32768  pref_tok_s= 15438.17 pref_s=  2.1226 dec_tok_s= 310.640 ms_round=  3.2192 acc= kv_B=673710080
+  mtp0/int8/a                  pp=1024   pref_tok_s= 21097.98 pref_s=  0.0485 dec_tok_s= 376.038 ms_round=  2.6593 acc= kv_B=347381760
+  mtp0/int8/a                  pp=8192   pref_tok_s= 19183.29 pref_s=  0.4270 dec_tok_s= 360.163 ms_round=  2.7766 acc= kv_B=347381760
+  mtp0/int8/a                  pp=32768  pref_tok_s= 15284.28 pref_s=  2.1439 dec_tok_s= 333.179 ms_round=  3.0014 acc= kv_B=347381760
+  mtp0/fp8/a                   pp=1024   pref_tok_s= 21089.82 pref_s=  0.0486 dec_tok_s= 380.771 ms_round=  2.6263 acc= kv_B=339486720
+  mtp0/fp8/a                   pp=8192   pref_tok_s= 19199.30 pref_s=  0.4267 dec_tok_s= 370.848 ms_round=  2.6966 acc= kv_B=339486720
+  mtp0/fp8/a                   pp=32768  pref_tok_s= 15599.46 pref_s=  2.1006 dec_tok_s= 348.642 ms_round=  2.8683 acc= kv_B=339486720
+  mtp0/nvfp4/a                 pp=1024   pref_tok_s= 21014.55 pref_s=  0.0487 dec_tok_s= 379.550 ms_round=  2.6348 acc= kv_B=189480960
+  mtp0/nvfp4/a                 pp=8192   pref_tok_s= 19004.98 pref_s=  0.4310 dec_tok_s= 371.054 ms_round=  2.6950 acc= kv_B=189480960
+  mtp0/nvfp4/a                 pp=32768  pref_tok_s= 15088.08 pref_s=  2.1718 dec_tok_s= 353.409 ms_round=  2.8296 acc= kv_B=189480960
+  mtp0/k8v4/a                  pp=1024   pref_tok_s= 21033.27 pref_s=  0.0487 dec_tok_s= 380.602 ms_round=  2.6274 acc= kv_B=264483840
+  mtp0/k8v4/a                  pp=8192   pref_tok_s= 19131.24 pref_s=  0.4282 dec_tok_s= 372.268 ms_round=  2.6863 acc= kv_B=264483840
+  mtp0/k8v4/a                  pp=32768  pref_tok_s= 15571.36 pref_s=  2.1044 dec_tok_s= 352.886 ms_round=  2.8338 acc= kv_B=264483840
+  mtp0/bf16/b                  pp=1024   pref_tok_s= 21060.93 pref_s=  0.0486 dec_tok_s= 372.298 ms_round=  2.6860 acc= kv_B=673710080
+  mtp0/bf16/b                  pp=8192   pref_tok_s= 19103.73 pref_s=  0.4288 dec_tok_s= 348.824 ms_round=  2.8668 acc= kv_B=673710080
+  mtp0/bf16/b                  pp=32768  pref_tok_s= 15195.91 pref_s=  2.1564 dec_tok_s= 308.345 ms_round=  3.2431 acc= kv_B=673710080
+  mtp0/int8/b                  pp=1024   pref_tok_s= 20952.88 pref_s=  0.0489 dec_tok_s= 372.512 ms_round=  2.6848 acc= kv_B=347381760
+  mtp0/int8/b                  pp=8192   pref_tok_s= 19018.14 pref_s=  0.4307 dec_tok_s= 361.495 ms_round=  2.7663 acc= kv_B=347381760
+  mtp0/int8/b                  pp=32768  pref_tok_s= 15179.58 pref_s=  2.1587 dec_tok_s= 332.515 ms_round=  3.0074 acc= kv_B=347381760
+  mtp0/fp8/b                   pp=1024   pref_tok_s= 21066.27 pref_s=  0.0486 dec_tok_s= 381.007 ms_round=  2.6247 acc= kv_B=339486720
+  mtp0/fp8/b                   pp=8192   pref_tok_s= 19135.76 pref_s=  0.4281 dec_tok_s= 366.316 ms_round=  2.7332 acc= kv_B=339486720
+  mtp0/fp8/b                   pp=32768  pref_tok_s= 15533.78 pref_s=  2.1095 dec_tok_s= 348.926 ms_round=  2.8659 acc= kv_B=339486720
+  mtp0/nvfp4/b                 pp=1024   pref_tok_s= 20993.59 pref_s=  0.0488 dec_tok_s= 379.652 ms_round=  2.6340 acc= kv_B=189480960
+  mtp0/nvfp4/b                 pp=8192   pref_tok_s= 18995.98 pref_s=  0.4312 dec_tok_s= 368.686 ms_round=  2.7124 acc= kv_B=189480960
+  mtp0/nvfp4/b                 pp=32768  pref_tok_s= 15108.05 pref_s=  2.1689 dec_tok_s= 353.279 ms_round=  2.8306 acc= kv_B=189480960
+  mtp0/k8v4/b                  pp=1024   pref_tok_s= 21015.99 pref_s=  0.0487 dec_tok_s= 380.208 ms_round=  2.6302 acc= kv_B=264483840
+  mtp0/k8v4/b                  pp=8192   pref_tok_s= 19115.92 pref_s=  0.4285 dec_tok_s= 371.926 ms_round=  2.6887 acc= kv_B=264483840
+  mtp0/k8v4/b                  pp=32768  pref_tok_s= 15561.47 pref_s=  2.1057 dec_tok_s= 352.736 ms_round=  2.8350 acc= kv_B=264483840
+
+[19:26:46] ##### mtp-draft-tokens = 3 #####
+  mtp3/bf16/a                  pp=1024   pref_tok_s= 19273.76 pref_s=  0.0531 dec_tok_s= 440.610 ms_round=  5.0091 acc=0.4046242775 kv_B=742653952
+  mtp3/bf16/a                  pp=8192   pref_tok_s= 18558.13 pref_s=  0.4414 dec_tok_s= 726.435 ms_round=  5.3411 acc=0.9693877551 kv_B=742653952
+  mtp3/bf16/a                  pp=32768  pref_tok_s= 15008.39 pref_s=  2.1834 dec_tok_s= 681.717 ms_round=  5.8675 acc=1 kv_B=742653952
+  mtp3/int8/a                  pp=1024   pref_tok_s= 19298.10 pref_s=  0.0531 dec_tok_s= 414.588 ms_round=  4.9799 acc=0.3586956522 kv_B=382930944
+  mtp3/int8/a                  pp=8192   pref_tok_s= 18542.57 pref_s=  0.4418 dec_tok_s= 735.299 ms_round=  5.4417 acc=0.9895833333 kv_B=382930944
+  mtp3/int8/a                  pp=32768  pref_tok_s= 15050.72 pref_s=  2.1772 dec_tok_s= 683.847 ms_round=  5.5052 acc=0.94 kv_B=382930944
+  mtp3/fp8/a                   pp=1024   pref_tok_s= 19381.66 pref_s=  0.0528 dec_tok_s= 433.554 ms_round=  5.0040 acc=0.3863636364 kv_B=374227968
+  mtp3/fp8/a                   pp=8192   pref_tok_s= 18751.77 pref_s=  0.4369 dec_tok_s= 759.166 ms_round=  5.2690 acc=0.9895833333 kv_B=374227968
+  mtp3/fp8/a                   pp=32768  pref_tok_s= 15453.79 pref_s=  2.1204 dec_tok_s= 728.044 ms_round=  5.4945 acc=1 kv_B=374227968
+  mtp3/nvfp4/a                 pp=1024   pref_tok_s= 19119.89 pref_s=  0.0536 dec_tok_s= 424.626 ms_round=  4.9418 acc=0.3681318681 kv_B=208871424
+  mtp3/nvfp4/a                 pp=8192   pref_tok_s= 18580.44 pref_s=  0.4409 dec_tok_s= 700.250 ms_round=  5.2227 acc=0.8761904762 kv_B=208871424
+  mtp3/nvfp4/a                 pp=32768  pref_tok_s= 15003.19 pref_s=  2.1841 dec_tok_s= 746.747 ms_round=  5.3566 acc=1 kv_B=208871424
+  mtp3/k8v4/a                  pp=1024   pref_tok_s= 19344.10 pref_s=  0.0529 dec_tok_s= 464.573 ms_round=  5.0096 acc=0.4444444444 kv_B=291549696
+  mtp3/k8v4/a                  pp=8192   pref_tok_s= 18730.18 pref_s=  0.4374 dec_tok_s= 758.475 ms_round=  5.1144 acc=0.9595959596 kv_B=291549696
+  mtp3/k8v4/a                  pp=32768  pref_tok_s= 15453.22 pref_s=  2.1205 dec_tok_s= 698.598 ms_round=  5.3889 acc=0.94 kv_B=291549696
+  mtp3/bf16/b                  pp=1024   pref_tok_s= 19283.00 pref_s=  0.0531 dec_tok_s= 439.689 ms_round=  5.0194 acc=0.4046242775 kv_B=742653952
+  mtp3/bf16/b                  pp=8192   pref_tok_s= 18583.88 pref_s=  0.4408 dec_tok_s= 719.240 ms_round=  5.3930 acc=0.9693877551 kv_B=742653952
+  mtp3/bf16/b                  pp=32768  pref_tok_s= 15067.81 pref_s=  2.1747 dec_tok_s= 681.203 ms_round=  5.8720 acc=1 kv_B=742653952
+  mtp3/int8/b                  pp=1024   pref_tok_s= 19721.93 pref_s=  0.0519 dec_tok_s= 425.366 ms_round=  4.8535 acc=0.3586956522 kv_B=382930944
+  mtp3/int8/b                  pp=8192   pref_tok_s= 18812.45 pref_s=  0.4355 dec_tok_s= 761.192 ms_round=  5.2549 acc=0.9895833333 kv_B=382930944
+  mtp3/int8/b                  pp=32768  pref_tok_s= 15105.88 pref_s=  2.1692 dec_tok_s= 685.772 ms_round=  5.4897 acc=0.94 kv_B=382930944
+  mtp3/fp8/b                   pp=1024   pref_tok_s= 19369.99 pref_s=  0.0529 dec_tok_s= 433.544 ms_round=  5.0041 acc=0.3863636364 kv_B=374227968
+  mtp3/fp8/b                   pp=8192   pref_tok_s= 18701.73 pref_s=  0.4380 dec_tok_s= 758.892 ms_round=  5.2715 acc=0.9895833333 kv_B=374227968
+  mtp3/fp8/b                   pp=32768  pref_tok_s= 15450.76 pref_s=  2.1208 dec_tok_s= 732.986 ms_round=  5.4571 acc=1 kv_B=374227968
+  mtp3/nvfp4/b                 pp=1024   pref_tok_s= 19216.10 pref_s=  0.0533 dec_tok_s= 425.959 ms_round=  4.9263 acc=0.3681318681 kv_B=208871424
+  mtp3/nvfp4/b                 pp=8192   pref_tok_s= 18556.61 pref_s=  0.4415 dec_tok_s= 699.164 ms_round=  5.2313 acc=0.8761904762 kv_B=208871424
+  mtp3/nvfp4/b                 pp=32768  pref_tok_s= 14998.80 pref_s=  2.1847 dec_tok_s= 746.597 ms_round=  5.3576 acc=1 kv_B=208871424
+  mtp3/k8v4/b                  pp=1024   pref_tok_s= 19325.60 pref_s=  0.0530 dec_tok_s= 465.450 ms_round=  5.0001 acc=0.4444444444 kv_B=291549696
+  mtp3/k8v4/b                  pp=8192   pref_tok_s= 18713.99 pref_s=  0.4377 dec_tok_s= 759.303 ms_round=  5.1091 acc=0.9595959596 kv_B=291549696
+  mtp3/k8v4/b                  pp=32768  pref_tok_s= 15384.83 pref_s=  2.1300 dec_tok_s= 698.566 ms_round=  5.3892 acc=0.94 kv_B=291549696
+
+[19:34:22] ##### dlinnyy kontekst 65536, mtp=0 i mtp=3 #####
+  L/mtp0/bf16 NET_DANNYH
+  L/mtp0/int8 NET_DANNYH
+  L/mtp0/fp8 NET_DANNYH
+  L/mtp0/k8v4 NET_DANNYH
+  L/mtp3/bf16 NET_DANNYH
+  L/mtp3/int8 NET_DANNYH
+  L/mtp3/fp8 NET_DANNYH
+  L/mtp3/k8v4 NET_DANNYH
+
+[19:34:23] KV_SPEED_DONE

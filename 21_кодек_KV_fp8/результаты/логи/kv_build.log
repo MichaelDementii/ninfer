@@ -1,0 +1,20 @@
+[19:13:57] chistim derevo
+  HEAD: 5973313d
+[19:13:57] nakat pravok
+warp tile 2x2 applied to q4 gate/up
+warp tile 2x2 applied to qx down
+kSparseMoePrefillWideMin = 1280
+  kSparseMoePrefillWideMin = 1280
+  izmeneno faylov: 2
+[19:13:58] sborka: ninfer ninfer-serve ninfer-perplexity ninfer_bench
+  SBORKA OK
+  q4_gate_up<8,64> rezidentnost: REG:80 STACK:0 SHARED:33792 
+total 926900
+drwxrwxr-x  2 root root       140 Sep  2 19:15 .
+drwxrwxr-x 44 root root      4096 Sep  2 19:15 ..
+-rwxrwxr-x  1 root root 190824720 Sep  2 19:15 ninfer
+-rwxrwxr-x  1 root root 190821328 Sep  2 19:15 ninfer-perplexity
+-rwxrwxr-x  1 root root 192822648 Sep  2 19:15 ninfer-serve
+-rwxrwxr-x  1 root root 190182432 Sep  2 19:15 ninfer_bench
+-rwxrwxr-x  1 root root 184476936 Sep  2 19:15 ninfer_sparse_moe_bench
+KV_BUILD_DONE

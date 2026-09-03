@@ -1,0 +1,136 @@
+schema_version: 1
+targets:
+  qwen35_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-35b-a3b
+    max_concurrency: 4
+    request:
+      timeout_seconds: 86400.0
+      retries: 2
+      retry_interval_seconds: 10.0
+      headers: {}
+suites:
+  aime25:
+    jobs:
+    - id: aime25
+      backend: evalscope
+      dataset: aime25
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+  aime26:
+    jobs:
+    - id: aime26
+      backend: evalscope
+      dataset: aime26
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+  ifbench:
+    jobs:
+    - id: ifbench
+      backend: evalscope
+      dataset: ifbench
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        few_shot_num: 0
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+  gpqa:
+    jobs:
+    - id: gpqa_diamond
+      backend: evalscope
+      dataset: gpqa_diamond
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        few_shot_num: 0
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+  aime_both:
+    jobs:
+    - id: aime25
+      backend: evalscope
+      dataset: aime25
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+    - id: aime26
+      backend: evalscope
+      dataset: aime26
+      repeats: 1
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        presence_penalty: 1.0
+        frequency_penalty: 0.0
+        max_tokens: 65536
+        seed: 42
+      backend_args:
+        judge_strategy: rule
+        dataset_hub: modelscope
+      target: qwen35_api
+      max_concurrency: 4
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1.0
+    heartbeat_seconds: 900.0
+  samples:
+    retention: all

@@ -1,0 +1,49 @@
+### Sreda kampanii
+data: 2026-09-03T14:28:14Z
+host: 99ec9f558191
+
+--- GPU:
+name, driver_version, memory.total [MiB], compute_cap
+NVIDIA GeForce RTX 5090, 580.173.02, 32607 MiB, 12.0
+
+--- CPU: 256 yader,  AMD EPYC 7B12 64-Core Processor
+awk: 1: unexpected character '\'
+awk: line 1: runaway string constant " GB\"} ...
+--- RAM: 
+
+--- CUDA:
+Cuda compilation tools, release 13.1, V13.1.115
+Build cuda_13.1.r13.1/compiler.37061995_0
+
+--- derevo ninfer:
+HEAD: 5973313d7f1e5dd8b7b74c197278372ecd89a900
+opisanie: test(frontend): make fixtures self-contained
+izmeneno faylov: 2
+ M src/ops/sparse_moe/prefill/sparse_moe_prefill.h
+ M src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+
+--- dvoichnye CAND:
+total 926900
+drwxrwxr-x  2 root root       140 Sep  2 19:15 .
+drwxrwxr-x 44 root root      4096 Sep  2 19:15 ..
+-rwxrwxr-x  1 root root 190824720 Sep  2 19:15 ninfer
+-rwxrwxr-x  1 root root 190821328 Sep  2 19:15 ninfer-perplexity
+-rwxrwxr-x  1 root root 192822648 Sep  2 19:15 ninfer-serve
+-rwxrwxr-x  1 root root 190182432 Sep  2 19:15 ninfer_bench
+-rwxrwxr-x  1 root root 184476936 Sep  2 19:15 ninfer_sparse_moe_bench
+
+--- rezidentnost klyuchevogo yadra:
+ Function __nv_static_51__1996d12f_29_sparse_moe_prefill_kernels_cu_8def5eb8__ZN6ninfer3ops6detail62_GLOBAL__N__1996d12f_29_sparse_moe_prefill_kernels_cu_8def5eb836sparse_moe_prefill_q4_gate_up_kernelILi8ELi64EEEvPK13__nv_bfloat16PKiS8_S8_S8_S8_PKhSA_PS4_:
+  REG:80 STACK:0 SHARED:33792 LOCAL:0 CONSTANT[0]:968 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function __nv_static_51__1996d12f_29_sparse_moe_prefill_kernels_cu_8def5eb8__ZN6ninfer3ops6detail62_GLOBAL__N__1996d12f_29_sparse_moe_prefill_kernels_cu_8def5eb832sparse_moe_prefill_gather_kernelILb0EEEvPK13__nv_bfloat16PKiS8_PiS8_PS4_S8_:
+
+--- artefakt modeli:
+total 22249268
+drwxrwxr-x 2 root root          44 Sep  1 21:14 .
+drwx------ 1 root root        4096 Sep  1 21:16 ..
+-rw-rw-r-- 1 root root 22783246080 Aug 31 12:16 qwen3_6_35b_a3b.ninfer
+sha256 (pervye 16): 1fb9ea0b5b8561e4
+
+--- eval stek:
+evalscope 1.10.0
+python 3.12.3

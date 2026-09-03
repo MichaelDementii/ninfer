@@ -1,0 +1,13 @@
+Perplexity result
+artifact: qwen3.6-35b-a3b / groupwise-int
+kv: nvfp4, corpus: ninfer-ppl-1m-v1 / full, context/stride: 65536/32768
+
+domain                            tokens        mean_nll             ppl
+chinese_reference                 262022        1.602404        4.964951
+english_long_form                 261408        1.998872        7.380729
+english_reference                 261223        1.728249        5.630784
+ninfer_code                       259904        0.505869        1.658426
+overall                          1044557        1.460257        4.307067
+
+score rate: 10994.5 tok/s
+report: "/root/exp/kv/ppl/L_nvfp4/report.json"

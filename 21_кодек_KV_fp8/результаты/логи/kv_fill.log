@@ -1,0 +1,9 @@
+[03:39:16] gpqa_bf16
+    gpqa_bf16 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.848500 | 198 | 0 | 2053.0s |
+[04:13:56] ifbench_bf16
+    ifbench_bf16 | ifbench | evalscope | ifbench | completed | prompt_level_strict | 0.596700 | 300 | 0 | 3113.1s |
+[05:06:16] gpqaC_int8
+    gpqaC_int8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.848500 | 198 | 0 | 2232.8s |
+[05:43:56] gpqaC_fp8
+    gpqaC_fp8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.828300 | 198 | 0 | 2234.4s |
+KV_FILL_DONE

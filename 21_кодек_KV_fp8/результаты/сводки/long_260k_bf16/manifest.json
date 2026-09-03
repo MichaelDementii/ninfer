@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "20260902T210149Z-c4fea0ed",
+  "suite": "long_260k",
+  "created_at": "2026-09-02T21:01:49.298922+00:00",
+  "config_fingerprint": "c4fea0ed73c643028227153bdd3eaa50094ea49510a43ac469f0c18c439e54d0",
+  "framework_version": "0.1.0",
+  "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
+  "platform": "Linux-5.15.0-187-generic-x86_64-with-glibc2.39",
+  "hostname": "99ec9f558191",
+  "repository": {
+    "commit": "5973313d7f1e5dd8b7b74c197278372ecd89a900",
+    "dirty": true
+  },
+  "packages": {
+    "evalscope": "1.10.0",
+    "bfcl-eval": "2025.10.27.1",
+    "soundfile": "0.14.0",
+    "PyYAML": "6.0.3",
+    "rich": "15.0.0"
+  },
+  "sample_retention": "all",
+  "targets": {
+    "qwen35_api": {
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:18080/v1",
+      "model": "qwen3.6-35b-a3b",
+      "api_key_env": null,
+      "max_concurrency": 1,
+      "provenance": {}
+    }
+  }
+}

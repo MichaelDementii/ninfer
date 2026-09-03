@@ -1,0 +1,32 @@
+Test project /root/ninfer_d4/build
+      Start 12: ninfer_kv_capacity_test
+ 1/11 Test #12: ninfer_kv_capacity_test ........................   Passed    0.00 sec
+      Start 16: ninfer_kv_cache_test
+ 2/11 Test #16: ninfer_kv_cache_test ...........................   Passed    0.38 sec
+      Start 27: ninfer_qwen3_6_35b_a3b_real_test
+ 3/11 Test #27: ninfer_qwen3_6_35b_a3b_real_test ...............***Skipped   0.05 sec
+      Start 28: ninfer_qwen3_6_35b_a3b_dflash_real_test
+ 4/11 Test #28: ninfer_qwen3_6_35b_a3b_dflash_real_test ........***Skipped   0.05 sec
+      Start 29: ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
+ 5/11 Test #29: ninfer_qwen3_6_35b_a3b_dflash_load_plan_test ...***Skipped   0.01 sec
+      Start 65: ninfer_softmax_attention_test
+ 6/11 Test #65: ninfer_softmax_attention_test ..................   Passed  154.21 sec
+      Start 66: ninfer_softmax_attention_nvfp4_test
+ 7/11 Test #66: ninfer_softmax_attention_nvfp4_test ............   Passed   33.24 sec
+      Start 67: ninfer_softmax_attention_k8v4_test
+ 8/11 Test #67: ninfer_softmax_attention_k8v4_test .............   Passed   83.53 sec
+      Start 69: ninfer_kv_cache_append_test
+ 9/11 Test #69: ninfer_kv_cache_append_test ....................   Passed    2.44 sec
+      Start 70: ninfer_kv_cache_append_nvfp4_test
+10/11 Test #70: ninfer_kv_cache_append_nvfp4_test ..............   Passed    1.88 sec
+      Start 71: ninfer_kv_cache_append_k8v4_test
+11/11 Test #71: ninfer_kv_cache_append_k8v4_test ...............   Passed    1.93 sec
+
+100% tests passed, 0 tests failed out of 11
+
+Total Test time (real) = 277.73 sec
+
+The following tests did not run:
+	 27 - ninfer_qwen3_6_35b_a3b_real_test (Skipped)
+	 28 - ninfer_qwen3_6_35b_a3b_dflash_real_test (Skipped)
+	 29 - ninfer_qwen3_6_35b_a3b_dflash_load_plan_test (Skipped)

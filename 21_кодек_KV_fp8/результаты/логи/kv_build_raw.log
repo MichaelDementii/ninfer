@@ -1,0 +1,11 @@
+[1/11] Building CXX object src/CMakeFiles/ninfer_ops.dir/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp.o
+[2/11] Building CXX object src/CMakeFiles/ninfer_ops.dir/ops/wrapper/sparse_moe.cpp.o
+[3/11] Building CUDA object src/CMakeFiles/ninfer_ops.dir/ops/linear_attention/gated_delta_net/chunked/state_passing.cu.o
+[4/11] Building CUDA object src/CMakeFiles/ninfer_ops.dir/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu.o
+[5/11] Linking CXX static library CMakeFiles/ninfer_ops.dir/cmake_device_link.o
+[6/11] Linking CXX static library src/libninfer_ops.a
+[7/11] Linking CXX executable apps/ninfer-serve
+[8/11] Linking CXX executable apps/ninfer
+[9/11] Linking CXX executable apps/ninfer-perplexity
+[10/11] Linking CXX executable bench/ninfer_sparse_moe_bench
+[11/11] Linking CXX executable bench/ninfer_bench

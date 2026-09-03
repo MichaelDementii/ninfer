@@ -1,0 +1,79 @@
+{
+  "artifact": {
+    "model_id": "qwen3.6-35b-a3b",
+    "path": "/root/models/qwen3_6_35b_a3b.ninfer",
+    "target": "qwen3_6_35b_a3b",
+    "weights_id": "groupwise-int"
+  },
+  "corpus": {
+    "id": "custom-long260k.txt",
+    "mode": "custom",
+    "source": "/root/exp/kv/ppl_long/long260k.txt",
+    "stream_count": 1
+  },
+  "domains": [
+    {
+      "domain": "custom",
+      "mean_nll": 1.408566104297621,
+      "perplexity": 4.090086439966923,
+      "scored_tokens": 261169,
+      "total_nll": 367873.8008933054
+    }
+  ],
+  "execution": {
+    "context_tokens": 262144,
+    "device": 0,
+    "kv_dtype": "bf16",
+    "prefill_chunk_tokens": 1024,
+    "purpose": "causal_scoring",
+    "score_tile_tokens": 1024,
+    "stride_tokens": 131072
+  },
+  "metric": {
+    "log_base": "natural",
+    "name": "fixed-window truncated-context causal perplexity"
+  },
+  "overall": {
+    "mean_nll": 1.408566104297621,
+    "perplexity": 4.090086439966923,
+    "scored_tokens": 261169,
+    "total_nll": 367873.8008933054
+  },
+  "schema_version": 1,
+  "streams": [
+    {
+      "domain": "custom",
+      "id": "long260k.txt",
+      "input_tokens": 261170,
+      "mean_nll": 1.408566104297621,
+      "path": "/root/exp/kv/ppl_long/long260k.txt",
+      "perplexity": 4.090086439966923,
+      "scored_tokens": 261169,
+      "seconds": 50.450687496,
+      "total_nll": 367873.8008933054,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 261170,
+          "mean_nll": 1.408566104297621,
+          "perplexity": 4.090086439966923,
+          "scored_tokens": 261169,
+          "seconds": 50.450464876,
+          "target_begin": 1,
+          "target_end": 261170,
+          "total_nll": 367873.8008933054
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "load_seconds": 9.104245363,
+    "read_and_tokenize_seconds": 0.177332559,
+    "score_seconds": 50.450721995,
+    "scored_tokens_per_second": 5176.714815416984,
+    "total_seconds": 60.00660517
+  }
+}

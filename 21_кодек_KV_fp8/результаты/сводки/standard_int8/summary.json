@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "20260902T202526Z-7c848f6a",
+  "status": "completed",
+  "results": [
+    {
+      "job_id": "needle_standard",
+      "backend": "evalscope",
+      "dataset": "needle_haystack",
+      "status": "completed",
+      "primary_metric": "accuracy",
+      "metrics": {
+        "chinese_accuracy": 0.98,
+        "english_accuracy": 0.67,
+        "accuracy": 0.825
+      },
+      "counts": {
+        "planned": 200,
+        "completed": 200,
+        "scored": 200,
+        "failed": 0,
+        "skipped": 0
+      },
+      "duration_seconds": 242.89193529309705,
+      "artifacts": [
+        "backends/needle_standard/evalscope-task.json",
+        "backends/needle_standard/evalscope-return.json",
+        "backends/needle_standard/reports/qwen3.6-35b-a3b/needle_haystack.json"
+      ],
+      "error": null
+    }
+  ]
+}

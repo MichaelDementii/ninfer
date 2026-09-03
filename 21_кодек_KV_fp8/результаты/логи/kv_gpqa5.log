@@ -1,0 +1,9 @@
+[06:31:34] gpqaS31337_int8
+    gpqaS31337_int8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.838400 | 198 | 0 | 2220.8s |
+[07:09:01] gpqaS31337_fp8
+    gpqaS31337_fp8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.853500 | 198 | 0 | 2167.8s |
+[07:45:37] gpqaS90210_int8
+    gpqaS90210_int8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.858600 | 198 | 0 | 2012.8s |
+[08:19:36] gpqaS90210_fp8
+    gpqaS90210_fp8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.833300 | 198 | 0 | 2072.0s |
+KV_GPQA5_DONE

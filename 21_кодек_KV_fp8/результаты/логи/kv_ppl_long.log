@@ -1,0 +1,22 @@
+[01:54:16] sklennyy dokument: 975351 bayt
+[01:54:16] --- bf16, kontekst 262144, shag 131072
+    rc=0 za 60 s
+    Perplexity result
+    overall                           261169        1.408566        4.090086
+[01:55:16] --- int8, kontekst 262144, shag 131072
+    rc=0 za 61 s
+    Perplexity result
+    overall                           261169        1.408745        4.090818
+[01:56:17] --- fp8, kontekst 262144, shag 131072
+    rc=0 za 57 s
+    Perplexity result
+    overall                           261169        1.408781        4.090964
+[01:57:14] --- k8v4, kontekst 262144, shag 131072
+    rc=0 za 58 s
+    Perplexity result
+    overall                           261169        1.409614        4.094373
+[01:58:12] --- nvfp4, kontekst 262144, shag 131072
+    rc=0 za 63 s
+    Perplexity result
+    overall                           261169        1.411649        4.102715
+KV_PPL_LONG_DONE

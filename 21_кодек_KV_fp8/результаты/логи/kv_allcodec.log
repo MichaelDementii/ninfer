@@ -1,0 +1,16 @@
+[07:56:41] zhdem KV_GPQA5_DONE
+[08:54:44] aime_both_nvfp4
+    aime_both_nvfp4 | aime25 | evalscope | aime25 | completed | accuracy | 0.900000 | 30 | 0 | 818.1s |
+    aime_both_nvfp4 | aime26 | evalscope | aime26 | completed | accuracy | 0.900000 | 30 | 0 | 803.3s |
+[09:22:16] aime_both_k8v4
+    aime_both_k8v4 | aime25 | evalscope | aime25 | completed | accuracy | 0.900000 | 30 | 0 | 800.3s |
+    aime_both_k8v4 | aime26 | evalscope | aime26 | completed | accuracy | 0.933300 | 30 | 0 | 752.4s |
+[09:48:37] gpqa_nvfp4
+    gpqa_nvfp4 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.848500 | 198 | 0 | 2005.4s |
+[10:22:30] gpqa_k8v4
+    gpqa_k8v4 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.833300 | 198 | 0 | 2015.2s |
+[10:56:35] ifbench_nvfp4
+    ifbench_nvfp4 | ifbench | evalscope | ifbench | completed | prompt_level_strict | 0.616700 | 300 | 0 | 2255.3s |
+[11:34:38] ifbench_k8v4
+    ifbench_k8v4 | ifbench | evalscope | ifbench | completed | prompt_level_strict | 0.600000 | 300 | 0 | 2618.0s |
+KV_ALLCODEC_DONE

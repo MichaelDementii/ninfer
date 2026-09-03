@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "run_id": "20260902T215551Z-f4aee2db",
+  "status": "completed",
+  "results": [
+    {
+      "job_id": "aime25",
+      "backend": "evalscope",
+      "dataset": "aime25",
+      "status": "completed",
+      "primary_metric": "accuracy",
+      "metrics": {
+        "accuracy": 0.8667
+      },
+      "counts": {
+        "planned": 30,
+        "completed": 30,
+        "scored": 30,
+        "failed": 0,
+        "skipped": 0
+      },
+      "duration_seconds": 832.3586883079261,
+      "artifacts": [
+        "backends/aime25/evalscope-task.json",
+        "backends/aime25/evalscope-return.json",
+        "backends/aime25/reports/qwen3.6-35b-a3b/aime25.json"
+      ],
+      "error": null
+    },
+    {
+      "job_id": "aime26",
+      "backend": "evalscope",
+      "dataset": "aime26",
+      "status": "completed",
+      "primary_metric": "accuracy",
+      "metrics": {
+        "accuracy": 0.9333
+      },
+      "counts": {
+        "planned": 30,
+        "completed": 30,
+        "scored": 30,
+        "failed": 0,
+        "skipped": 0
+      },
+      "duration_seconds": 722.442227085121,
+      "artifacts": [
+        "backends/aime26/evalscope-task.json",
+        "backends/aime26/evalscope-return.json",
+        "backends/aime26/reports/qwen3.6-35b-a3b/aime26.json"
+      ],
+      "error": null
+    }
+  ]
+}

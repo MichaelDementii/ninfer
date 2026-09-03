@@ -1,0 +1,10 @@
+[21:24:07] zhdem KV_AFTER_DONE
+[01:59:59] standard_nvfp4
+    standard_nvfp4 | needle_standard | evalscope | needle_haystack | completed | accuracy | 0.835000 | 200 | 0 | 243.3s |
+[02:04:31] long_128k_nvfp4
+    long_128k_nvfp4 | needle_128k | evalscope | needle_haystack | completed | accuracy | 0.863636 | 22 | 0 | 365.7s |
+[02:11:04] standard_k8v4
+    standard_k8v4 | needle_standard | evalscope | needle_haystack | completed | accuracy | 0.805000 | 200 | 0 | 240.2s |
+[02:15:33] long_128k_k8v4
+    long_128k_k8v4 | needle_128k | evalscope | needle_haystack | completed | accuracy | 0.818182 | 22 | 0 | 338.8s |
+KV_NIAHCTL_DONE

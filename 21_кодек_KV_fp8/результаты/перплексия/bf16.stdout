@@ -1,0 +1,10 @@
+Perplexity result
+artifact: qwen3.6-35b-a3b / groupwise-int
+kv: bf16, corpus: custom-long260k.txt / custom, context/stride: 262144/131072
+
+domain                            tokens        mean_nll             ppl
+custom                            261169        1.408566        4.090086
+overall                           261169        1.408566        4.090086
+
+score rate: 5176.7 tok/s
+report: "/root/exp/kv/ppl_long/bf16/report.json"

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "run_id": "20260903T011033Z-292677c0",
+  "status": "completed",
+  "results": [
+    {
+      "job_id": "ifbench",
+      "backend": "evalscope",
+      "dataset": "ifbench",
+      "status": "completed",
+      "primary_metric": "prompt_level_strict",
+      "metrics": {
+        "prompt_level_strict": 0.6333,
+        "inst_level_strict": 0.665,
+        "prompt_level_loose": 0.6633,
+        "inst_level_loose": 0.6917
+      },
+      "counts": {
+        "planned": 300,
+        "completed": 300,
+        "scored": 300,
+        "failed": 0,
+        "skipped": 0
+      },
+      "duration_seconds": 2486.0057914829813,
+      "artifacts": [
+        "backends/ifbench/evalscope-task.json",
+        "backends/ifbench/evalscope-return.json",
+        "backends/ifbench/reports/qwen3.6-35b-a3b/ifbench.json"
+      ],
+      "error": null
+    }
+  ]
+}

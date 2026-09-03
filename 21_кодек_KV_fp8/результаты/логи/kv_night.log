@@ -1,0 +1,109 @@
+[19:56:54] ########## NACHALO. bin=CAND (camp36 + 2x2 + porog 1280) ##########
+[19:56:54] 0) zhdem zaversheniya zamerov skorosti i dymovogo testa
+[19:56:54]    zamer skorosti zavershen
+[19:56:54] 1) PERPLEXIYA po pyati kodekam, dva protokola
+[20:15:57]    perplexiya zavershena
+[20:15:57] 1b) sobstvennye chislennye testy proekta po kodekam KV i po realnomu artefaktu 35B
+[20:20:35]    ctest rc=0 -- 100% tests passed, 0 tests failed out of 11
+       1/11 Test #12: ninfer_kv_capacity_test ........................   Passed    0.00 sec
+       2/11 Test #16: ninfer_kv_cache_test ...........................   Passed    0.38 sec
+       3/11 Test #27: ninfer_qwen3_6_35b_a3b_real_test ...............***Skipped   0.05 sec
+       4/11 Test #28: ninfer_qwen3_6_35b_a3b_dflash_real_test ........***Skipped   0.05 sec
+       5/11 Test #29: ninfer_qwen3_6_35b_a3b_dflash_load_plan_test ...***Skipped   0.01 sec
+       6/11 Test #65: ninfer_softmax_attention_test ..................   Passed  154.21 sec
+       7/11 Test #66: ninfer_softmax_attention_nvfp4_test ............   Passed   33.24 sec
+       8/11 Test #67: ninfer_softmax_attention_k8v4_test .............   Passed   83.53 sec
+       9/11 Test #69: ninfer_kv_cache_append_test ....................   Passed    2.44 sec
+      10/11 Test #70: ninfer_kv_cache_append_nvfp4_test ..............   Passed    1.88 sec
+      11/11 Test #71: ninfer_kv_cache_append_k8v4_test ...............   Passed    1.93 sec
+[20:20:35] ===== ETAP: standard (ctx=40960 conc=1 spec=no) =====
+[20:20:54]     server podnyat: kv=bf16 ctx=40960 conc=1 spec=no
+[20:20:54]     ocenka: standard [standard_bf16]
+[20:25:01]     rc=0 za 4 min, run=20260902T202054Z-7c848f6a
+      standard_bf16 | needle_standard | evalscope | needle_haystack | completed | accuracy | 0.805000 | 200 | 0 | 243.8s |
+[20:25:25]     server podnyat: kv=int8 ctx=40960 conc=1 spec=no
+[20:25:25]     ocenka: standard [standard_int8]
+[20:29:32]     rc=0 za 4 min, run=20260902T202526Z-7c848f6a
+      standard_int8 | needle_standard | evalscope | needle_haystack | completed | accuracy | 0.825000 | 200 | 0 | 242.9s |
+[20:29:55]     server podnyat: kv=fp8 ctx=40960 conc=1 spec=no
+[20:29:55]     ocenka: standard [standard_fp8]
+[20:33:57]     rc=0 za 4 min, run=20260902T202955Z-7c848f6a
+      standard_fp8 | needle_standard | evalscope | needle_haystack | completed | accuracy | 0.815000 | 200 | 0 | 238.2s |
+[20:34:03] ===== ETAP: long_64k (ctx=73728 conc=1 spec=no) =====
+[20:34:22]     server podnyat: kv=bf16 ctx=73728 conc=1 spec=no
+[20:34:22]     ocenka: long_64k [long_64k_bf16]
+[20:36:47]     rc=0 za 2 min, run=20260902T203422Z-c42413a6
+      long_64k_bf16 | needle_64k | evalscope | needle_haystack | completed | accuracy | 0.909091 | 22 | 0 | 141.3s |
+[20:37:11]     server podnyat: kv=int8 ctx=73728 conc=1 spec=no
+[20:37:11]     ocenka: long_64k [long_64k_int8]
+[20:39:36]     rc=0 za 2 min, run=20260902T203711Z-c42413a6
+      long_64k_int8 | needle_64k | evalscope | needle_haystack | completed | accuracy | 1.000000 | 22 | 0 | 141.5s |
+[20:40:01]     server podnyat: kv=fp8 ctx=73728 conc=1 spec=no
+[20:40:01]     ocenka: long_64k [long_64k_fp8]
+[20:42:20]     rc=0 za 2 min, run=20260902T204001Z-c42413a6
+      long_64k_fp8 | needle_64k | evalscope | needle_haystack | completed | accuracy | 1.000000 | 22 | 0 | 135.0s |
+[20:42:26] ===== ETAP: long_128k (ctx=139264 conc=1 spec=no) =====
+[20:42:44]     server podnyat: kv=bf16 ctx=139264 conc=1 spec=no
+[20:42:44]     ocenka: long_128k [long_128k_bf16]
+[20:48:50]     rc=0 za 6 min, run=20260902T204245Z-b81a90bd
+      long_128k_bf16 | needle_128k | evalscope | needle_haystack | completed | accuracy | 0.727273 | 22 | 0 | 361.6s |
+[20:49:15]     server podnyat: kv=int8 ctx=139264 conc=1 spec=no
+[20:49:15]     ocenka: long_128k [long_128k_int8]
+[20:55:17]     rc=0 za 6 min, run=20260902T204915Z-b81a90bd
+      long_128k_int8 | needle_128k | evalscope | needle_haystack | completed | accuracy | 0.818182 | 22 | 0 | 358.3s |
+[20:55:41]     server podnyat: kv=fp8 ctx=139264 conc=1 spec=no
+[20:55:41]     ocenka: long_128k [long_128k_fp8]
+[21:01:25]     rc=0 za 5 min, run=20260902T205541Z-b81a90bd
+      long_128k_fp8 | needle_128k | evalscope | needle_haystack | completed | accuracy | 0.818182 | 22 | 0 | 340.1s |
+[21:01:31] ===== ETAP: long_260k (ctx=262144 conc=1 spec=no) =====
+[21:01:49]     server podnyat: kv=bf16 ctx=262144 conc=1 spec=no
+[21:01:49]     ocenka: long_260k [long_260k_bf16]
+[21:19:47]     rc=0 za 17 min, run=20260902T210149Z-c4fea0ed
+      long_260k_bf16 | needle_260k | evalscope | needle_haystack | completed | accuracy | 0.954545 | 22 | 0 | 1074.4s |
+[21:20:11]     server podnyat: kv=int8 ctx=262144 conc=1 spec=no
+[21:20:11]     ocenka: long_260k [long_260k_int8]
+[21:38:04]     rc=0 za 17 min, run=20260902T212011Z-c4fea0ed
+      long_260k_int8 | needle_260k | evalscope | needle_haystack | completed | accuracy | 1.000000 | 22 | 0 | 1069.3s |
+[21:38:27]     server podnyat: kv=fp8 ctx=262144 conc=1 spec=no
+[21:38:27]     ocenka: long_260k [long_260k_fp8]
+[21:55:04]     rc=0 za 16 min, run=20260902T213827Z-c4fea0ed
+      long_260k_fp8 | needle_260k | evalscope | needle_haystack | completed | accuracy | 0.954545 | 22 | 0 | 993.1s |
+[21:55:09] 5) razvedka konteksta dlya tekstovogo nabora
+[21:55:27]     server podnyat: kv=int8 ctx=131072 conc=4 spec=yes
+[21:55:33]    maksimalnyy kontekst pri conc=4: 131072
+napisano: ctx=131072 aime=65536 ifbench=65536 gpqa=65536
+[21:55:33] ===== ETAP: aime_both (ctx=131072 conc=4 spec=yes) =====
+[21:55:51]     server podnyat: kv=int8 ctx=131072 conc=4 spec=yes
+[21:55:51]     ocenka: aime_both [aime_both_int8]
+[22:21:50]     rc=0 za 25 min, run=20260902T215551Z-f4aee2db
+      aime_both_int8 | aime25 | evalscope | aime25 | completed | accuracy | 0.866700 | 30 | 0 | 832.4s |
+      aime_both_int8 | aime26 | evalscope | aime26 | completed | accuracy | 0.933300 | 30 | 0 | 722.4s |
+[22:22:14]     server podnyat: kv=fp8 ctx=131072 conc=4 spec=yes
+[22:22:14]     ocenka: aime_both [aime_both_fp8]
+[22:48:30]     rc=0 za 26 min, run=20260902T222214Z-f4aee2db
+      aime_both_fp8 | aime25 | evalscope | aime25 | completed | accuracy | 0.900000 | 30 | 0 | 756.0s |
+      aime_both_fp8 | aime26 | evalscope | aime26 | completed | accuracy | 0.933300 | 30 | 0 | 817.1s |
+[22:48:54]     server podnyat: kv=bf16 ctx=131072 conc=4 spec=yes
+[22:48:54]     ocenka: aime_both [aime_both_bf16]
+[23:17:09]     rc=0 za 28 min, run=20260902T224854Z-f4aee2db
+      aime_both_bf16 | aime25 | evalscope | aime25 | completed | accuracy | 0.900000 | 30 | 0 | 871.5s |
+      aime_both_bf16 | aime26 | evalscope | aime26 | completed | accuracy | 0.900000 | 30 | 0 | 819.5s |
+[23:17:15] ===== ETAP: gpqa (ctx=131072 conc=4 spec=yes) =====
+[23:17:33]     server podnyat: kv=int8 ctx=131072 conc=4 spec=yes
+[23:17:33]     ocenka: gpqa [gpqa_int8]
+[23:51:51]     rc=0 za 34 min, run=20260902T231733Z-97c305fb
+      gpqa_int8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.863600 | 198 | 0 | 2054.2s |
+[23:52:16]     server podnyat: kv=fp8 ctx=131072 conc=4 spec=yes
+[23:52:16]     ocenka: gpqa [gpqa_fp8]
+[00:25:27]     rc=0 za 33 min, run=20260902T235216Z-97c305fb
+      gpqa_fp8 | gpqa_diamond | evalscope | gpqa_diamond | completed | accuracy | 0.813100 | 198 | 0 | 1987.2s |
+[00:25:33] ===== ETAP: ifbench (ctx=131072 conc=4 spec=yes) =====
+[00:25:50]     server podnyat: kv=int8 ctx=131072 conc=4 spec=yes
+[00:25:50]     ocenka: ifbench [ifbench_int8]
+[01:10:09]     rc=0 za 44 min, run=20260903T002550Z-292677c0
+      ifbench_int8 | ifbench | evalscope | ifbench | completed | prompt_level_strict | 0.610000 | 300 | 0 | 2654.4s |
+[01:10:33]     server podnyat: kv=fp8 ctx=131072 conc=4 spec=yes
+[01:10:33]     ocenka: ifbench [ifbench_fp8]
+[01:52:03]     rc=0 za 41 min, run=20260903T011033Z-292677c0
+      ifbench_fp8 | ifbench | evalscope | ifbench | completed | prompt_level_strict | 0.633300 | 300 | 0 | 2486.0s |
+[01:52:09] ########## KV_NIGHT_DONE ##########

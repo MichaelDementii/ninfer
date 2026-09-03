@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "20260902T204915Z-b81a90bd",
+  "status": "completed",
+  "results": [
+    {
+      "job_id": "needle_128k",
+      "backend": "evalscope",
+      "dataset": "needle_haystack",
+      "status": "completed",
+      "primary_metric": "accuracy",
+      "metrics": {
+        "chinese_accuracy": 1.0,
+        "english_accuracy": 0.6363636363636364,
+        "accuracy": 0.8181818181818182
+      },
+      "counts": {
+        "planned": 22,
+        "completed": 22,
+        "scored": 22,
+        "failed": 0,
+        "skipped": 0
+      },
+      "duration_seconds": 358.3256047030445,
+      "artifacts": [
+        "backends/needle_128k/evalscope-task.json",
+        "backends/needle_128k/evalscope-return.json",
+        "backends/needle_128k/reports/qwen3.6-35b-a3b/needle_haystack.json"
+      ],
+      "error": null
+    }
+  ]
+}

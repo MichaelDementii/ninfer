@@ -1,0 +1,14 @@
+[19:51:37] GPU svoboden, podnimayem server
+  server podnyat za 8 s
+{"data":[{"created":1788378716,"id":"qwen3.6-35b-a3b","max_model_len":40960,"object":"model","owned_by":"ninfer"}],"object":"list"}
+[19:51:56] proba NIAH
+  rc=0
+  run=20260902T195157Z-93289a66
+# Evaluation Summary: 20260902T195157Z-93289a66
+
+Status: `completed`
+
+| Job | Backend | Dataset | Status | Primary metric | Score | Completed | Failed | Duration |
+|---|---|---|---|---|---:|---:|---:|---:|
+| needle_smoke | evalscope | needle_haystack | completed | accuracy | 0.000000 | 1 | 0 | 18.4s |
+SMOKE_DONE
