@@ -359,6 +359,9 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    // The first width the TMA route admits with a partial last M tile. This output policy splits
+    // one row block across four destinations, so it needs its own ragged case.
+    failures += run_nvfp4_target_case(parent, 1025, ops::LinearPolicy::AllowA4);
     return failures;
 }
 

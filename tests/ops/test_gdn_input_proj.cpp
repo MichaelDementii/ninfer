@@ -218,6 +218,9 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    // Ragged: the last M tile is one real token and 255 of padding. This output policy splits one
+    // row block across two destinations, so it needs its own case.
+    failures += run_nvfp4_case(parent, 1025, ops::LinearPolicy::AllowA4);
     return failures;
 }
 
@@ -283,7 +286,7 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 613U));
 
-    int failures          = 0;
+    int failures = 0;
     for (int columns : {5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129}) {
         failures += run_fp8_case(parent, columns, ops::LinearPolicy::A16Only);
     }

@@ -95,6 +95,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
+        // Ragged: the last M tile is one real token and 255 of padding. This is the only route
+        // whose epilogue reads the residual at the token index, and the only in-place one.
+        Invocation{1025, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
         Invocation{16, ops::LinearPolicy::AllowA4},
         Invocation{32, ops::LinearPolicy::AllowA4},
@@ -103,7 +106,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{128, ops::LinearPolicy::AllowA4},
         Invocation{129, ops::LinearPolicy::AllowA4},
     };
-    constexpr std::int32_t kMaximumTokens = 1024;
+    // The host buffers below serve every invocation, so they are sized by the widest one rather
+    // than by a literal that has to be kept in step with the list.
+    const std::int32_t kMaximumTokens =
+        std::max_element(
+            invocations.begin(), invocations.end(),
+            [](const Invocation& a, const Invocation& b) { return a.tokens < b.tokens; })
+            ->tokens;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
@@ -145,7 +154,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
                 CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                    cudaMemcpyHostToDevice, stream));
+                                           cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

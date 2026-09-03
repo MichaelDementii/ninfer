@@ -14,21 +14,33 @@ int run_nvfp4_a4() {
         Invocation{4, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        // 1025 is the first width the route admits that is not a whole number of M tiles, and the
+        // emptiest: its last tile carries one real token and 255 of padding.
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     constexpr std::array gdn_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{2, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        // 1025 is the first width the route admits that is not a whole number of M tiles, and the
+        // emptiest: its last tile carries one real token and 255 of padding.
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     constexpr std::array gate_up_invocations{
         Invocation{5, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        // 1025 is the first width the route admits that is not a whole number of M tiles, and the
+        // emptiest: its last tile carries one real token and 255 of padding.
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     constexpr std::array residual_invocations{
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        // 1025 is the first width the route admits that is not a whole number of M tiles, and the
+        // emptiest: its last tile carries one real token and 255 of padding.
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     int failures = 0;
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,

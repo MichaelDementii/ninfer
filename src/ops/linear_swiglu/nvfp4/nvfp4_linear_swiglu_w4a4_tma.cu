@@ -41,13 +41,13 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
         const_cast<std::uint8_t*>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
         kPairN, CU_TENSOR_MAP_SWIZZLE_64B, "encode LinearSwiGLU weight codes TMA");
-    descriptors.a_scales =
-        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(activation_scales),
-                          CU_TENSOR_MAP_DATA_TYPE_UINT8, Schedule::kBlockM,
-                          (static_cast<std::uint64_t>(tokens) / Schedule::kBlockM) *
-                              kScaleTilesPerPlane * kScaleTileGroups,
-                          Schedule::kBlockM, Schedule::kBlockM, kScaleTileGroups,
-                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode LinearSwiGLU activation scales TMA");
+    descriptors.a_scales = nvfp4_make_tma_2d(
+        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        Schedule::kBlockM,
+        (static_cast<std::uint64_t>(nvfp4_w4a4_padded_tokens(tokens)) / Schedule::kBlockM) *
+            kScaleTilesPerPlane * kScaleTileGroups,
+        Schedule::kBlockM, Schedule::kBlockM, kScaleTileGroups, CU_TENSOR_MAP_SWIZZLE_NONE,
+        "encode LinearSwiGLU activation scales TMA");
     descriptors.b_scales =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                           16, kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -62,9 +62,8 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                          std::int32_t tokens, float alpha, cudaStream_t stream) {
-    if (tokens < M256N128S3::kBlockM || (tokens % M256N128S3::kBlockM) != 0) {
-        throw std::invalid_argument(
-            "nvfp4 LinearSwiGLU TMA requires a positive M256 full-tile token count");
+    if (tokens <= 0) {
+        throw std::invalid_argument("nvfp4 LinearSwiGLU TMA requires a positive token count");
     }
 
     using Geometry                     = Nvfp4MlpGateUpGeometry;
@@ -80,9 +79,10 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     const Nvfp4W4a4TmaDescriptors descriptors = make_descriptors<Geometry, M256N128S3>(
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr int kPairN = M256N128S3::kBlockN / 2;
-    const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
+    const dim3 grid((Geometry::kOutputRows / 2) / kPairN,
+                    (tokens + M256N128S3::kBlockM - 1) / M256N128S3::kBlockM);
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
-        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 

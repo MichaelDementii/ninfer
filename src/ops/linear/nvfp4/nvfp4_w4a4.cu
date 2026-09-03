@@ -40,17 +40,20 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
                            Nvfp4ScaleLayout scale_layout, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
-    const std::int32_t tasks  = tokens * ActivationGeometry::kGroupsPerRow;
-    const int blocks          = (tasks + kThreads - 1) / kThreads;
+    // The tiled layout is written over whole tiles, so its launch covers the padding as well.
+    const std::int32_t written_tokens =
+        scale_layout == Nvfp4ScaleLayout::Tiled ? nvfp4_w4a4_padded_tokens(tokens) : tokens;
+    const std::int32_t tasks = written_tokens * ActivationGeometry::kGroupsPerRow;
+    const int blocks         = (tasks + kThreads - 1) / kThreads;
     if (scale_layout == Nvfp4ScaleLayout::Tiled) {
         nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled>
             <<<blocks, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                               workspace.codes, workspace.scales, tokens,
-                                              weight.input_scale_divisor);
+                                              written_tokens, weight.input_scale_divisor);
     } else {
         nvfp4_w4a4_quantize_kernel<ActivationGeometry><<<blocks, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
-            weight.input_scale_divisor);
+            written_tokens, weight.input_scale_divisor);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -98,13 +101,6 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
                                 Nvfp4ScaleLayout scale_layout, cudaStream_t stream) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
-    }
-    // The tiled layout is a bijection onto the scale plane only for a whole number of token tiles.
-    // Every route that asks for it admits only such widths; check it here, where the layout is
-    // acted on, rather than trust each caller's own predicate.
-    if (scale_layout == Nvfp4ScaleLayout::Tiled && (x.ne[1] % kNvfp4TmaBlockM) != 0) {
-        throw std::invalid_argument(
-            "nvfp4 W4A4 tiled activation scales require a whole number of token tiles");
     }
     switch (weight.k) {
     case Nvfp4Activation5120Geometry::kInputRows:

@@ -35,6 +35,12 @@ inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
 // why the load below is issued on even k-tiles only.
 inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
 
+// Token extent the tiled scale plane is written over: the layout is a bijection onto whole tiles,
+// so a ragged token count is padded up to one and the padding is filled with zeroes.
+[[nodiscard]] inline constexpr std::int32_t nvfp4_w4a4_padded_tokens(std::int32_t tokens) {
+    return ((tokens + kNvfp4TmaBlockM - 1) / kNvfp4TmaBlockM) * kNvfp4TmaBlockM;
+}
+
 // Layout the quantizer writes the activation scale plane in. Named rather than passed as a flag so
 // that a call site forcing one of them says which.
 enum class Nvfp4ScaleLayout : std::uint8_t {
