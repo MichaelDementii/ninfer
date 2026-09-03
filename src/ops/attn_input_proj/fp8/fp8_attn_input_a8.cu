@@ -53,6 +53,22 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    using TmaSchedule = typename Fp8LinearA8TmaSchedule<Geometry>::Type;
+    if (fp8_a8_tma_applies<Geometry, TmaSchedule, Schedule>(x.ne[1], workspace.codes,
+                                                            weight.qdata)) {
+        const Fp8AttentionInputOutput output{
+            static_cast<__nv_bfloat16*>(q.data),
+            static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data),
+            static_cast<__nv_bfloat16*>(v.data),
+        };
+        fp8_a8_tma_launch<Geometry, TmaSchedule>(workspace.codes, workspace.scales,
+                                                 static_cast<const std::uint8_t*>(weight.qdata),
+                                                 static_cast<const __nv_bfloat16*>(weight.scales),
+                                                 x.ne[1], Fp8IdentityEpilogue{}, output, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
         launch_mma<true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     } else {

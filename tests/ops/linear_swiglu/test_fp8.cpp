@@ -10,7 +10,10 @@ int main() {
 
     try {
         constexpr std::array<std::int32_t, 2> kA16Cases{1, 2};
-        constexpr std::array<std::int32_t, 6> kA8Cases{1, 2, 3, 48, 65, 1024};
+        // 4096 and 4288 are the point of this list: below them the TMA-staged route declines,
+        // so without them the paired-rows instantiation this op is the only user of - two
+        // TMA loads per stage, a non-identity row policy - is never executed by any test.
+        constexpr std::array<std::int32_t, 8> kA8Cases{1, 2, 3, 48, 65, 1024, 4096, 4288};
         int failures = 0;
         failures += run_profile(
             "LinearSwiGLU FP8_A16",

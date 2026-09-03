@@ -391,7 +391,9 @@ int run_fp8_target() {
     }
     failures += run_fp8_target_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_fp8_target_case(parent, 2, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024}) {
+    // 1024 already reaches the TMA-staged route; 4288 is the first width here that leaves
+    // it a partial trailing tile, which this op output type otherwise never sees.
+    for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024, 4288}) {
         failures += run_fp8_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;
