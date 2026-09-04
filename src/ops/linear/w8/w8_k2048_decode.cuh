@@ -50,14 +50,14 @@ __global__ __launch_bounds__(RowsPerCta * 32,
     for (int phase = 0; phase < kPhases; ++phase) {
         unsigned scale_bits = 0;
         if (lane < kGroupsPerPhase) {
-            scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scale_bits = load_vec_streaming<std::uint16_t>(
                 scale_row + static_cast<std::int64_t>(phase * kGroupsPerPhase + lane) * 2);
         }
         scale_bits        = __shfl_sync(kFullWarpMask, scale_bits, lane >> 2);
         const float scale = __half2float(__ushort_as_half(scale_bits));
 
         const int phase_k  = phase * kValuesPerPhase + lane * kValuesPerLane;
-        const uint2 packed = load_vec<uint2>(code_row + phase_k);
+        const uint2 packed = load_vec_streaming<uint2>(code_row + phase_k);
         float weights[kValuesPerLane];
 #pragma unroll
         for (int word_index = 0; word_index < 2; ++word_index) {

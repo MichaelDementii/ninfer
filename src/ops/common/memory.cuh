@@ -14,6 +14,16 @@ __device__ __forceinline__ V load_vec(const T* ptr) {
     return *reinterpret_cast<const V*>(ptr);
 }
 
+// Weight codes and their group scales are read once per decode round and never revisited, while the
+// activation tile under them is re-read by every row of every CTA. ld.global.cs marks the weight
+// lines evict-first, so a 2.5 GB weight stream stops evicting the working set it shares L2 with.
+template <class V, class T>
+__device__ __forceinline__ V load_vec_streaming(const T* ptr) {
+    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
+                  sizeof(V) == 16);
+    return __ldcs(reinterpret_cast<const V*>(ptr));
+}
+
 template <class V, class T>
 __device__ __forceinline__ V load_ldg(const T* ptr) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||

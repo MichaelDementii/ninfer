@@ -104,11 +104,11 @@ struct Q5Codec {
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
                std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
-        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+        const std::uint32_t packed = load_vec_streaming<std::uint32_t>(
             codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
-        const std::uint8_t high_bits =
-            high[group_index * Q5RowSplitStorage::kHighBytesPerGroup + lane_in_group];
-        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+        const std::uint8_t high_bits = load_vec_streaming<std::uint8_t>(
+            high + group_index * Q5RowSplitStorage::kHighBytesPerGroup + lane_in_group);
+        const auto scale_bits = load_vec_streaming<std::uint16_t>(
             scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
         Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
     }
@@ -121,11 +121,11 @@ struct Q6Codec {
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
                std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
-        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+        const std::uint32_t packed = load_vec_streaming<std::uint32_t>(
             codes + group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
-        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
+        const std::uint16_t high_bits = load_vec_streaming<std::uint16_t>(
             high + group_index * Q6RowSplitStorage::kHighBytesPerGroup + lane_in_group * 2);
-        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+        const auto scale_bits = load_vec_streaming<std::uint16_t>(
             scales + group_index * Q6RowSplitStorage::kScaleBytesPerGroup);
         Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
     }
