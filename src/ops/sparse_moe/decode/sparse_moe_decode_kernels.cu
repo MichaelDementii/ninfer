@@ -104,6 +104,18 @@ struct Q5Codec {
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
                std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+#if defined(NINFER_ABLATE_D4_WEIGHTS)
+        // Ablation arm: the weight stream is removed and the loop, the decode and the FMAs stay.
+        // What is left is the activation stream plus the kernel's own ramp and tail. Numerically
+        // meaningless by construction; never gated, never shipped.
+        (void)codes;
+        (void)high;
+        (void)scales;
+        (void)group_index;
+        (void)lane_in_group;
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { weights[item] = 1.0f; }
+#else
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
             codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
         const std::uint8_t high_bits =
@@ -111,6 +123,7 @@ struct Q5Codec {
         const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
             scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
         Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
+#endif
     }
 };
 
@@ -338,8 +351,15 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
         const int lane_in_group = lane & 7;
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group = group_base + lane_group;
+#if defined(NINFER_ABLATE_D4_ACT)
+            // Ablation arm: the activation stream is removed, the weight stream stays.
+            const float4 x0 = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            const float4 x1 = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            (void)x;
+#else
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
+#endif
             const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
