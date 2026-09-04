@@ -46,7 +46,10 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 2048:
-        if (n == 131072) {
+        // The draft head is registered at three widths: the full row set and the two
+        // narrowed domains the coverage report measures (98304 -> 98.23%, 65536 -> 96.31%).
+        // Every route below takes its row count from the weight, so one gate serves all three.
+        if (n == 131072 || n == 98304 || n == 65536) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
             if (t <= 20) { return launch_q4_draft_head_small_t; }
             if (t <= 32) { return launch_q4_mma_r64_c32; }
