@@ -343,6 +343,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
+    // The row max and the running max are kept in unscaled QK units, so the per-element "* scale"
+    // drops out of the QK epilogue and rides into the softmax exponent instead. scale is positive,
+    // so scaling commutes with the max.
+    const float scale_l2 = scale * Log2E;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
@@ -462,19 +466,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key1 = k0 + col1;
                 score[nt][0] =
                     (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
-                        ? score[nt][0] * scale
+                        ? score[nt][0]
                         : -CUDART_INF_F;
                 score[nt][1] =
                     (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
-                        ? score[nt][1] * scale
+                        ? score[nt][1]
                         : -CUDART_INF_F;
                 score[nt][2] =
                     (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
-                        ? score[nt][2] * scale
+                        ? score[nt][2]
                         : -CUDART_INF_F;
                 score[nt][3] =
                     (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
-                        ? score[nt][3] * scale
+                        ? score[nt][3]
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
@@ -482,28 +486,34 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
 
-            const float nm0    = fmaxf(m0, bm0);
-            const float nm1    = fmaxf(m1, bm1);
-            const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
-            const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
+            const float nm0 = fmaxf(m0, bm0);
+            const float nm1 = fmaxf(m1, bm1);
+            // A split can hold no key at all for a row, and then the row max is -inf. Clamping the
+            // shifted max to zero in that case keeps the exponent at -inf instead of turning it
+            // into (-inf) + (+inf) = NaN, which is what lets the element loop below drop its
+            // guards: a masked score is -inf, ex2.approx(-inf) is +0, and a fully masked row
+            // yields all zeros.
+            const float nm0_scaled = (nm0 > -CUDART_INF_F) ? nm0 * scale_l2 : 0.0f;
+            const float nm1_scaled = (nm1 > -CUDART_INF_F) ? nm1 * scale_l2 : 0.0f;
+            // A tile that does not raise the row max carries alpha == 1 exactly, and the consumer
+            // warps read that value to skip their rescale. Writing the exact one keeps the skip
+            // free of rounding rather than one ulp away from it.
+            const float alpha0 = (m0 == -CUDART_INF_F)  ? 0.0f
+                                 : (nm0 > m0)           ? exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled))
+                                                        : 1.0f;
+            const float alpha1 = (m1 == -CUDART_INF_F)  ? 0.0f
+                                 : (nm1 > m1)           ? exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled))
+                                                        : 1.0f;
 
             float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;
                 const int col1  = col0 + 1;
-                const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                      ? exp2_approx((score[nt][0] - nm0) * Log2E)
-                                      : 0.0f;
-                const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                      ? exp2_approx((score[nt][1] - nm0) * Log2E)
-                                      : 0.0f;
-                const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                      ? exp2_approx((score[nt][2] - nm1) * Log2E)
-                                      : 0.0f;
-                const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                      ? exp2_approx((score[nt][3] - nm1) * Log2E)
-                                      : 0.0f;
+                const float p00 = exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
+                const float p01 = exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
+                const float p10 = exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
+                const float p11 = exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)] = __float2bfloat16(p00);
@@ -561,12 +571,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         __nv_bfloat16* p_consumer   = &p_s[consumer_row_base * Bc];
         const float alpha0          = alpha_s[consumer_row_base + gid];
         const float alpha1          = alpha_s[consumer_row_base + gid + 8];
+        // Once the running max has settled the producer publishes an exact one, and the rescale is
+        // 4 * PVNtPerWarp multiplications by it. The vote makes the branch warp-uniform.
+        if (__any_sync(FullMask, alpha0 != 1.0f || alpha1 != 1.0f)) {
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
         }
 
 #pragma unroll
@@ -596,18 +610,25 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     if (warp < RowTiles && lid == 0) {
         const int row0 = warp * 16 + gid;
         const int row1 = row0 + 8;
+        // The running max was carried unscaled; the reducer weights splits by expf(m_split - M) and
+        // wants the scaled logit, so the scale comes back here -- once per row instead of once per
+        // score element. -inf * scale stays -inf, which is the empty-split signal the reducer reads.
+        const float m0_out = m0 * scale;
+        const float m1_out = m1 * scale;
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m0;
+            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+                m0_out;
             partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l0;
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m1;
+            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+                m1_out;
             partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
         }
     }
