@@ -59,7 +59,12 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
         const int id = lane + item * 32;
+#if defined(NINFER_ABLATE_TOP8_LOAD)
+        // Ablation: the score load is replaced by a synthetic value, everything else stays.
+        local[item]  = {static_cast<float>(255 - id), id, lane};
+#else
         local[item]  = {scores[id], id, lane};
+#endif
     }
 #pragma unroll
     for (int i = 1; i < 8; ++i) {
@@ -77,6 +82,17 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
     // reductions replace the whole round: one for the winning value, one for the lowest index
     // holding it, which is exactly the tie-break sparse_moe_ranked_better applies. Both broadcast
     // their result, so the reads below need no shuffle at all.
+#if defined(NINFER_ABLATE_TOP8_EXTRACT)
+    // Ablation: the eight extraction rounds are removed, the load and the sort stay.
+    if (lane == 0) {
+#pragma unroll
+        for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
+            ids[rank]             = local[rank].id;
+            selected_logits[rank] = local[rank].value;
+        }
+    }
+    __syncwarp();
+#else
     int cursor = 0;
 #pragma unroll
     for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
@@ -94,6 +110,7 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
         if (key == best && id == winner) { ++cursor; }
         __syncwarp();
     }
+#endif
 
     float exponential = 0.0f;
     if (lane < kSparseMoeTopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }
