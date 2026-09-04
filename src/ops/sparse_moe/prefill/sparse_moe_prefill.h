@@ -17,7 +17,11 @@ inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
-inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
+// The wide plan chooses a 64-column job tile over a 32-column one, and what decides between
+// them is the column run an expert actually gets, not the token count: at top-8 of 256 that run
+// averages tokens/32. The two plans were measured to tie at 40 columns per expert, which is 1280
+// tokens; below it the wide tile multiplies padding.
+inline constexpr std::int32_t kSparseMoePrefillWideMin      = 1280;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
 // 257 logits padded to a 16-byte-aligned per-token stride.
