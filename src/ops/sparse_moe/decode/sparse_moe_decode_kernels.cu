@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -539,10 +540,29 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
-    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden), dim3(9 * 32), 0, stream},
-                                     sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids, alpha,
-                                     shared_scale, act, routed_codes, routed_high, routed_scales,
-                                     shared_codes, shared_scales, output));
+    // Measurement scaffold for the rows-per-CTA axis. One row per CTA makes every one of the 2048
+    // blocks re-read the 512 FP32 activations of its own path from global -- 18 KiB per CTA, about
+    // 37 MB of L2 traffic per layer -- and amortises that read over a single output row. Rows > 1
+    // reuses the loaded activation across rows inside dot_fp32_rows and divides both the grid and
+    // that traffic. NINFER_D4_ROWS selects the instantiation; the default is the shipped shape.
+    const auto rows = [] {
+        const char* env = std::getenv("NINFER_D4_ROWS");
+        const int value = (env != nullptr) ? std::atoi(env) : 1;
+        return (value == 2 || value == 4 || value == 8 || value == 16) ? value : 1;
+    }();
+    auto launch = [&]<int Rows>() {
+        CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / Rows), dim3(9 * 32), 0, stream},
+                                         sparse_moe_d4_nine_warp_kernel<Codec, Rows>, ids, alpha,
+                                         shared_scale, act, routed_codes, routed_high,
+                                         routed_scales, shared_codes, shared_scales, output));
+    };
+    switch (rows) {
+    case 2: launch.template operator()<2>(); return;
+    case 4: launch.template operator()<4>(); return;
+    case 8: launch.template operator()<8>(); return;
+    case 16: launch.template operator()<16>(); return;
+    default: launch.template operator()<1>(); return;
+    }
 }
 
 void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
