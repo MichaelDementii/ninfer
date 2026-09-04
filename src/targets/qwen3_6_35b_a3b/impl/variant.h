@@ -34,7 +34,17 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr std::int32_t draft_head_rows              = 131072;
+    // Rows the draft head is asked to produce. The artifact always stores 131072 of them,
+    // ordered so that a prefix is the frequent part of the domain: the coverage report puts
+    // 98304 at 98.23% and 65536 at 96.31% of held-out acceptances. Narrowing changes only
+    // which tokens the draft may propose; every proposal is still verified by the target
+    // head, so the accepted text stays exactly what the target would have produced.
+    static constexpr std::int32_t draft_head_stored_rows       = 131072;
+#if defined(NINFER_DRAFT_HEAD_ROWS)
+    static constexpr std::int32_t draft_head_rows              = NINFER_DRAFT_HEAD_ROWS;
+#else
+    static constexpr std::int32_t draft_head_rows              = draft_head_stored_rows;
+#endif
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

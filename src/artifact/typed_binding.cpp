@@ -85,7 +85,12 @@ Weight contiguous_weight(const MaterializedArtifact& materialized, ObjectHandle 
 }
 
 Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
-                        NumericFormat format, std::int32_t rows, std::int32_t columns) {
+                        NumericFormat format, std::int32_t rows, std::int32_t columns,
+                        std::int32_t active_rows) {
+    // The plane offsets come from the stored row count, because that is what sized the payload:
+    // the high-bit and scale planes begin after a full codes plane. active_rows only narrows how
+    // many of those rows an operator is asked to produce. Each plane is row-major with rows
+    // outermost, so a prefix of rows is a prefix of every plane and no pointer moves.
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
     const RowSplitGeometry geometry          = row_split_geometry(format, shape);
@@ -101,14 +106,14 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
     out.qdata            = bytes;
     out.qhigh       = geometry.high_plane_bytes == 0 ? nullptr : bytes + geometry.high_plane_offset;
     out.scales      = bytes + geometry.scale_plane_offset;
-    out.n           = rows;
+    out.n           = active_rows;
     out.k           = columns;
     out.group       = static_cast<std::int32_t>(geometry.group_size);
     out.scale_dtype = DType::FP16;
     out.ndim        = 2;
-    out.shape[0]    = rows;
+    out.shape[0]    = active_rows;
     out.shape[1]    = columns;
-    out.padded_shape[0] = rows;
+    out.padded_shape[0] = active_rows;
     out.padded_shape[1] = static_cast<std::int32_t>(geometry.padded_columns);
     return out;
 }
@@ -178,10 +183,19 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 }
 
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
-                           NumericFormat format, std::int32_t rows, std::int32_t columns) {
+                           NumericFormat format, std::int32_t rows, std::int32_t columns,
+                           std::int32_t active_rows) {
     if (format == NumericFormat::NVFP4) {
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
+    }
+    if (active_rows == 0) { active_rows = rows; }
+    if (active_rows < 0 || active_rows > rows) {
+        throw std::invalid_argument("materialized_weight: active rows outside the stored rows");
+    }
+    if (active_rows != rows && storage_layout_for(format) != StorageLayout::RowSplitK128V1) {
+        throw std::invalid_argument(
+            "materialized_weight: narrowing the row count is defined for row-split storage only");
     }
     if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns);
@@ -189,7 +203,7 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns);
     }
-    return row_split_weight(materialized, handle, format, rows, columns);
+    return row_split_weight(materialized, handle, format, rows, columns, active_rows);
 }
 
 } // namespace ninfer::artifact

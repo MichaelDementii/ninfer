@@ -1,6 +1,7 @@
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
+#include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -294,7 +295,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::Q4G64_F16S, 131072, 2048);
+                                                           NumericFormat::Q4G64_F16S, Variant::draft_head_stored_rows, 2048,
+                                                           Variant::draft_head_rows);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }
