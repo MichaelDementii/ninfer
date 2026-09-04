@@ -61,16 +61,39 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
         const int id = lane + item * 32;
         local[item]  = {scores[id], id, lane};
     }
-#pragma unroll
-    for (int i = 1; i < 8; ++i) {
-        const SparseMoeRankedValue value = local[i];
-        int position                     = i;
-        while (position > 0 && sparse_moe_ranked_better(value, local[position - 1])) {
-            local[position] = local[position - 1];
-            --position;
-        }
-        local[position] = value;
-    }
+    // Batcher odd-even merge sort, nineteen comparators at depth six. The insertion sort this
+    // replaces carried a data-dependent inner loop: every lane of the warp walked a different
+    // number of steps, so the whole warp paid for the worst lane on every one of the seven
+    // insertions. A network is branch-free and always the same length, and it sorts by the same
+    // predicate, so the order it produces is identical.
+#define NINFER_MOE_SORT_STEP(a, b)                                                                 \
+    do {                                                                                           \
+        const SparseMoeRankedValue lo = local[a];                                                  \
+        const SparseMoeRankedValue hi = local[b];                                                  \
+        const bool swap               = sparse_moe_ranked_better(hi, lo);                          \
+        local[a]                      = swap ? hi : lo;                                            \
+        local[b]                      = swap ? lo : hi;                                            \
+    } while (false)
+    NINFER_MOE_SORT_STEP(0, 1);
+    NINFER_MOE_SORT_STEP(2, 3);
+    NINFER_MOE_SORT_STEP(4, 5);
+    NINFER_MOE_SORT_STEP(6, 7);
+    NINFER_MOE_SORT_STEP(0, 2);
+    NINFER_MOE_SORT_STEP(1, 3);
+    NINFER_MOE_SORT_STEP(4, 6);
+    NINFER_MOE_SORT_STEP(5, 7);
+    NINFER_MOE_SORT_STEP(1, 2);
+    NINFER_MOE_SORT_STEP(5, 6);
+    NINFER_MOE_SORT_STEP(0, 4);
+    NINFER_MOE_SORT_STEP(1, 5);
+    NINFER_MOE_SORT_STEP(2, 6);
+    NINFER_MOE_SORT_STEP(3, 7);
+    NINFER_MOE_SORT_STEP(2, 4);
+    NINFER_MOE_SORT_STEP(3, 5);
+    NINFER_MOE_SORT_STEP(1, 2);
+    NINFER_MOE_SORT_STEP(3, 4);
+    NINFER_MOE_SORT_STEP(5, 6);
+#undef NINFER_MOE_SORT_STEP
 
     // Each rank used to cost a five-step shuffle tournament plus a broadcast -- eight rounds of
     // eighteen dependent shuffles, on one warp, while the rest of the machine waits. Two redux.sync
