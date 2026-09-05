@@ -27,6 +27,7 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
+  core/l2_persist.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/context_cost.cpp
   runtime/engine/context_cost_defaults.cpp
