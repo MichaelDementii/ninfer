@@ -365,9 +365,7 @@ void causal_attention_small_t_launch(
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_small_t_fp8_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                             envelope, column_begin, width, partial_acc, partial_m,
-                                            partial_l, out, stream);
-        // These codecs take a different partial route whose reducer has no fused epilogue.
-        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
+                                            partial_l, out, stream, gate);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
@@ -414,9 +412,7 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_cached_small_t_fp8_launch(q, pos, scale, cache, envelope, partial_acc,
-                                                   partial_m, partial_l, out, stream);
-        // These codecs take a different partial route whose reducer has no fused epilogue.
-        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
+                                                   partial_m, partial_l, out, stream, gate);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {

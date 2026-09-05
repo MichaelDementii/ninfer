@@ -587,7 +587,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_fp8_reduce_outpu
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate) {
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
@@ -634,7 +634,11 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_fp8_reduce_outpu
     if (head_m == -CUDART_INF_F) {
         const int d = d_start + tid;
         if (tid < DChunk && d < kCausalHeadDim) {
-            out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0F);
+            const auto zero_index = causal_q_index<Geometry>(q_head, d, output_column);
+            out[zero_index] =
+                gate == nullptr
+                    ? __float2bfloat16(0.0F)
+                    : __float2bfloat16_rn(0.0F * sigmoid(__bfloat162float(gate[zero_index])));
         }
         return;
     }
@@ -684,7 +688,16 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_fp8_reduce_outpu
         valid = absolute_column < valid_columns[batch];
     }
     const float value = valid && head_l > 0.0F ? numerator / head_l : 0.0F;
-    out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const auto out_index = causal_q_index<Geometry>(q_head, d, output_column);
+    if (gate == nullptr) {
+        out[out_index] = __float2bfloat16(value);
+    } else {
+        // Same replication as the int8 reducer: round first, multiply in FP32, round on
+        // the store, so the fused result matches the standalone gate Op bit for bit.
+        const __nv_bfloat16 reduced = __float2bfloat16(value);
+        const float gated = __bfloat162float(reduced) * sigmoid(__bfloat162float(gate[out_index]));
+        out[out_index]    = __float2bfloat16_rn(gated);
+    }
 }
 
 } // namespace ninfer::ops

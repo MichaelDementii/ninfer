@@ -62,7 +62,8 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
                        std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
-                       const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                       const Tensor& partial_l, Tensor& out, cudaStream_t stream,
+                       const Tensor* gate) {
     constexpr int Block  = 256;
     constexpr int DChunk = 64;
     const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
@@ -77,7 +78,8 @@ void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& in
                 ? nullptr
                 : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
-            splits, static_cast<__nv_bfloat16*>(out.data));
+            splits, static_cast<__nv_bfloat16*>(out.data),
+            gate == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(gate->data));
     };
     if (invocation.column_begin == 0) {
         launch.template operator()<false>();
@@ -94,7 +96,8 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
                                              const CausalSmallTInvocation& invocation,
                                              CausalAttentionExecutionEnvelope envelope,
                                              Tensor& partial_acc, Tensor& partial_m,
-                                             Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                                             Tensor& partial_l, Tensor& out,
+                                             cudaStream_t stream, const Tensor* gate) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits = causal_attention_split_capacity(Geometry::QHeads, invocation.width,
                                                         cache.storage, envelope);
@@ -146,17 +149,17 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
     if (invocation.batch_size == 1) {
         if (masked) {
             launch_fp8_reduce<Geometry, false, true>(positions, invocation, splits, partial_acc,
-                                                     partial_m, partial_l, out, stream);
+                                                     partial_m, partial_l, out, stream, gate);
         } else {
             launch_fp8_reduce<Geometry, false, false>(positions, invocation, splits, partial_acc,
-                                                      partial_m, partial_l, out, stream);
+                                                      partial_m, partial_l, out, stream, gate);
         }
     } else if (masked) {
         launch_fp8_reduce<Geometry, true, true>(positions, invocation, splits, partial_acc,
-                                                partial_m, partial_l, out, stream);
+                                                partial_m, partial_l, out, stream, gate);
     } else {
         launch_fp8_reduce<Geometry, true, false>(positions, invocation, splits, partial_acc,
-                                                 partial_m, partial_l, out, stream);
+                                                 partial_m, partial_l, out, stream, gate);
     }
 }
 
@@ -166,7 +169,8 @@ void causal_attention_small_t_fp8_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream,
+    const Tensor* gate) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -180,12 +184,12 @@ void causal_attention_small_t_fp8_launch(
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_fp8_launch_for<CausalD256H24Kv4>(
             q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
+            partial_l, out, stream, gate);
         return;
     }
     causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
                                                               invocation, envelope, partial_acc,
-                                                              partial_m, partial_l, out, stream);
+                                                              partial_m, partial_l, out, stream, gate);
 }
 
 void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& positions,
@@ -193,7 +197,7 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
                                                 CausalAttentionExecutionEnvelope envelope,
                                                 Tensor& partial_acc, Tensor& partial_m,
                                                 Tensor& partial_l, Tensor& out,
-                                                cudaStream_t stream) {
+                                                cudaStream_t stream, const Tensor* gate) {
     const CausalCachedInput input{};
     const CausalSmallTInvocation invocation{
         .valid_columns = nullptr,
@@ -207,12 +211,12 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_fp8_launch_for<CausalD256H24Kv4>(
             q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
+            partial_l, out, stream, gate);
         return;
     }
     causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(
         q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-        partial_l, out, stream);
+        partial_l, out, stream, gate);
 }
 
 } // namespace ninfer::ops::detail
