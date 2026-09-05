@@ -197,21 +197,40 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         // four scalar code-pair/decode iterations.
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
-        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+        // Ablation on this stand: removing the routed weight fetch cuts this kernel by 37% at
+        // T=4, removing the activation fetch cuts it by 0. The stream reaches 796 GB/s against
+        // a 1674.5 GB/s roofline, so it is latency-bound, not volume-bound. Issuing the next
+        // group's loads before decoding the current one doubles the weight loads in flight.
+        // Same bytes, same layout, same arithmetic order: bit-exact.
+        std::uint32_t packed0_next = 0u;
+        std::uint32_t packed1_next = 0u;
+        std::uint16_t scale0_next  = 0u;
+        std::uint16_t scale1_next  = 0u;
+        uint4 input_next           = make_uint4(0u, 0u, 0u, 0u);
+        auto fetch_group           = [&](int group_base) {
             const int group           = group_base + lane_group;
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
-            const std::uint32_t packed0 =
+            packed0_next =
                 *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
-            const std::uint32_t packed1 =
+            packed1_next =
                 *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
-            const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
-            const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+            scale0_next = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
+            scale1_next = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+            input_next  = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
+        };
+        if (first_group < last_group) { fetch_group(first_group); }
+        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+            const std::uint32_t packed0 = packed0_next;
+            const std::uint32_t packed1 = packed1_next;
+            const std::uint16_t scale0  = scale0_next;
+            const std::uint16_t scale1  = scale1_next;
+            const uint4 input           = input_next;
+            if (group_base + 4 < last_group) { fetch_group(group_base + 4); }
             float weights0[8];
             float weights1[8];
             Q4SimtDecodeAtom::decode_eight(packed0, scale0, weights0);
             Q4SimtDecodeAtom::decode_eight(packed1, scale1, weights1);
-            const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float2 x0       = bf16x2_bits_to_float2(input.x);
             const float2 x1       = bf16x2_bits_to_float2(input.y);
             const float2 x2       = bf16x2_bits_to_float2(input.z);
