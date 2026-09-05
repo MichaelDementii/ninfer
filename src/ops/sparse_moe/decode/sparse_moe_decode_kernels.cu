@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -440,7 +441,7 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     }
 }
 
-template <class RoutedCodec, int Rows, bool Adaptive>
+template <class RoutedCodec, int Rows, bool Adaptive, bool TokenMajor = false>
 __global__ void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
@@ -458,9 +459,20 @@ __global__ void sparse_moe_d4_token_kernel(
     }
     constexpr int kRowBlocks = kHidden / Rows;
     const int total_work     = tokens * kRowBlocks;
-    const int first_work =
-        Adaptive ? static_cast<int>(blockIdx.x)
-                 : static_cast<int>(blockIdx.y) * kRowBlocks + static_cast<int>(blockIdx.x);
+    // Work order decides how far apart two reads of the same expert row land in time. Tokens repeat
+    // experts -- at T=4 there are 32 paths but only 22 distinct experts -- so putting the token on
+    // the fast grid axis makes the blocks that share a weight row run adjacently instead of a whole
+    // 2048-row pass apart. Numerically nothing changes: every block computes the same rows from the
+    // same inputs, only the dispatch order differs.
+    // TokenMajor puts the token on blockIdx.x and the row block on blockIdx.y; the default keeps
+    // the row block on x. The work index is the same either way, so the decomposition below is
+    // untouched.
+    const int first_work = Adaptive ? static_cast<int>(blockIdx.x)
+                           : TokenMajor
+                               ? static_cast<int>(blockIdx.x) * kRowBlocks +
+                                     static_cast<int>(blockIdx.y)
+                               : static_cast<int>(blockIdx.y) * kRowBlocks +
+                                     static_cast<int>(blockIdx.x);
     const int work_stride = Adaptive ? static_cast<int>(gridDim.x) : total_work;
     for (int work = first_work; work < total_work; work += work_stride) {
         const int token     = work / kRowBlocks;
@@ -639,6 +651,25 @@ void launch_d4_small_t_rows(const SparseMoeWeights& weights, Tensor& destination
                             const float* shared_scale, const float* token_activations,
                             std::int32_t tokens, cudaStream_t stream,
                             const int* adaptive_route_jobs) {
+    // Measurement scaffold for the work-order axis. Tokens repeat experts, so which grid axis runs
+    // fast decides whether two reads of the same weight row are adjacent or a full row pass apart.
+    static const bool token_major = [] {
+        const char* env = std::getenv("NINFER_D4_TOKEN_MAJOR");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!Adaptive && token_major) {
+        const dim3 grid_tm(tokens, kHidden / Rows);
+        sparse_moe_d4_token_kernel<Codec, Rows, Adaptive, true><<<grid_tm, 9 * 32, 0, stream>>>(
+            token_ids, token_alpha, shared_scale, token_activations,
+            static_cast<const std::uint8_t*>(weights.routed_down.qdata),
+            static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
+            static_cast<const std::uint8_t*>(weights.routed_down.scales),
+            static_cast<const std::uint8_t*>(weights.shared_down.qdata),
+            static_cast<const std::uint8_t*>(weights.shared_down.scales),
+            static_cast<__nv_bfloat16*>(destination.data), tokens, adaptive_route_jobs);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const dim3 grid = Adaptive ? dim3(kAdaptiveD4Blocks) : dim3(kHidden / Rows, tokens);
     sparse_moe_d4_token_kernel<Codec, Rows, Adaptive><<<grid, 9 * 32, 0, stream>>>(
         token_ids, token_alpha, shared_scale, token_activations,
