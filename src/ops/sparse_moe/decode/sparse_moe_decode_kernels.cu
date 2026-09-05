@@ -22,6 +22,16 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Ceiling probe for sub-4-bit expert codes. The container already stores Q4G64 at exactly 4.25
+// bits per weight, so any further saving has to come from a narrower code, which costs decode
+// work. This knob shrinks only the routed weight footprint -- the row stride of the code and
+// scale planes -- while the access pattern, the instruction count, the decode and the FMAs stay
+// bit-identical. It answers what a narrower code would buy if unpacking were free, which is the
+// upper bound on the whole idea. Numerically meaningless; timing arm only, never shipped.
+#if !defined(NINFER_WBYTES_NUM)
+#define NINFER_WBYTES_NUM 4
+#endif
+
 constexpr int kHidden           = 2048;
 constexpr int kExperts          = 256;
 constexpr int kRouterRows       = kExperts + 1;
@@ -197,10 +207,11 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         // four scalar code-pair/decode iterations.
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
+        constexpr int kRowStride = kGroups * NINFER_WBYTES_NUM / 4;
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group           = group_base + lane_group;
-            const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
-            const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+            const std::int64_t index0 = static_cast<std::int64_t>(row0) * kRowStride + group;
+            const std::int64_t index1 = static_cast<std::int64_t>(row1) * kRowStride + group;
             const std::uint32_t packed0 =
                 *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
             const std::uint32_t packed1 =
@@ -370,8 +381,9 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
             const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
+                constexpr int kRowStride = kGroups * NINFER_WBYTES_NUM / 4;
                 const std::int64_t group_index =
-                    static_cast<std::int64_t>(row_base + row) * kGroups + group;
+                    static_cast<std::int64_t>(row_base + row) * kRowStride + group;
                 float weights[8];
                 Codec::load_eight(codes, high, scales, group_index, lane_in_group, weights);
 #pragma unroll
