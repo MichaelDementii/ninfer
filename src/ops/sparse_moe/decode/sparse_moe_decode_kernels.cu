@@ -131,6 +131,12 @@ struct Q5Codec {
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
                std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+#if defined(NINFER_ABLATE_SMALLT_W)
+        // Ablation: the routed down weight stream of D4 is removed, loop and FMAs stay.
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { weights[item] = 1.0f; }
+        (void)codes; (void)high; (void)scales; (void)group_index; (void)lane_in_group;
+#else
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
             codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
         const std::uint8_t high_bits =
@@ -138,6 +144,7 @@ struct Q5Codec {
         const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
             scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
         Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
+#endif
     }
 };
 
@@ -148,6 +155,12 @@ struct Q6Codec {
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
                std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+#if defined(NINFER_ABLATE_SMALLT_W)
+        // Ablation: the routed down weight stream of D4 is removed, loop and FMAs stay.
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { weights[item] = 1.0f; }
+        (void)codes; (void)high; (void)scales; (void)group_index; (void)lane_in_group;
+#else
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
             codes + group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
         const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
@@ -155,6 +168,7 @@ struct Q6Codec {
         const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
             scales + group_index * Q6RowSplitStorage::kScaleBytesPerGroup);
         Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
+#endif
     }
 };
 
@@ -201,12 +215,22 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
             const int group           = group_base + lane_group;
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+#if defined(NINFER_ABLATE_SMALLT_W)
+            // Ablation: the routed weight stream of D3 is removed; the loop, the decode
+            // shape and the FMAs stay. Numerically meaningless, never gated, never shipped.
+            const std::uint32_t packed0 = 0x11111111u;
+            const std::uint32_t packed1 = 0x11111111u;
+            const std::uint16_t scale0  = 0x3c00u;
+            const std::uint16_t scale1  = 0x3c00u;
+            (void)codes; (void)scales; (void)index0; (void)index1;
+#else
             const std::uint32_t packed0 =
                 *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
             const std::uint32_t packed1 =
                 *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
             const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
             const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+#endif
             float weights0[8];
             float weights1[8];
             Q4SimtDecodeAtom::decode_eight(packed0, scale0, weights0);
@@ -365,8 +389,15 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
         const int lane_in_group = lane & 7;
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group = group_base + lane_group;
+#if defined(NINFER_ABLATE_SMALLT_A)
+            // Ablation: the activation stream of D4 is removed, the weight stream stays.
+            const float4 x0 = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            const float4 x1 = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            (void)x;
+#else
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
+#endif
             const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
