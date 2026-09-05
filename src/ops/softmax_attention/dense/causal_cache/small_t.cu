@@ -1,5 +1,6 @@
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
 // preparation, including their paired fixed rotation, remains private to the included kernel.
+#include "ops/launcher/sigmoid_gate_mul.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/paged_kv_storage.h"
@@ -238,7 +239,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          const CausalSmallTInvocation& invocation,
                                          CausalAttentionExecutionEnvelope envelope,
                                          Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                         Tensor& out, cudaStream_t stream) {
+                                         Tensor& out, cudaStream_t stream, const Tensor* gate) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
@@ -314,7 +315,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                         ? nullptr
                         : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                     invocation.width, invocation.full_width, invocation.column_begin,
-                    invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                    invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data),
+                    gate == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(gate->data));
         };
     const bool masked = invocation.valid_columns != nullptr;
     const auto launch_profile =
@@ -350,23 +352,30 @@ void causal_attention_small_t_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+    cudaStream_t stream, const Tensor* gate) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                              envelope, column_begin, width, partial_acc, partial_m,
                                              partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_small_t_fp8_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                             envelope, column_begin, width, partial_acc, partial_m,
                                             partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         causal_attention_small_t_nvfp4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                               envelope, column_begin, width, partial_acc, partial_m,
                                               partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
@@ -382,32 +391,39 @@ void causal_attention_small_t_launch(
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache,
                                                               invocation, envelope, partial_acc,
-                                                              partial_m, partial_l, out, stream);
+                                                              partial_m, partial_l, out, stream, gate);
         return;
     }
     causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, cache, invocation,
                                                           envelope, partial_acc, partial_m,
-                                                          partial_l, out, stream);
+                                                          partial_l, out, stream, gate);
 }
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
                                             const PagedKVLayerView& cache,
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
-                                            Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                                            Tensor& partial_l, Tensor& out, cudaStream_t stream,
+                                            const Tensor* gate) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, partial_acc,
                                                     partial_m, partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_cached_small_t_fp8_launch(q, pos, scale, cache, envelope, partial_acc,
                                                    partial_m, partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         causal_attention_cached_small_t_nvfp4_launch(q, pos, scale, cache, envelope, partial_acc,
                                                      partial_m, partial_l, out, stream);
+        // These codecs take a different partial route whose reducer has no fused epilogue.
+        if (gate != nullptr) { sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     const CausalCachedInput input{};
@@ -423,12 +439,12 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, batch_cache,
                                                               invocation, envelope, partial_acc,
-                                                              partial_m, partial_l, out, stream);
+                                                              partial_m, partial_l, out, stream, gate);
         return;
     }
     causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, batch_cache,
                                                           invocation, envelope, partial_acc,
-                                                          partial_m, partial_l, out, stream);
+                                                          partial_m, partial_l, out, stream, gate);
 }
 
 } // namespace ninfer::ops::detail

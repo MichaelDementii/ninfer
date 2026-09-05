@@ -3,6 +3,7 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
+#include "ops/launcher/sigmoid_gate_mul.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
@@ -411,7 +412,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream) {
+                              Tensor& out, cudaStream_t stream, const Tensor* gate) {
     constexpr const char* op = "causal_softmax_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        geometry, envelope, scale, op);
@@ -432,6 +433,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
+        // The chunked route reduces through its own path, which has no fused epilogue.
+        if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -441,18 +444,21 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch, cache.storage);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                                 scale, cache, envelope, 0, width, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out, stream, gate);
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, stream);
+    // The prompt route writes its output directly and has no reducer to fuse into.
+    if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                                     WorkspaceArena& workspace, Tensor& out,
+                                     cudaStream_t stream, const Tensor* gate) {
     constexpr const char* op = "causal_softmax_attention_cached";
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
 
@@ -461,6 +467,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
         return;
     }
     if (detail::causal_attention_uses_small_t(q.ne[2])) {
@@ -469,10 +476,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1, cache.storage);
         detail::causal_attention_cached_small_t_launch(
-            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
+            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out,
+            stream, gate);
         return;
     }
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
 }
 
 } // namespace ninfer::ops

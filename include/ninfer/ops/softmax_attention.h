@@ -138,13 +138,17 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * state. Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
+ *
+ * When gate is non-null the Op applies out = out * sigmoid(gate) itself, elementwise over
+ * the whole output, rounding to BF16 before the multiply exactly as the standalone gate Op
+ * does. Routes whose reducer has no fused epilogue fall back to that Op.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream);
+                              Tensor& out, cudaStream_t stream, const Tensor* gate = nullptr);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
@@ -158,7 +162,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                                     WorkspaceArena& workspace, Tensor& out,
+                                     cudaStream_t stream, const Tensor* gate = nullptr);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
