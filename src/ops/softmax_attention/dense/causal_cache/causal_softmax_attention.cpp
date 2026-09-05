@@ -298,7 +298,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream) {
+                            Tensor& out, cudaStream_t stream, const Tensor* gate) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -308,21 +308,27 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3], cache.storage);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out, stream, gate);
     }
 }
 
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
                                    const PagedKVLayerView& cache,
                                    CausalAttentionExecutionEnvelope envelope,
-                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                                   const Tensor* gate) {
     for_each_small_t_chunk(
         q, positions, workspace, cache.storage, envelope, out,
-        [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
+        [&](std::int32_t begin, std::int32_t count, const Tensor& q_chunk,
+            const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
+            // The chunk owns a column slice of out, so the gate is sliced the same way.
+            Tensor gate_chunk;
+            if (gate != nullptr) { gate_chunk = gate->slice(2, begin, count); }
             detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
                                                            envelope, partial.acc, partial.m,
-                                                           partial.l, out_chunk, stream);
+                                                           partial.l, out_chunk, stream,
+                                                           gate == nullptr ? nullptr : &gate_chunk);
         });
 }
 
@@ -432,9 +438,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         detail::causal_attention_resolve_route(q.ne[1], width, batch, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
-        // The chunked route reduces through its own path, which has no fused epilogue.
-        if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
+                               envelope, workspace, out, stream, gate);
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -466,8 +470,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
-        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
-        if (gate != nullptr) { detail::sigmoid_gate_mul_launch(*gate, out, stream); }
+        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out,
+                                      stream, gate);
         return;
     }
     if (detail::causal_attention_uses_small_t(q.ne[2])) {
