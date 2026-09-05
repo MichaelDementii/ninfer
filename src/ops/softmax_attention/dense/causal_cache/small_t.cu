@@ -298,7 +298,13 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #undef NINFER_CAUSAL_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = 64;
+    // One block per (head, token, d-chunk) at DChunk 64 means four blocks share a head and a
+    // token, and each of them runs both full reductions over the same partial_m and
+    // partial_l -- the split statistics do not depend on d. It also leaves 192 of the 256
+    // threads with nothing to write. At DChunk = kCausalHeadDim the grid is one block per
+    // (head, token), the statistics are reduced once instead of four times, and every
+    // thread owns a d.
+    constexpr int kDChunk      = kCausalHeadDim;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce =
