@@ -69,6 +69,8 @@ ninfer_add_test(ninfer_pretty_logging_test
   LIBRARIES ninfer_product_logging)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
+ninfer_add_test(ninfer_l2_reservation_test SOURCES test_l2_reservation.cpp)
+set_tests_properties(ninfer_l2_reservation_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)

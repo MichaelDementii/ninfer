@@ -86,7 +86,7 @@ DeviceContext::~DeviceContext() {
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
+      props(other.props), persisting_l2(std::move(other.persisting_l2)) {
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
 }
@@ -102,6 +102,7 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props           = other.props;
     stream          = other.stream;
     transfer_stream = other.transfer_stream;
+    persisting_l2   = std::move(other.persisting_l2);
 
     other.stream          = nullptr;
     other.transfer_stream = nullptr;

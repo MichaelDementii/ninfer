@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/l2_persist.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -23,6 +25,10 @@ struct DeviceContext {
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
     cudaDeviceProp props{};
+    // Owns the device-wide persisting-L2 set-aside for as long as this context exists. The limit
+    // is context state and outlives both the stream attribute and the graph the window is baked
+    // into, so it is given back here rather than left standing for whatever runs next.
+    l2p::Reservation persisting_l2;
 
     explicit DeviceContext(int device_id = 0);
     ~DeviceContext();

@@ -43,7 +43,8 @@ void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& bod
     // A target whose state pool does not fit an access policy window gets nothing installed,
     // and then there is nothing to take off the stream either.
     const bool pinned =
-        l2p::pin_range(state.execution.device.stream, reinterpret_cast<const void*>(low), span);
+        l2p::pin_range(state.execution.device.stream, reinterpret_cast<const void*>(low), span,
+                       state.execution.device.persisting_l2);
     definition.capture(state.execution.device.stream, body);
     if (pinned) { l2p::unpin(state.execution.device.stream); }
 }
