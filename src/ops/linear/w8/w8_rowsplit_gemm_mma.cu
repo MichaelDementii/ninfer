@@ -77,7 +77,10 @@ using MmaR48C112 = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
 using MmaR48C128 = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
 using MmaR64C96  = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
 using MmaR64C112 = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
-using MmaR64C128 = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+// The wide route of the linear family is the one schedule measured to want cg on the predicated
+// path; every other schedule keeps the inherited ca.
+using MmaR64C128 =
+    W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>::with_predicated_cache<Cache::cg>;
 using MmaR96C96  = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
 using MmaR128C64 = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
 using MmaR128C80 = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
