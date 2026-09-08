@@ -45,6 +45,88 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
     detail::mtp_pack_fc_input_launch(embedding_norm, hidden_norm, out, stream);
 }
 
+namespace {
+
+void require_stem_operands(const Tensor& embedding, const Tensor& embedding_weight,
+                           const Tensor& hidden, const Tensor& hidden_weight, const Tensor& out) {
+    constexpr const char* op = "mtp_norm_pack_fc_input";
+    require_bf16_contiguous_nonnull(embedding, op, "embedding");
+    require_bf16_contiguous_nonnull(embedding_weight, op, "embedding_weight");
+    require_bf16_contiguous_nonnull(hidden, op, "hidden");
+    require_bf16_contiguous_nonnull(hidden_weight, op, "hidden_weight");
+    require_bf16_contiguous_nonnull(out, op, "out");
+    const std::int32_t rows   = embedding.ne[0];
+    const std::int32_t tokens = embedding.ne[1];
+    if (rows <= 0) { throw std::invalid_argument("mtp_norm_pack_fc_input: D must be positive"); }
+    if (tokens <= 0) { throw std::invalid_argument("mtp_norm_pack_fc_input: T must be positive"); }
+    require_shape(embedding, rows, tokens, op, "embedding");
+    require_shape(hidden, rows, tokens, op, "hidden");
+    require_shape(out, 2 * rows, tokens, op, "out");
+    if (embedding_weight.numel() != rows || hidden_weight.numel() != rows) {
+        throw std::invalid_argument("mtp_norm_pack_fc_input: weight length must be D");
+    }
+}
+
+} // namespace
+
+bool mtp_norm_pack_fc_input_supported(const Tensor& embedding, const Tensor& embedding_weight,
+                                      const Tensor& hidden, const Tensor& hidden_weight,
+                                      const Tensor& out) {
+    require_stem_operands(embedding, embedding_weight, hidden, hidden_weight, out);
+    return detail::mtp_norm_pack_fc_input_admits(embedding.ne[0], embedding, embedding_weight,
+                                                 hidden, hidden_weight, out);
+}
+
+void mtp_norm_pack_fc_input(const Tensor& embedding, const Tensor& embedding_weight,
+                            const Tensor& hidden, const Tensor& hidden_weight, Tensor& out,
+                            float eps, cudaStream_t stream) {
+    require_stem_operands(embedding, embedding_weight, hidden, hidden_weight, out);
+    if (!detail::mtp_norm_pack_fc_input_admits(embedding.ne[0], embedding, embedding_weight, hidden,
+                                               hidden_weight, out)) {
+        throw std::invalid_argument("mtp_norm_pack_fc_input: unsupported operand profile");
+    }
+    detail::mtp_norm_pack_fc_input_launch(embedding, embedding_weight, hidden, hidden_weight, out,
+                                          eps, stream);
+}
+
+namespace {
+
+void require_residual_norm_operands(const Tensor& delta, const Tensor& residual,
+                                    const Tensor& weight, const Tensor& out) {
+    constexpr const char* op = "mtp_residual_norm";
+    require_bf16_contiguous_nonnull(delta, op, "delta");
+    require_bf16_contiguous_nonnull(residual, op, "residual");
+    require_bf16_contiguous_nonnull(weight, op, "weight");
+    require_bf16_contiguous_nonnull(out, op, "out");
+    const std::int32_t rows   = residual.ne[0];
+    const std::int32_t tokens = residual.ne[1];
+    if (rows <= 0) { throw std::invalid_argument("mtp_residual_norm: D must be positive"); }
+    if (tokens <= 0) { throw std::invalid_argument("mtp_residual_norm: T must be positive"); }
+    require_shape(delta, rows, tokens, op, "delta");
+    require_shape(residual, rows, tokens, op, "residual");
+    require_shape(out, rows, tokens, op, "out");
+    if (weight.numel() != rows) {
+        throw std::invalid_argument("mtp_residual_norm: weight length must be D");
+    }
+}
+
+} // namespace
+
+bool mtp_residual_norm_supported(const Tensor& delta, const Tensor& residual, const Tensor& weight,
+                                 const Tensor& out) {
+    require_residual_norm_operands(delta, residual, weight, out);
+    return detail::mtp_residual_norm_admits(residual.ne[0], delta, residual, weight, out);
+}
+
+void mtp_residual_norm(const Tensor& delta, Tensor& residual, const Tensor& weight, Tensor& out,
+                       float eps, cudaStream_t stream) {
+    require_residual_norm_operands(delta, residual, weight, out);
+    if (!detail::mtp_residual_norm_admits(residual.ne[0], delta, residual, weight, out)) {
+        throw std::invalid_argument("mtp_residual_norm: unsupported operand profile");
+    }
+    detail::mtp_residual_norm_launch(delta, residual, weight, out, eps, stream);
+}
+
 void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
     constexpr const char* op = "mtp_split_attn_in";
