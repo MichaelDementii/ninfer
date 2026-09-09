@@ -438,6 +438,59 @@ int run_text_case(int query_heads, int key_heads, int tokens, int first_position
     return failures;
 }
 
+// A prefill chunk may be any positive multiple of 128, so the Op has to take widths far past the
+// ones the oracle can afford to check. Here the reference is the split route only: the FP64 oracle
+// already covers the arithmetic at the widths above, and what is at stake here is dispatch.
+int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t seed) {
+    const std::size_t q_count = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
+    const std::size_t k_count = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
+    const auto q_bits         = bf16_bits(make_bf16_values(q_count, seed, -4.0F, 4.0F));
+    const auto k_bits         = bf16_bits(make_bf16_values(k_count, seed + 1U, -4.0F, 4.0F));
+    const auto q_weight_bits  = bf16_bits(make_bf16_values(kTextHeadDim, seed + 2U, 0.25F, 1.75F));
+    const auto k_weight_bits  = bf16_bits(make_bf16_values(kTextHeadDim, seed + 3U, 0.25F, 1.75F));
+    const auto positions      = make_positions(tokens, 0);
+
+    DeviceBuffer q_in_device     = to_device(q_bits);
+    DeviceBuffer k_in_device     = to_device(k_bits);
+    DeviceBuffer q_weight_device = to_device(q_weight_bits);
+    DeviceBuffer k_weight_device = to_device(k_weight_bits);
+    DeviceBuffer position_device = to_device(positions);
+    GuardedDeviceBuffer q_out_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_out_device(k_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q_split_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_split_device(k_count * sizeof(std::uint16_t));
+
+    Tensor q_in(q_in_device.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_in(k_in_device.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor position_tensor(position_device.p, DType::I32, {tokens});
+    Tensor q_out(q_out_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_out(k_out_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_split(q_split_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_split(k_split_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+
+    ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_in, k_in, q_out, k_out,
+                      nullptr);
+    ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
+    ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
+    ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
+              nullptr);
+    cuda_synchronize();
+
+    const std::string label =
+        "rmsnorm_rope text wide Q=" + std::to_string(query_heads) + " T=" + std::to_string(tokens);
+    int failures = verify_exact((label + " q equals split route").c_str(),
+                                from_device<std::uint16_t>(q_out_device.data(), q_count),
+                                from_device<std::uint16_t>(q_split_device.data(), q_count));
+    failures += verify_exact((label + " k equals split route").c_str(),
+                             from_device<std::uint16_t>(k_out_device.data(), k_count),
+                             from_device<std::uint16_t>(k_split_device.data(), k_count));
+    failures += q_out_device.verify_guards((label + " q guards").c_str());
+    failures += k_out_device.verify_guards((label + " k guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -469,6 +522,10 @@ int main() {
     }
     failures += run_text_case(16, 2, 4, 0, 0x3101U, true);
     failures += run_text_case(24, 4, 16, 262'000, 0x4101U, true);
+    // Past the widths the FP64 oracle can afford, and past any ceiling of our own: a prefill
+    // chunk is only required to be a positive multiple of 128.
+    failures += run_text_wide_case(16, 2, 8320, 0x5001U);
+    failures += run_text_wide_case(24, 4, 16384, 0x5002U);
 
     if (failures != 0) {
         std::cerr << "rmsnorm_rope failures=" << failures << '\n';
