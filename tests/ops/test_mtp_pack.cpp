@@ -499,7 +499,8 @@ int main() {
     failures += pack_case(2048, 48);
     failures += norm_pack_route(2048, true);
     failures += norm_pack_route(5120, true);
-    failures += norm_pack_route(1536, true);
+    failures += norm_pack_route(1536, false);
+    failures += norm_pack_route(4096, false);
     failures += norm_pack_route(384, false);
     failures += norm_pack_case(2048, 1);
     failures += norm_pack_case(2048, 4);
@@ -509,6 +510,7 @@ int main() {
     failures += norm_pack_case(5120, 64);
     failures += residual_norm_route(2048, true);
     failures += residual_norm_route(5120, true);
+    failures += residual_norm_route(1536, false);
     failures += residual_norm_route(384, false);
     failures += residual_norm_case(2048, 1);
     failures += residual_norm_case(2048, 4);

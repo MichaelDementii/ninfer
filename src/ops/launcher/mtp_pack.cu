@@ -36,12 +36,16 @@ namespace {
 // associative. This mirrors the ladder in src/ops/launcher/rmsnorm.cu for the Offset epilogue,
 // including its first branch, which intercepts d == 5120 before everything else. Widths the
 // standalone launcher sends to its warp or generic kernels are declined here.
-enum class MtpRowRoute { None, Cta256x6, Cta256x10, Cta512x8 };
+enum class MtpRowRoute { None, Cta256x6, Cta256x10 };
 
+// Only the two registered MTP stem widths are admitted: 2048 for Qwen3.6-27B and 5120 for
+// 35B-A3B. Everything else stays on the composed three-Op path, which serves it correctly --
+// admitting a width no target asks for would be a route kept alive for a hypothetical one. Each
+// admitted width lands on the instantiation src/ops/launcher/rmsnorm.cu would have picked for it,
+// which is what makes the fused row bit-exact with ops::rmsnorm.
 MtpRowRoute mtp_row_route(std::int32_t d) {
     if (d == 5120) { return MtpRowRoute::Cta256x10; }
-    if (d >= 512 && d <= 3072 && d % 512 == 0) { return MtpRowRoute::Cta256x6; }
-    if (d > 3072 && d <= 8192 && d % 1024 == 0) { return MtpRowRoute::Cta512x8; }
+    if (d == 2048) { return MtpRowRoute::Cta256x6; }
     return MtpRowRoute::None;
 }
 
@@ -94,11 +98,6 @@ void mtp_norm_pack_fc_input_launch(const Tensor& embedding, const Tensor& embedd
         mtp_norm_pack_fc_input_kernel<RmsEpilogue::Offset, 256, 10, true>
             <<<grid, 256, 0, stream>>>(e, ew, h, hw, o, d, rows, eps);
         break;
-    case MtpRowRoute::Cta512x8:
-        require_row_route(d, 512, 8);
-        mtp_norm_pack_fc_input_kernel<RmsEpilogue::Offset, 512, 8, true>
-            <<<grid, 512, 0, stream>>>(e, ew, h, hw, o, d, rows, eps);
-        break;
     case MtpRowRoute::None:
         throw std::invalid_argument("mtp_norm_pack_fc_input: unsupported width");
     }
@@ -132,11 +131,6 @@ void mtp_residual_norm_launch(const Tensor& delta, Tensor& residual, const Tenso
         require_row_route(d, 256, 10);
         mtp_residual_norm_kernel<RmsEpilogue::Offset, 256, 10, true>
             <<<grid, 256, 0, stream>>>(dv, rv, wv, ov, d, rows, eps);
-        break;
-    case MtpRowRoute::Cta512x8:
-        require_row_route(d, 512, 8);
-        mtp_residual_norm_kernel<RmsEpilogue::Offset, 512, 8, true>
-            <<<grid, 512, 0, stream>>>(dv, rv, wv, ov, d, rows, eps);
         break;
     case MtpRowRoute::None:
         throw std::invalid_argument("mtp_residual_norm: unsupported width");
