@@ -123,6 +123,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
                                   "messages", "assistant_prefill_not_supported");
         }
+        if (!request.tool_choice.forced_name.empty() && result.enable_thinking) {
+            // The call opener is written into the generation prompt, and a thinking prompt ends
+            // inside the reasoning block, where the opener has no place.
+            invalid_prompt_option("a forced tool_choice requires reasoning to be disabled for the "
+                                  "request",
+                                  "tool_choice", "tool_choice_not_supported");
+        }
         if (result.enable_thinking) {
             result.effective_reasoning_effort = result.reasoning_effort
                                                     ? result.reasoning_effort
@@ -286,6 +293,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             });
         }
     }
+    if (request.uses_tools()) { input.options.forced_tool_name = request.tool_choice.forced_name; }
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
     return input;
@@ -306,6 +314,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
+    if (request.uses_tools()) { options.output.forced_tool_name = request.tool_choice.forced_name; }
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {

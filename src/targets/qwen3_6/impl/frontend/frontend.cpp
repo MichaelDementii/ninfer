@@ -327,7 +327,8 @@ fi::ChatRenderOptions render_options(const PromptOptions& options,
                                    .reasoning_effort  = options.reasoning_effort,
                                    .preserve_thinking = options.preserve_thinking,
                                    .add_vision_id     = options.add_vision_id,
-                                   .tool_jsons        = options.tool_jsons};
+                                   .tool_jsons        = options.tool_jsons,
+                                   .forced_tool_name  = options.forced_tool_name};
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
 }
@@ -957,8 +958,9 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length) {
+          tool_call_output(
+              output.raw ? nullptr : std::move(tool_call_output_), output.tool_name_max_length,
+              output.raw ? std::string_view{} : std::string_view(output.forced_tool_name)) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }

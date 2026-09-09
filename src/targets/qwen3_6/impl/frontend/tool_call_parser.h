@@ -68,7 +68,8 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// verbatim. When the prompt already carries the opener of a forced call, the decoder is seeded
+// with that opener, because the model never emits it.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {
@@ -78,7 +79,7 @@ public:
     };
 
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                          std::size_t max_tool_name_length);
+                          std::size_t max_tool_name_length, std::string_view forced_tool_name = {});
 
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish();
@@ -90,6 +91,7 @@ private:
     std::size_t marker_prefix_bytes_  = 0;
     std::size_t max_tool_name_length_ = 0;
     bool saw_tool_marker_             = false;
+    bool forced_                      = false;
     bool finished_                    = false;
 };
 
