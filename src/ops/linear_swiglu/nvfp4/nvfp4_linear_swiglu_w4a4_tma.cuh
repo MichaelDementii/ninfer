@@ -19,7 +19,19 @@ namespace ninfer::ops::detail {
 // and the result is then rounded to bf16 on the very next instruction. The
 // hardware-approximate forms are ~1e-6 relative, four orders of magnitude below
 // the bf16 quantum, so nothing that survives the rounding is affected.
-__device__ __forceinline__ float swiglu_silu(float x) { return __fdividef(x, 1.0f + __expf(-x)); }
+//
+// The exponential is folded onto the side that cannot overflow. `__fdividef`
+// returns zero once the divisor reaches 2^126, which `1 + __expf(-x)` does for
+// x below -87.34, and SiLU there is still a normal bf16 (-9.6e-37 at that
+// edge). Written this way the divisor stays in (1, 2] for every finite x, and
+// the only subnormal the form can produce, `e`, enters a multiply rather than
+// the divide. It costs nothing: both forms compile to the same 40 SASS
+// instructions with two MUFU and no CALL.
+__device__ __forceinline__ float swiglu_silu(float x) {
+    const float e = __expf(-fabsf(x));
+    const float r = __fdividef(1.0f, 1.0f + e);
+    return (x >= 0.0f ? x : x * e) * r;
+}
 
 template <class Schedule>
 struct Nvfp4LinearSwiGluTmaTensorStorage {
