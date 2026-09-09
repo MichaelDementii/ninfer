@@ -277,7 +277,7 @@ void test_schema_validation() {
 
 void test_weights_fallback() {
     // A registered model with no row of its own resolves to the row of another model in the same
-    // weight format, and an exact (model, weights) row still wins over it.
+    // weight format, and an unregistered format still reaches the generic profile.
     constexpr const char* kMachine = "nvidia-geforce-rtx-5090-sm120";
     const auto resolve             = [](std::string model, std::string weights) {
         return ninfer::runtime::resolve_context_machine_cost(ninfer::runtime::ContextCostIdentity{
@@ -297,16 +297,21 @@ void test_weights_fallback() {
                !(nvfp4_row.model.prefill == int_row.model.prefill),
            "the two compiled rows this test compares are not distinguishable");
 
-    expect(
-        fallback.model.prefill == nvfp4_row.model.prefill &&
-            fallback.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault,
-        "a model with no row of its own did not take the coefficients of the same weights format");
+    expect(fallback.model.prefill == nvfp4_row.model.prefill &&
+               fallback.summary.prefill_source ==
+                   ninfer::ContextCostPresetSource::CompiledWeightsFallback,
+           "a model with no row of its own did not take the coefficients of the same weights "
+           "format");
 
     expect(!(fallback.model.prefill == int_row.model.prefill),
            "the weights fallback picked a row of a different weight format");
 
-    expect(int_row.model.prefill.chunk_ns != nvfp4_row.model.prefill.chunk_ns &&
-               resolve("qwen3.6-27b", "groupwise-int").model.prefill == int_row.model.prefill,
+    // Precedence is asserted through the source rather than through the coefficients. No weight
+    // format carries two compiled rows, so both lookups return the same row and comparing costs
+    // could not tell them apart; the reported source can, and it moves the moment the fallback is
+    // consulted first.
+    expect(nvfp4_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+               int_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault,
            "an exact (model, weights) row no longer wins over the same-weights fallback");
 
     expect(unknown_format.summary.prefill_source ==

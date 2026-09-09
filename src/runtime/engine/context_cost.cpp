@@ -586,7 +586,7 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
             // A registered model with no row of its own is closer to another model in the same
             // weight format than to the generic profile, which is the slowest measured one.
             model.prefill  = by_weights->cost;
-            prefill_source = ContextCostPresetSource::CompiledDefault;
+            prefill_source = ContextCostPresetSource::CompiledWeightsFallback;
         }
     }
 
