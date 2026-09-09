@@ -108,7 +108,14 @@ struct Result {
     bench::ColdTiming timing;
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;
+    // The mode this row was actually measured in, not the one asked for on the command line: the
+    // cached entry takes no gate parameter, so it is standalone whenever a gate is requested.
+    GateMode gate = GateMode::Off;
 };
+
+const char* gate_name(GateMode gate) noexcept {
+    return gate == GateMode::Off ? "off" : gate == GateMode::Standalone ? "standalone" : "fused";
+}
 
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
@@ -354,9 +361,9 @@ PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer&
         .k_pages = Tensor(
             k.p, layout.key.data_dtype,
             {layout.key.data_leading_extent, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
-        .v_pages = Tensor(v.p, layout.value.data_dtype,
-                          {layout.value.data_leading_extent, kPagedKVPageSize, geometry.kv_heads,
-                           physical_pages}),
+        .v_pages       = Tensor(v.p, layout.value.data_dtype,
+                                {layout.value.data_leading_extent, kPagedKVPageSize, geometry.kv_heads,
+                                 physical_pages}),
         .k_scale_pages = layout.key.has_scale()
                              ? Tensor(k_scale.p, layout.key.scale_dtype,
                                       {layout.key.scale_leading_extent, kPagedKVPageSize,
@@ -736,15 +743,15 @@ void report(const Result& result) {
     const double pv_tflops     = result.pv_flops / seconds / 1.0e12;
     std::printf(
         "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
-        "B=%d W=%d contexts=%s valid=%s rows=%s "
+        "gate=%-10s B=%d W=%d contexts=%s valid=%s rows=%s "
         "workspace=%9zu peak=%9zu nodes=%zu calls=%d median=%10.3f us min=%10.3f us p95=%10.3f us "
         "logical_payload=%8.1f GB/s physical_payload=%8.1f GB/s math=%7.2f TFLOP/s\n",
         entry_name(result.entry), result.geometry.name, storage_name(result.storage),
         mapping_name(result.mapping), execution_name(result.execution), cache_name(result.cache),
-        result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
-        result.table_rows.c_str(), result.workspace_bytes, result.workspace_peak,
-        result.graph_nodes, result.graph_calls, result.timing.median_us, result.timing.min_us,
-        result.timing.p95_us, logical_gbps, physical_gbps, tflops);
+        gate_name(result.gate), result.batch, result.tokens, result.row_contexts.c_str(),
+        result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
+        result.workspace_peak, result.graph_nodes, result.graph_calls, result.timing.median_us,
+        result.timing.min_us, result.timing.p95_us, logical_gbps, physical_gbps, tflops);
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
@@ -761,7 +768,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output
-        << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
+        << "entry,geometry,kv_dtype,mapping,execution,cache,gate,B,W,row_contexts,valid_columns,"
            "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
            "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
            "qk_full_op_tflops,pv_full_op_tflops,"
@@ -771,12 +778,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
-               << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
-               << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.physical_bytes << ','
-               << result.logical_cache_bytes << ',' << result.key_vector_bytes << ','
-               << result.value_vector_bytes << ',' << result.physical_cache_bytes << ','
-               << result.qk_flops << ',' << result.pv_flops << ',';
+               << gate_name(result.gate) << ',' << result.batch << ',' << result.tokens << ','
+               << result.row_contexts << ',' << result.valid_columns << ',' << result.table_rows
+               << ',' << result.workspace_bytes << ',' << result.logical_bytes << ','
+               << result.physical_bytes << ',' << result.logical_cache_bytes << ','
+               << result.key_vector_bytes << ',' << result.value_vector_bytes << ','
+               << result.physical_cache_bytes << ',' << result.qk_flops << ',' << result.pv_flops
+               << ',';
         const double seconds = result.timing.median_us * 1.0e-6;
         output << result.qk_flops / seconds / 1.0e12 << ',' << result.pv_flops / seconds / 1.0e12
                << ',' << result.unique_kv_bytes << ',' << result.unique_kv_bytes / seconds / 1.0e9;
@@ -914,9 +922,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::printf("gate=%s\n", options.gate == GateMode::Off          ? "off"
-                                 : options.gate == GateMode::Standalone ? "standalone"
-                                                                        : "fused");
+        std::printf("gate=%s\n", gate_name(options.gate));
         std::vector<Result> results;
         const std::vector<std::int32_t> context_profiles =
             options.row_contexts.empty() ? options.contexts : std::vector<std::int32_t>{0};
@@ -998,6 +1004,10 @@ int main(int argc, char** argv) {
                                         result.workspace_peak = data.workspace_peak();
                                         result.graph_calls =
                                             execution == Execution::Graph ? options.graph_calls : 1;
+                                        result.gate = entry == Entry::Cached &&
+                                                              options.gate == GateMode::Fused
+                                                          ? GateMode::Standalone
+                                                          : options.gate;
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;

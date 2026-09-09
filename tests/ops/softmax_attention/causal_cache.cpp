@@ -472,9 +472,9 @@ std::uint8_t encode_e2m1_rne_satfinite(float value) {
             const float lower_value  = decode_e2m1(lower);
             const float lower_error  = magnitude - lower_value;
             const float upper_error  = upper_value - magnitude;
-            selected = lower_error < upper_error   ? lower
-                       : upper_error < lower_error ? upper
-                                                   : ((lower & 1U) == 0U ? lower : upper);
+            selected                 = lower_error < upper_error   ? lower
+                                       : upper_error < lower_error ? upper
+                                                                   : ((lower & 1U) == 0U ? lower : upper);
             break;
         }
     }
@@ -699,8 +699,8 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
                     cache_index(geometry, logical_capacity, head, position, 0);
                 const std::size_t k_scale =
                     fp8_scale_index(geometry, logical_capacity, head, position);
-                const std::size_t v_code = logical_plane_index(kNvfp4CodeBytes, geometry,
-                                                               logical_capacity, head, position, 0);
+                const std::size_t v_code  = logical_plane_index(kNvfp4CodeBytes, geometry,
+                                                                logical_capacity, head, position, 0);
                 const std::size_t v_scale = logical_plane_index(
                     kNvfp4QuantGroups, geometry, logical_capacity, head, position, 0);
                 encode_fp8_rotated_row(logical_k, source, cache.k_fp8, source, cache.k_scale,
@@ -1065,19 +1065,19 @@ public:
         if (storage_ == KvCacheStorage::BFloat16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, k_code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, v_code_elements_);
-            cache.k_bf16 = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
-                                                       logical_capacity_, block_table_host_);
-            cache.v_fp16 = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
-                                                       logical_capacity_, block_table_host_);
+            cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
+                                                                logical_capacity_, block_table_host_);
+            cache.v_fp16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
+                                                                logical_capacity_, block_table_host_);
         } else if (storage_ == KvCacheStorage::Int8Group64) {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_i8    = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
-                                                      logical_capacity_, block_table_host_);
-            cache.v_i8    = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
-                                                      logical_capacity_, block_table_host_);
+            cache.k_i8             = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
+                                                               logical_capacity_, block_table_host_);
+            cache.v_i8             = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
+                                                               logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
@@ -1087,10 +1087,10 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                       logical_capacity_, block_table_host_);
-            cache.v_fp8   = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
-                                                       logical_capacity_, block_table_host_);
+            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                                logical_capacity_, block_table_host_);
+            cache.v_fp8            = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
+                                                                logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kFp8QuantGroups, geometry_,
@@ -1100,8 +1100,8 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint8_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                       logical_capacity_, block_table_host_);
+            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                                logical_capacity_, block_table_host_);
             cache.v_nvfp4 = gather_paged<std::uint8_t>(v_physical, kNvfp4CodeBytes, geometry_,
                                                        logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
@@ -1660,6 +1660,19 @@ ReductionCriterion attention_criterion(KvCacheStorage storage) {
     throw std::logic_error("unregistered causal-attention test storage");
 }
 
+// The gated route rounds to BF16 twice -- once on the attention result, once on the product with
+// the gate -- where the ungated route rounds once. The second rounding moves an element by at
+// most 2^-9 of itself, and the gate cannot enlarge an element, so 2^-9 is what both the
+// relative-L2 bound and the bound taken relative to the largest reference have to grow by. The
+// absolute floor is unchanged: it is there for elements near zero, which the extra rounding
+// cannot move by more than it already covers.
+ReductionCriterion gated_attention_criterion(KvCacheStorage storage) {
+    ReductionCriterion criterion = attention_criterion(storage);
+    criterion.relative_l2 += 0x1p-9;
+    criterion.gross_relative_to_max_reference += 0x1p-9;
+    return criterion;
+}
+
 int verify_attention(const std::string& label, const std::vector<double>& actual,
                      const std::vector<double>& reference, const ReductionCriterion& criterion) {
     return verify_reduction(label.c_str(), actual, reference, criterion);
@@ -1723,13 +1736,13 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
-    const std::size_t q_elements  = static_cast<std::size_t>(kHeadDim) *
-                                    static_cast<std::size_t>(geometry.q_heads) *
-                                    static_cast<std::size_t>(test_case.tokens);
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
+                                   static_cast<std::size_t>(geometry.q_heads) *
+                                   static_cast<std::size_t>(test_case.tokens);
     const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q          = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
@@ -1825,7 +1838,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q         = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -2041,7 +2054,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
                                   " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
-        const auto output       = copy_from_guarded<std::uint16_t>(dout, q.size());
+        const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
@@ -2108,9 +2121,20 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                                           op_geometry(geometry), kAttentionScale, cache.view(),
                                           envelope, workspace, tout, device.stream, &tgate);
             cuda_synchronize(device.stream);
-            failures += verify_exact((label + " fused gate").c_str(),
-                                     copy_from_guarded<std::uint16_t>(dout, q.size()),
+            const auto gated_output = copy_from_guarded<std::uint16_t>(dout, q.size());
+            failures += verify_exact((label + " fused gate").c_str(), gated_output,
                                      copy_from_guarded<std::uint16_t>(dexpected, output.size()));
+            // Both checks above compare production against production, so an error shared by the
+            // attention result, the sigmoid or the BF16 boundary would pass them. This one does
+            // not: the gated output is qualified against the same FP64 attention oracle the
+            // ungated output is judged by, multiplied by a host sigmoid of the gate.
+            std::vector<double> gated_reference(reference.size());
+            for (std::size_t i = 0; i < gated_reference.size(); ++i)
+                gated_reference[i] =
+                    reference[i] / (1.0 + std::exp(-double(bf16_to_f32(gate_bits[i]))));
+            failures += verify_attention(label + " fused gate against the oracle",
+                                         bf16_bits_to_double(gated_output), gated_reference,
+                                         gated_attention_criterion(storage));
             failures += dgate.verify_guards((label + " fused gate input").c_str());
             failures += dout.verify_guards((label + " fused gate output").c_str());
         }
