@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
@@ -471,9 +472,9 @@ std::uint8_t encode_e2m1_rne_satfinite(float value) {
             const float lower_value  = decode_e2m1(lower);
             const float lower_error  = magnitude - lower_value;
             const float upper_error  = upper_value - magnitude;
-            selected                 = lower_error < upper_error   ? lower
-                                       : upper_error < lower_error ? upper
-                                                                   : ((lower & 1U) == 0U ? lower : upper);
+            selected = lower_error < upper_error   ? lower
+                       : upper_error < lower_error ? upper
+                                                   : ((lower & 1U) == 0U ? lower : upper);
             break;
         }
     }
@@ -698,8 +699,8 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
                     cache_index(geometry, logical_capacity, head, position, 0);
                 const std::size_t k_scale =
                     fp8_scale_index(geometry, logical_capacity, head, position);
-                const std::size_t v_code  = logical_plane_index(kNvfp4CodeBytes, geometry,
-                                                                logical_capacity, head, position, 0);
+                const std::size_t v_code = logical_plane_index(kNvfp4CodeBytes, geometry,
+                                                               logical_capacity, head, position, 0);
                 const std::size_t v_scale = logical_plane_index(
                     kNvfp4QuantGroups, geometry, logical_capacity, head, position, 0);
                 encode_fp8_rotated_row(logical_k, source, cache.k_fp8, source, cache.k_scale,
@@ -1064,19 +1065,19 @@ public:
         if (storage_ == KvCacheStorage::BFloat16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, k_code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, v_code_elements_);
-            cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
-            cache.v_fp16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_bf16 = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
+            cache.v_fp16 = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
         } else if (storage_ == KvCacheStorage::Int8Group64) {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_i8             = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
-                                                               logical_capacity_, block_table_host_);
-            cache.v_i8             = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
-                                                               logical_capacity_, block_table_host_);
+            cache.k_i8    = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
+                                                      logical_capacity_, block_table_host_);
+            cache.v_i8    = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
+                                                      logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
@@ -1086,10 +1087,10 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
-            cache.v_fp8            = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
+            cache.v_fp8   = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kFp8QuantGroups, geometry_,
@@ -1099,8 +1100,8 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint8_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
             cache.v_nvfp4 = gather_paged<std::uint8_t>(v_physical, kNvfp4CodeBytes, geometry_,
                                                        logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
@@ -1722,13 +1723,13 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
-    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
-                                   static_cast<std::size_t>(geometry.q_heads) *
-                                   static_cast<std::size_t>(test_case.tokens);
+    const std::size_t q_elements  = static_cast<std::size_t>(kHeadDim) *
+                                    static_cast<std::size_t>(geometry.q_heads) *
+                                    static_cast<std::size_t>(test_case.tokens);
     const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q          = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
@@ -1824,7 +1825,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q         = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -2040,7 +2041,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
                                   " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
-        const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
+        const auto output       = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
@@ -2075,6 +2076,43 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         if (workspace.used() != 0 || workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace mismatch\n";
             ++failures;
+        }
+
+        // Handing the Op a gate must produce exactly what applying sigmoid_mul afterwards
+        // produces -- on the route that folds the multiply into the reduce epilogue and on the
+        // routes that fall back to the standalone kernel alike. Re-running the Op is safe:
+        // appending the same k/v to the same rows again leaves the cache byte-identical, which
+        // the standalone-parity check above has just established.
+        {
+            const auto gate_bits =
+                to_bf16_bits(make_bf16_values(q.size(), test_case.seed + 97u, -3.0F, 3.0F));
+            GuardedDeviceBuffer dgate(gate_bits.size() * sizeof(std::uint16_t));
+            GuardedDeviceBuffer dexpected(output.size() * sizeof(std::uint16_t));
+            dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
+            dexpected.copy_from_host(output.data(), output.size() * sizeof(std::uint16_t));
+            Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+            Tensor texpected(dexpected.data(), DType::BF16,
+                             {kHeadDim, geometry.q_heads, width, batch});
+            // The reference is a second ungated run of the Op, not the first run's output: that
+            // separates "the gate is exact" from "the Op repeats itself", and only the first is
+            // what this check is about.
+            ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+                                          op_geometry(geometry), kAttentionScale, cache.view(),
+                                          envelope, workspace, texpected, device.stream);
+            cuda_synchronize(device.stream);
+            failures +=
+                verify_exact((label + " ungated repeat").c_str(),
+                             copy_from_guarded<std::uint16_t>(dexpected, output.size()), output);
+            ops::sigmoid_mul(tgate, texpected, device.stream);
+            ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+                                          op_geometry(geometry), kAttentionScale, cache.view(),
+                                          envelope, workspace, tout, device.stream, &tgate);
+            cuda_synchronize(device.stream);
+            failures += verify_exact((label + " fused gate").c_str(),
+                                     copy_from_guarded<std::uint16_t>(dout, q.size()),
+                                     copy_from_guarded<std::uint16_t>(dexpected, output.size()));
+            failures += dgate.verify_guards((label + " fused gate input").c_str());
+            failures += dout.verify_guards((label + " fused gate output").c_str());
         }
     }
     return failures;
