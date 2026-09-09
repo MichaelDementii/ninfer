@@ -3,6 +3,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ops/op_tester.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -13,6 +14,36 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
+
+// The parity checks below compare the fused Op against the Ops it replaces, which cannot see a
+// defect the two share. These are the independent half: the same naive FP64 oracle and the same
+// criterion tests/ops/test_rmsnorm.cpp judges ops::rmsnorm by, evaluated here from the represented
+// BF16 inputs and compared against the fused output directly.
+constexpr ReductionCriterion rmsnorm_bf16_criterion() {
+    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
+            /*gross_relative_to_max_reference*/ 3.95e-3};
+}
+
+std::vector<double> rmsnorm_oracle(const std::vector<std::uint16_t>& input,
+                                   const std::vector<std::uint16_t>& weight, std::int32_t hidden,
+                                   std::int32_t tokens, float eps) {
+    std::vector<double> output(input.size());
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::size_t base = static_cast<std::size_t>(token) * hidden;
+        double sum_squares     = 0.0;
+        for (std::int32_t row = 0; row < hidden; ++row) {
+            const double value = bf16_to_f32(input[base + row]);
+            sum_squares += value * value;
+        }
+        const double inverse =
+            1.0 / std::sqrt(sum_squares / static_cast<double>(hidden) + static_cast<double>(eps));
+        for (std::int32_t row = 0; row < hidden; ++row) {
+            output[base + row] =
+                bf16_to_f32(input[base + row]) * inverse * (1.0 + bf16_to_f32(weight[row]));
+        }
+    }
+    return output;
+}
 
 std::vector<std::uint16_t> bit_pattern(std::size_t count, std::uint32_t seed) {
     std::vector<std::uint16_t> values(count);
@@ -208,6 +239,22 @@ int norm_pack_case(std::int32_t hidden, std::int32_t tokens) {
     const auto reference       = from_device<std::uint16_t>(d_reference.data(), elements);
     const auto fused           = from_device<std::uint16_t>(d_fused.data(), elements);
     failures += verify_exact(label.c_str(), fused, reference);
+
+    const auto norm_e_oracle = rmsnorm_oracle(embedding16, weight_e16, hidden, tokens, kStemEps);
+    const auto norm_h_oracle = rmsnorm_oracle(hidden16, weight_h16, hidden, tokens, kStemEps);
+    std::vector<double> oracle(elements), produced(elements);
+    for (std::int32_t token = 0; token < tokens; ++token)
+        for (std::int32_t row = 0; row < hidden; ++row) {
+            const std::size_t in   = static_cast<std::size_t>(token) * hidden + row;
+            const std::size_t out  = static_cast<std::size_t>(token) * output_rows + row;
+            oracle[out]            = norm_e_oracle[in];
+            oracle[out + hidden]   = norm_h_oracle[in];
+            produced[out]          = bf16_to_f32(fused[out]);
+            produced[out + hidden] = bf16_to_f32(fused[out + hidden]);
+        }
+    failures += verify_reduction((label + " against the oracle").c_str(), produced, oracle,
+                                 rmsnorm_bf16_criterion());
+
     failures += d_embedding.verify_guards((label + " embedding").c_str());
     failures += d_hidden.verify_guards((label + " hidden").c_str());
     failures += d_fused.verify_guards((label + " fused").c_str());
@@ -347,6 +394,20 @@ int residual_norm_case(std::int32_t hidden, std::int32_t tokens) {
     cuda_synchronize();
 
     int failures = 0;
+    // The updated residual is a BF16 sum of two BF16 values, which is exact in double, so this
+    // half of the fused Op has an independent oracle that is itself exact.
+    std::vector<std::uint16_t> residual_oracle(count);
+    for (std::size_t i = 0; i < count; ++i)
+        residual_oracle[i] = f32_to_bf16(bf16_to_f32(delta16[i]) + bf16_to_f32(residual16[i]));
+    failures +=
+        verify_exact((label + " residual against the oracle").c_str(),
+                     from_device<std::uint16_t>(d_fused_residual.data(), count), residual_oracle);
+    {
+        const auto out_oracle = rmsnorm_oracle(residual_oracle, weight16, hidden, tokens, kTailEps);
+        const auto produced   = from_device_bf16(d_fused_out.data(), count);
+        failures += verify_reduction((label + " output against the oracle").c_str(), produced,
+                                     out_oracle, rmsnorm_bf16_criterion());
+    }
     failures += verify_exact((label + " residual").c_str(),
                              from_device<std::uint16_t>(d_fused_residual.data(), count),
                              from_device<std::uint16_t>(d_ref_residual.data(), count));
