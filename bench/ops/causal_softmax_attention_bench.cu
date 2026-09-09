@@ -117,6 +117,13 @@ const char* gate_name(GateMode gate) noexcept {
     return gate == GateMode::Off ? "off" : gate == GateMode::Standalone ? "standalone" : "fused";
 }
 
+// The cached entry takes no gate parameter, so a requested fused gate is a standalone multiply
+// there. Every line that names a gate names this one.
+GateMode effective_gate(GateMode requested, Entry entry) noexcept {
+    return entry == Entry::Cached && requested == GateMode::Fused ? GateMode::Standalone
+                                                                  : requested;
+}
+
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
@@ -819,9 +826,10 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
     }
     std::printf(
         "PROFILE entry=%s geometry=%s kv=%s mapping=%s dispatch=public execution=%s cache=%s "
-        "B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
+        "gate=%s B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
         entry_name(entry), geometry.name, storage_name(storage), mapping_name(options.mapping),
-        execution_name(execution), cache_name(cache), batch, width,
+        execution_name(execution), cache_name(cache),
+        gate_name(effective_gate(options.gate, entry)), batch, width,
         static_cast<int>(contexts.size()), contexts.data(), static_cast<int>(valid_columns.size()),
         valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data(),
         options.graph_calls);
@@ -1004,10 +1012,7 @@ int main(int argc, char** argv) {
                                         result.workspace_peak = data.workspace_peak();
                                         result.graph_calls =
                                             execution == Execution::Graph ? options.graph_calls : 1;
-                                        result.gate = entry == Entry::Cached &&
-                                                              options.gate == GateMode::Fused
-                                                          ? GateMode::Standalone
-                                                          : options.gate;
+                                        result.gate = effective_gate(options.gate, entry);
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;
