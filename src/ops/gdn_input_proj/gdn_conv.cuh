@@ -113,7 +113,9 @@ struct GdnConvEpilogue {
             publish.publish(token, batch_row, row, s1, s2, p);
             s0 = s1;
             s1 = s2;
-            s2 = p;
+            // Carry forward the column that the next column would read back, not the wider
+            // accumulator: the published window is a sequence of BF16 represented columns.
+            s2 = __bfloat162float(__float2bfloat16_rn(p));
         }
     }
 };
