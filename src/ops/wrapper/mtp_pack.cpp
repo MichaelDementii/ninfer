@@ -1,6 +1,7 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ops/launcher/mtp_pack.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -69,6 +70,15 @@ void require_stem_operands(const Tensor& embedding, const Tensor& embedding_weig
 
 } // namespace
 
+// The fused Ops stand in for a composition that contains ops::rmsnorm, so they owe the same
+// contract on eps that ops::rmsnorm enforces (src/ops/wrapper/rmsnorm.cpp). Without this a
+// non-positive or non-finite eps would reach the kernel and come back as NaN instead of a throw.
+void require_normalization_eps(float eps, const char* op) {
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(std::string(op) + ": eps must be positive and finite");
+    }
+}
+
 bool mtp_norm_pack_fc_input_supported(const Tensor& embedding, const Tensor& embedding_weight,
                                       const Tensor& hidden, const Tensor& hidden_weight,
                                       const Tensor& out) {
@@ -81,6 +91,7 @@ void mtp_norm_pack_fc_input(const Tensor& embedding, const Tensor& embedding_wei
                             const Tensor& hidden, const Tensor& hidden_weight, Tensor& out,
                             float eps, cudaStream_t stream) {
     require_stem_operands(embedding, embedding_weight, hidden, hidden_weight, out);
+    require_normalization_eps(eps, "mtp_norm_pack_fc_input");
     if (!detail::mtp_norm_pack_fc_input_admits(embedding.ne[0], embedding, embedding_weight, hidden,
                                                hidden_weight, out)) {
         throw std::invalid_argument("mtp_norm_pack_fc_input: unsupported operand profile");
@@ -120,6 +131,7 @@ bool mtp_residual_norm_supported(const Tensor& delta, const Tensor& residual, co
 
 void mtp_residual_norm(const Tensor& delta, Tensor& residual, const Tensor& weight, Tensor& out,
                        float eps, cudaStream_t stream) {
+    require_normalization_eps(eps, "mtp_residual_norm");
     require_residual_norm_operands(delta, residual, weight, out);
     if (!detail::mtp_residual_norm_admits(residual.ne[0], delta, residual, weight, out)) {
         throw std::invalid_argument("mtp_residual_norm: unsupported operand profile");

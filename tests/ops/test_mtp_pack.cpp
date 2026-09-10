@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -258,6 +259,42 @@ int norm_pack_case(std::int32_t hidden, std::int32_t tokens) {
     failures += d_embedding.verify_guards((label + " embedding").c_str());
     failures += d_hidden.verify_guards((label + " hidden").c_str());
     failures += d_fused.verify_guards((label + " fused").c_str());
+    return failures;
+}
+
+// An eps that is not positive and finite has to be refused, not normalised with: the composition
+// these Ops replace refuses it in ops::rmsnorm, and a kernel handed it returns NaN instead.
+int eps_contract(std::int32_t hidden) {
+    const std::size_t bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+    GuardedDeviceBuffer d_embedding(bytes), d_hidden(bytes), d_weight_e(bytes), d_weight_h(bytes);
+    GuardedDeviceBuffer d_residual(bytes), d_out(bytes), d_pack(2 * bytes);
+    Tensor t_embedding(d_embedding.data(), DType::BF16, {hidden, 1});
+    Tensor t_hidden(d_hidden.data(), DType::BF16, {hidden, 1});
+    Tensor t_weight_e(d_weight_e.data(), DType::BF16, {hidden});
+    Tensor t_weight_h(d_weight_h.data(), DType::BF16, {hidden});
+    Tensor t_residual(d_residual.data(), DType::BF16, {hidden, 1});
+    Tensor t_out(d_out.data(), DType::BF16, {hidden, 1});
+    Tensor t_pack(d_pack.data(), DType::BF16, {2 * hidden, 1});
+
+    int failures       = 0;
+    const auto refuses = [&](const char* what, auto&& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return; }
+        std::cout << "mtp eps contract D=" << hidden << " " << what
+                  << " FAILED: accepted an invalid eps\n";
+        ++failures;
+    };
+    for (const float eps : {0.0F, -1.0e-6F, std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::infinity()}) {
+        refuses("norm_pack", [&] {
+            ops::mtp_norm_pack_fc_input(t_embedding, t_weight_e, t_hidden, t_weight_h, t_pack, eps,
+                                        nullptr);
+        });
+        refuses("residual_norm", [&] {
+            ops::mtp_residual_norm(t_embedding, t_residual, t_weight_e, t_out, eps, nullptr);
+        });
+    }
     return failures;
 }
 
@@ -522,6 +559,8 @@ int main() {
     failures += residual_norm_strength(5120, 1);
     failures += norm_pack_strength(2048, 4);
     failures += norm_pack_strength(5120, 1);
+    failures += eps_contract(2048);
+    failures += eps_contract(5120);
     failures += split_case(1);
     failures += split_case(6);
     failures += split_case(48);
