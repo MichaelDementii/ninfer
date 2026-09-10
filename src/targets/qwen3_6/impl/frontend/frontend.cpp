@@ -380,7 +380,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
-                                          std::to_string(token));
+                                        std::to_string(token));
         }
         if (std::find(result.token_ids.begin(), result.token_ids.end(), token) ==
             result.token_ids.end()) {
@@ -958,9 +958,8 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          tool_call_output(
-              output.raw ? nullptr : std::move(tool_call_output_), output.tool_name_max_length,
-              output.raw ? std::string_view{} : std::string_view(output.forced_tool_name)) {
+          tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
+                           output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -1399,8 +1398,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output =
-        fi::build_tool_call_output_contract(options.tool_jsons, !options.tool_jsons.empty());
+    const auto tool_call_output = fi::build_tool_call_output_contract(
+        options.tool_jsons, !options.tool_jsons.empty(), options.forced_tool_name);
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;

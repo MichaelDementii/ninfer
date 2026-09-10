@@ -824,8 +824,8 @@ int test_assistant_continuation() {
                     options);
     const std::string expected = "<|im_start|>user\nquestion<|im_end|>\n"
                                  "<|im_start|>assistant\nanswer prefix";
-    int failures               = check(rendered.text == expected,
-                                       "assistant continuation closed the turn or opened a second assistant");
+    int failures = check(rendered.text == expected,
+                         "assistant continuation closed the turn or opened a second assistant");
     failures +=
         check(rendered.rewrite_checkpoint &&
                   rendered.rewrite_checkpoint->kind ==
@@ -917,7 +917,7 @@ int test_reasoning_effort_chat_template() {
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     no_generation.reasoning_effort      = ninfer::ReasoningEffort::Medium;
-    const std::string preserved         = reasoning_effort_template()
+    const std::string preserved = reasoning_effort_template()
                                       .render({chat_message(ninfer::ChatRole::User, "q1"), previous,
                                                chat_message(ninfer::ChatRole::User, "q2")},
                                               no_generation)
@@ -2257,8 +2257,7 @@ int test_forced_tool_call(const Frontend& frontend) {
         input.options.tool_jsons.emplace_back(kForcedToolDefinition);
         auto prompt  = frontend.prepare(std::move(input));
         auto session = frontend.make_output_session(
-            prompt, {},
-            ninfer::OutputOptions{.tool_name_max_length = 64, .forced_tool_name = "TaskUpdate"});
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
         const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(continuation);
         (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
                                     ninfer::FinishReason::OutputLimit);

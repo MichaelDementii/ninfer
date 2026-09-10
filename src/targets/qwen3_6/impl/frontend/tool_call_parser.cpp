@@ -583,10 +583,12 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
+                                std::string_view forced_tool_name) {
     if (!enabled) { return {}; }
     auto contract                    = std::make_shared<ToolCallOutputContract>();
     contract->enforce_declared_names = true;
+    contract->forced_tool_name.assign(forced_tool_name);
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
@@ -625,10 +627,10 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 }
 
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                                             std::size_t max_tool_name_length,
-                                             std::string_view forced_tool_name)
+                                             std::size_t max_tool_name_length)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length) {
-    if (contract_ == nullptr || forced_tool_name.empty()) { return; }
+    if (contract_ == nullptr || contract_->forced_tool_name.empty()) { return; }
+    const std::string& forced_tool_name = contract_->forced_tool_name;
     // The generation prompt ends with exactly this opener, so generation resumes inside the call
     // and the region the parser sees has to begin where the prompt left off.
     tool_region_.append(kToolOpen);

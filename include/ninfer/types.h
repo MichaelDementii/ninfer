@@ -257,9 +257,6 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
-    // Function whose call opener the prompt already carries. The decoder owns that opener instead
-    // of the model, so the parse must be seeded with it. Empty means the model chooses freely.
-    std::string forced_tool_name;
 };
 
 struct RequestOptions {

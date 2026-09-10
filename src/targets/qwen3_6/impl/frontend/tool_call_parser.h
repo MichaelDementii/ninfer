@@ -50,6 +50,11 @@ struct ToolCallOutputContract {
 
     std::vector<Tool> tools;
     bool enforce_declared_names = false;
+    // Function whose call opener the rendered prompt already carries, empty when the model chooses
+    // freely. It lives here because the prompt that carries the opener is the only thing that knows
+    // it: a second, independently supplied copy could name a different tool and the continuation
+    // would be attributed to that one.
+    std::string forced_tool_name;
 };
 
 struct ParsedToolCallOutput {
@@ -60,7 +65,8 @@ struct ParsedToolCallOutput {
 };
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
+build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
+                                std::string_view forced_tool_name = {});
 
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
@@ -79,7 +85,7 @@ public:
     };
 
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                          std::size_t max_tool_name_length, std::string_view forced_tool_name = {});
+                          std::size_t max_tool_name_length);
 
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish();
