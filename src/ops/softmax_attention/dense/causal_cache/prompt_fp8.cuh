@@ -391,24 +391,38 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // FP16-accumulate PV, confined to one key block. The P fragments for all
+        // PVKs contraction steps are hoisted so the (n, k) space can be walked
+        // n-outermost: one FP16 buffer is live at a time and it is folded into the
+        // f32 running accumulator at the block boundary. See prompt_bf16.cuh for
+        // why the carry has to stay in f32.
+        unsigned pf[PVKs][4];
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
-            unsigned pf[4];
             const int pcol = k * 16 + a_coloff;
-            ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+            ldmatrix_x4(pf[k][0], pf[k][1], pf[k][2], pf[k][3],
                         smem_addr(&p_s[(row_base + a_rowoff) * Bc +
                                        causal_prompt_p_swz<Bc>(row_base + a_rowoff, pcol)]));
+        }
 #pragma unroll
-            for (int n = 0; n < PVNtPerWarp; ++n) {
-                const int global_n = d_slice * PVNtPerWarp + n;
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int global_n = d_slice * PVNtPerWarp + n;
+            unsigned h[2]{0u, 0u};
+#pragma unroll
+            for (int k = 0; k < PVKs; ++k) {
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_acc16(h[0], h[1], pf[k][0], pf[k][1], pf[k][2], pf[k][3], vf[0], vf[1]);
             }
+            const float2 p0 = __half22float2(half2_from_bits(h[0]));
+            const float2 p1 = __half22float2(half2_from_bits(h[1]));
+            acc[n][0] += p0.x;
+            acc[n][1] += p0.y;
+            acc[n][2] += p1.x;
+            acc[n][3] += p1.y;
         }
         if (has_next) ninfer::ops::cp_wait<0>();
         __syncthreads();

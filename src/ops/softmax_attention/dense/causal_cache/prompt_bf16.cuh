@@ -371,6 +371,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         // load against the current pair of MMAs.
         constexpr int PVHalf  = PVNt / 2;      // 16 n-tile pairs
         constexpr int PVLoads = PVKs * PVHalf; // 64 x4.trans loads
+        // The PV product runs on the FP16-accumulate MMA, twice as fast as the
+        // f32-accumulate form on sm_120a, but the FP16 accumulator never leaves
+        // one key block: the pair buffer starts at zero for every kb and is folded
+        // into the f32 running accumulator below. Carrying it across blocks instead
+        // would round the running output to ten mantissa bits once per block and
+        // per alpha rescale, making the error a random walk over the block count.
+        // The (n, k) space is walked n-outermost so only one pair buffer is live;
+        // the transposed ldmatrix for the next V fragment is still issued while the
+        // current MMA pair runs.
         // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
         unsigned vf[2][4];
         {
@@ -378,23 +387,41 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                           causal_prompt_swz_addr(v_lane_base, 0u, v_as, v_r));
         }
 #pragma unroll
-        for (int li = 0; li < PVLoads; ++li) {
-            const int k   = li / PVHalf;
-            const int n2  = (li % PVHalf) * 2;
-            const int cur = li & 1;
-            const int nxt = cur ^ 1;
-            if (li + 1 < PVLoads) {
-                const int k2       = (li + 1) / PVHalf;
-                const int n2b      = ((li + 1) % PVHalf) * 2;
-                const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                ldmatrix_x4_t(vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                              causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
-                                                     ckv, v_as, v_r));
+        for (int np = 0; np < PVHalf; ++np) {
+            const int n2 = np * 2;
+            unsigned h0[2]{0u, 0u};
+            unsigned h1[2]{0u, 0u};
+#pragma unroll
+            for (int k = 0; k < PVKs; ++k) {
+                const int li  = np * PVKs + k;
+                const int cur = li & 1;
+                const int nxt = cur ^ 1;
+                if (li + 1 < PVLoads) {
+                    const int k2       = (li + 1) % PVKs;
+                    const int n2b      = ((li + 1) / PVKs) * 2;
+                    const unsigned ckv = static_cast<unsigned>(n2b << 4);
+                    ldmatrix_x4_t(
+                        vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
+                        causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192), ckv,
+                                               v_as, v_r));
+                }
+                mma_f16_acc16(h0[0], h0[1], p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
+                              vf[cur][0], vf[cur][1]);
+                mma_f16_acc16(h1[0], h1[1], p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
+                              vf[cur][2], vf[cur][3]);
             }
-            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                    p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                    p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+            const float2 p0 = __half22float2(half2_from_bits(h0[0]));
+            const float2 p1 = __half22float2(half2_from_bits(h0[1]));
+            const float2 p2 = __half22float2(half2_from_bits(h1[0]));
+            const float2 p3 = __half22float2(half2_from_bits(h1[1]));
+            acc[n2][0] += p0.x;
+            acc[n2][1] += p0.y;
+            acc[n2][2] += p1.x;
+            acc[n2][3] += p1.y;
+            acc[n2 + 1][0] += p2.x;
+            acc[n2 + 1][1] += p2.y;
+            acc[n2 + 1][2] += p3.x;
+            acc[n2 + 1][3] += p3.y;
         }
     }
 
