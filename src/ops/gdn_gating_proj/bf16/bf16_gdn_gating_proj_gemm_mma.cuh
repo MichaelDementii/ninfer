@@ -97,32 +97,38 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     if constexpr (NormalizeInput) {
         static_assert(SplitK == 32, "fused input normalization is tuned for split-32");
         static_assert(NormTokenCapacity > 0 && NormTokenCapacity <= 16);
-        constexpr int kLocalPairs     = kBf16GdnBlockK / 2;
-        const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
-        const int token_count         = min(kBf16GdnBlockN, t - token0);
-        float sums[NormTokenCapacity] = {};
-        // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
-        // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
-        if (blockIdx.y == 0 && warp == 0) {
+        constexpr int kLocalPairs = kBf16GdnBlockK / 2;
+        constexpr int kNormSlots  = (NormTokenCapacity + Warps - 1) / Warps;
+        const auto* x2            = reinterpret_cast<const __nv_bfloat162*>(x);
+        const int token_count     = min(kBf16GdnBlockN, t - token0);
+        float sums[kNormSlots]    = {};
+        // Row tile zero contributes the 64-element norm slices, spread across its warps: warp w
+        // owns tokens w, w + Warps, ... Every token keeps the same lane stride and the same warp
+        // reduction as the single-warp form, so the FP32 summation order is unchanged. The
+        // existing post-MMA cooperative handoff reduces the 32 slices, so normalization adds no
+        // grid-wide barrier.
+        if (blockIdx.y == 0) {
             for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
 #pragma unroll
-                for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
+                for (int slot = 0; slot < kNormSlots; ++slot) {
+                    const int token_local = warp + slot * Warps;
                     if (token_local >= token_count) { continue; }
                     const std::int64_t row_base =
                         static_cast<std::int64_t>(token0 + token_local) * (kBf16GdnHidden / 2);
                     const int global_pair = kt_begin * (kBf16GdnBlockK / 2) + pair;
                     const float2 value    = __bfloat1622float2(x2[row_base + global_pair]);
-                    sums[token_local] += value.x * value.x + value.y * value.y;
+                    sums[slot] += value.x * value.x + value.y * value.y;
                 }
             }
 #pragma unroll
-            for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
-                sums[token_local] = warp_reduce_sum(sums[token_local]);
+            for (int slot = 0; slot < kNormSlots; ++slot) {
+                sums[slot]            = warp_reduce_sum(sums[slot]);
+                const int token_local = warp + slot * Warps;
                 if (lane == 0 && token_local < token_count) {
                     float* norm_partial =
                         partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
                     norm_partial[static_cast<std::int64_t>(split) * t + token0 + token_local] =
-                        sums[token_local];
+                        sums[slot];
                 }
             }
         }
