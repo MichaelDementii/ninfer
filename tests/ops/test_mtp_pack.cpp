@@ -298,6 +298,47 @@ int eps_contract(std::int32_t hidden) {
     return failures;
 }
 
+// The weight contract is [D]. A view with the right element count but the wrong shape has to be
+// refused here exactly as ops::rmsnorm refuses it, or the fused route would run on an operand the
+// composed path would not accept.
+int weight_shape_contract(std::int32_t hidden) {
+    const std::size_t bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+    GuardedDeviceBuffer d_embedding(bytes), d_hidden(bytes), d_weight(bytes), d_residual(bytes);
+    GuardedDeviceBuffer d_out(bytes), d_pack(2 * bytes);
+    Tensor t_embedding(d_embedding.data(), DType::BF16, {hidden, 1});
+    Tensor t_hidden(d_hidden.data(), DType::BF16, {hidden, 1});
+    Tensor t_good(d_weight.data(), DType::BF16, {hidden});
+    Tensor t_residual(d_residual.data(), DType::BF16, {hidden, 1});
+    Tensor t_out(d_out.data(), DType::BF16, {hidden, 1});
+    Tensor t_pack(d_pack.data(), DType::BF16, {2 * hidden, 1});
+
+    int failures       = 0;
+    const auto refuses = [&](const char* what, auto&& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return; }
+        std::cout << "mtp weight shape D=" << hidden << " " << what
+                  << " FAILED: accepted a weight that is not [D]\n";
+        ++failures;
+    };
+    const Tensor bad_rowed(d_weight.data(), DType::BF16, {1, hidden});
+    const Tensor bad_split(d_weight.data(), DType::BF16, {hidden / 2, 2});
+    for (const Tensor* bad : {&bad_rowed, &bad_split}) {
+        refuses("norm_pack embedding_weight", [&] {
+            ops::mtp_norm_pack_fc_input(t_embedding, *bad, t_hidden, t_good, t_pack, 1.0e-6F,
+                                        nullptr);
+        });
+        refuses("norm_pack hidden_weight", [&] {
+            ops::mtp_norm_pack_fc_input(t_embedding, t_good, t_hidden, *bad, t_pack, 1.0e-6F,
+                                        nullptr);
+        });
+        refuses("residual_norm weight", [&] {
+            ops::mtp_residual_norm(t_embedding, t_residual, *bad, t_out, 1.0e-6F, nullptr);
+        });
+    }
+    return failures;
+}
+
 // The route predicate is part of the contract in both directions. If a stem width stopped being
 // admitted, the exactness case above would print "route declined" and pass while covering nothing;
 // if a width outside the mirrored ops::rmsnorm ladder started being admitted, the kernel would run
@@ -559,6 +600,8 @@ int main() {
     failures += residual_norm_strength(5120, 1);
     failures += norm_pack_strength(2048, 4);
     failures += norm_pack_strength(5120, 1);
+    failures += weight_shape_contract(2048);
+    failures += weight_shape_contract(5120);
     failures += eps_contract(2048);
     failures += eps_contract(5120);
     failures += split_case(1);

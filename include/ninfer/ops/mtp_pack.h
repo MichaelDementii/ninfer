@@ -41,10 +41,13 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
  *   BF16 embedding and hidden [D,T], weights [D], out [2D,T], all contiguous.
  *
  * Numeric:
- *   Identical to rmsnorm() applied to each half followed by mtp_pack_fc_input(): the same block
- *   width, pair decomposition, reduction and epilogue produce the same bytes. Returns false from
- *   mtp_norm_pack_fc_input_supported() for shapes it does not cover, and the caller keeps the
- *   three-Op path there.
+ *   Each half is normalised over its own D values: out = x * rsqrt(mean(x^2) + eps) * (1 + w),
+ *   per column and per half. eps must be positive and finite; anything else is rejected. Inputs
+ *   and weights are read as represented BF16 and every output element is rounded to nearest BF16
+ *   once -- that rounding is the only observable boundary. Conformance is against an FP64 oracle
+ *   of the formula above under the operation's numerical criterion; reduction order and every
+ *   intermediate width are implementation choices. mtp_norm_pack_fc_input_supported() reports the
+ *   shapes this route covers, and the caller keeps the three-Op path elsewhere.
  *
  * Effects:
  *   Writes the full output. Inputs, weights and output must not alias.
@@ -72,10 +75,13 @@ void mtp_norm_pack_fc_input(const Tensor& embedding, const Tensor& embedding_wei
  *   BF16 delta and residual [D,T], weight [D], out [D,T], all contiguous.
  *
  * Numeric:
- *   Identical to residual_add() followed by rmsnorm() on the updated residual: the same pairwise
- *   FP32 addition and rounding, then the same block width, pair decomposition, reduction and
- *   epilogue. mtp_residual_norm_supported() reports the shapes this route covers; the caller keeps
- *   the two-Op path elsewhere.
+ *   The residual becomes the sum of the two represented BF16 values, rounded to nearest BF16 once.
+ *   out is the RMSNorm of that stored residual, out = r * rsqrt(mean(r^2) + eps) * (1 + w), read
+ *   back as represented BF16 and rounded to nearest BF16 once. eps must be positive and finite.
+ *   Those two roundings and the stored residual are the observable boundaries; conformance is
+ *   against an FP64 oracle of the composition, in which the sum is exact because both addends are
+ *   BF16. mtp_residual_norm_supported() reports the shapes this route covers; the caller keeps the
+ *   two-Op path elsewhere.
  *
  * Effects:
  *   Updates the full residual in place and writes the full output. delta, weight and out must not

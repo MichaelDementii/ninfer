@@ -27,6 +27,12 @@ void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, const char
     }
 }
 
+// The contract says [D], and ops::rmsnorm holds callers to it. A length check alone would let
+// [1,D] or [D/2,2] through here and take the fused route on an operand the composed path refuses.
+void require_weight_vector(const Tensor& t, std::int32_t d, const char* op, const char* name) {
+    require_shape(t, d, 1, op, name);
+}
+
 } // namespace
 
 void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
@@ -63,9 +69,8 @@ void require_stem_operands(const Tensor& embedding, const Tensor& embedding_weig
     require_shape(embedding, rows, tokens, op, "embedding");
     require_shape(hidden, rows, tokens, op, "hidden");
     require_shape(out, 2 * rows, tokens, op, "out");
-    if (embedding_weight.numel() != rows || hidden_weight.numel() != rows) {
-        throw std::invalid_argument("mtp_norm_pack_fc_input: weight length must be D");
-    }
+    require_weight_vector(embedding_weight, rows, op, "embedding_weight");
+    require_weight_vector(hidden_weight, rows, op, "hidden_weight");
 }
 
 } // namespace
@@ -116,9 +121,7 @@ void require_residual_norm_operands(const Tensor& delta, const Tensor& residual,
     require_shape(delta, rows, tokens, op, "delta");
     require_shape(residual, rows, tokens, op, "residual");
     require_shape(out, rows, tokens, op, "out");
-    if (weight.numel() != rows) {
-        throw std::invalid_argument("mtp_residual_norm: weight length must be D");
-    }
+    require_weight_vector(weight, rows, op, "weight");
 }
 
 } // namespace
