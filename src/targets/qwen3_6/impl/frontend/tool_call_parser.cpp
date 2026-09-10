@@ -638,8 +638,9 @@ ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutpu
     tool_region_.append(kFunctionOpen);
     tool_region_.append(forced_tool_name);
     tool_region_.append(">\n");
-    saw_tool_marker_ = true;
-    forced_          = true;
+    seeded_prefix_bytes_ = tool_region_.size();
+    saw_tool_marker_     = true;
+    forced_              = true;
 }
 
 std::string ToolCallOutputDecoder::feed(std::string_view text) {
@@ -723,7 +724,12 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     std::string tail = std::move(trailing_whitespace_);
     tail.append(kToolOpen.substr(0, marker_prefix_bytes_));
     marker_prefix_bytes_ = 0;
-    tail += tool_region_;
+    // Only what the model produced. A forced turn that never formed a closing region still
+    // carries the prompt's opener at the head of the region, and returning it would put bytes the
+    // model never generated into the response. saw_tool_marker_ is set in the constructor for a
+    // forced turn, so feed() never rebuilds the region and the prefix stays at its head.
+    tail.append(std::string_view(tool_region_).substr(seeded_prefix_bytes_));
+    seeded_prefix_bytes_ = 0;
     tool_region_.clear();
     return Terminal{
         .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};

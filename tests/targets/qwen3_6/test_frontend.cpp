@@ -2283,6 +2283,12 @@ int test_forced_tool_call(const Frontend& frontend) {
     failures += check(truncated.calls.empty() && !truncated.diagnostics.forced_call_closed &&
                           !truncated.content.empty(),
                       "an unfinished argument was completed into a call");
+    // The fallback returns the region as ordinary content. The opener at its head came from the
+    // prompt, not from the model, and must not reach the caller.
+    failures += check(truncated.content.find("<tool_call>") == std::string::npos &&
+                          truncated.content.find("<function=TaskUpdate>") == std::string::npos &&
+                          truncated.content.starts_with("\n<parameter=taskId>"),
+                      "fallback content carried the prompt-owned opener");
     return failures;
 }
 
