@@ -39,8 +39,20 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
     using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
     static_assert((kRows % kRowsPerCta) == 0);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+    using Depth                = W8SmallTMmaStageDepth<Geometry, Schedule>;
+    constexpr int kStages      = Depth::kStages;
+    constexpr int kSharedBytes = Depth::kSharedBytes;
+    if constexpr (kSharedBytes > 0) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                                  W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, false,
+                                  kStages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+        CUDA_CHECK(attribute);
+    }
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, false, kStages>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, kSharedBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);

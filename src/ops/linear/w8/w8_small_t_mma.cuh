@@ -52,20 +52,46 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
     return result.bits;
 }
 
-// The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
+// One k-group's worth of staged operands.
 template <class Schedule>
+struct W8SmallTMmaStage {
+    std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kGroupK];
+    __nv_bfloat16 activations[Schedule::kKWarps][Schedule::kTileTokens * Schedule::kTileKPerWarp];
+    std::uint8_t scales[Schedule::kRowsPerCta]
+                       [Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                            ? Schedule::kScaleBytesPerRow
+                            : 1];
+};
+
+// The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
+// Stages copies of the staging block let Stages - 1 k-groups stay in flight while one is consumed;
+// Stages == 1 is the historical layout, byte for byte.
+template <class Schedule, int Stages = 1>
 union alignas(16) W8SmallTMmaSharedStorage {
-    struct {
-        std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kGroupK];
-        __nv_bfloat16 activations[Schedule::kKWarps]
-                                 [Schedule::kTileTokens * Schedule::kTileKPerWarp];
-        std::uint8_t scales[Schedule::kRowsPerCta]
-                           [Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
-                                ? Schedule::kScaleBytesPerRow
-                                : 1];
-    } staging;
+    W8SmallTMmaStage<Schedule> staging[Stages];
 
     float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
+};
+
+// How deep the k-group feed runs for one Geometry/Schedule pair.
+//
+// The loop can cover a load with arithmetic in two ways: across CTAs resident on the same SM, or
+// inside one CTA by holding more than one group in flight. A schedule asking for
+// kMinBlocksPerSm == 1 has given up the first, so the feed is all that is left. Deepen it exactly
+// there; schedules that keep several CTAs resident already overlap across them, and extra staging
+// buffers would cost them that residency.
+template <class Geometry, class Schedule, int Max = 2>
+struct W8SmallTMmaStageDepth {
+    static constexpr int kSharedBudget = 99 * 1024;
+    static constexpr int kGroups       = Geometry::kInputRows / Schedule::kGroupK;
+    static constexpr int kStageBytes   = static_cast<int>(sizeof(W8SmallTMmaStage<Schedule>));
+    static constexpr int kByShared     = kSharedBudget / kStageBytes;
+    static constexpr int kByGroups     = kGroups < Max ? kGroups : Max;
+    static constexpr int kWanted       = kByShared < kByGroups ? kByShared : kByGroups;
+    static constexpr int kStages = (Schedule::kMinBlocksPerSm == 1 && kWanted > 1) ? kWanted : 1;
+    static constexpr int kSharedBytes =
+        kStages == 1 ? 0 : static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule, kStages>));
+    static_assert(kSharedBytes <= kSharedBudget);
 };
 
 struct W8SmallTMmaIdentityColumns {
@@ -75,7 +101,7 @@ struct W8SmallTMmaIdentityColumns {
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
           bool DirectPairEpilogue = false, bool TiledColumns = false,
-          class ColumnPolicy = W8SmallTMmaIdentityColumns>
+          class ColumnPolicy = W8SmallTMmaIdentityColumns, int Stages = 1>
 __device__ __forceinline__ void
 w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
@@ -97,17 +123,18 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
-    using SharedStorage = W8SmallTMmaSharedStorage<Schedule>;
+    static_assert(Stages >= 1 && Stages <= 4);
+    static_assert(Stages <= kGroups);
+    using SharedStorage = W8SmallTMmaSharedStorage<Schedule, Stages>;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
+    // A deeper feed does not fit the 48 KiB static bound, so it takes the same opt-in route the
+    // wide tiled columns already take.
+    constexpr bool kDynamicShared = (TiledColumns && ActiveCols > 64) || Stages > 1;
     __shared__ __align__(
         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];
     auto& shared =
         *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
-    auto& code_shared  = shared.staging.codes;
-    auto& b_shared     = shared.staging.activations;
-    auto& scale_shared = shared.staging.scales;
 
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
@@ -118,7 +145,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
 
     const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
 
-    const auto stage_x = [&](int group_k0) {
+    const auto stage_x = [&](int group_k0, int stage) {
         constexpr bool kPaddedStage =
             Schedule::kActivationStage == W8SmallTMmaActivationStage::PaddedZero;
         constexpr int kStageCols     = kPaddedStage ? kTileCols : ActiveCols;
@@ -126,7 +153,8 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
+            auto* dst = &shared.staging[stage]
+                             .activations[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
             if constexpr (TiledColumns) {
                 const int source_col = col < live_columns ? col : 0;
                 cp_async_zfill<16, Schedule::kActivationCache>(
@@ -152,7 +180,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
         }
     };
 
-    const auto stage_codes = [&](int group_k0) {
+    const auto stage_codes = [&](int group_k0, int stage) {
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
@@ -160,7 +188,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
                 cp_async<16, Schedule::kWeightCache>(
-                    &code_shared[row][swizzled_chunk * 16],
+                    &shared.staging[stage].codes[row][swizzled_chunk * 16],
                     codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
                         chunk * 16);
             }
@@ -172,7 +200,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
                 const int chunk      = item - row * kScaleChunksPerRow;
                 const int weight_row = row_policy.weight_row(cta_row0, row);
                 cp_async<16, Schedule::kWeightCache>(
-                    &scale_shared[row][chunk * 16],
+                    &shared.staging[stage].scales[row][chunk * 16],
                     scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
                               group_k0 / 32 + chunk * 8) *
                                  2);
@@ -192,16 +220,24 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0);
-    stage_x(0);
-    cp_commit();
-    cp_wait<0>();
+#pragma unroll
+    for (int stage = 0; stage < Stages; ++stage) {
+        stage_codes(stage * kGroupK, stage);
+        stage_x(stage * kGroupK, stage);
+        cp_commit();
+    }
+    cp_wait<Stages - 1>();
     __syncthreads();
 
     constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
+        const int buffer   = Stages == 1 ? 0 : group_index % Stages;
+        auto& code_shared  = shared.staging[buffer].codes;
+        auto& b_shared     = shared.staging[buffer].activations;
+        auto& scale_shared = shared.staging[buffer].scales;
+        (void)scale_shared;
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
@@ -274,10 +310,14 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
-            stage_codes(group_k0 + kGroupK);
-            stage_x(group_k0 + kGroupK);
+            // The commit is issued on every pass, empty once the tail is reached, so the wait
+            // always counts the same number of groups.
+            if (group_index + Stages < kGroups) {
+                stage_codes(group_k0 + Stages * kGroupK, buffer);
+                stage_x(group_k0 + Stages * kGroupK, buffer);
+            }
             cp_commit();
-            cp_wait<0>();
+            cp_wait<Stages - 1>();
             __syncthreads();
         }
     }
@@ -379,13 +419,14 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
 // their independent weight views and provide a closed FP32 epilogue.
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
-          bool DirectPairEpilogue = false, bool TiledColumns = false>
+          bool DirectPairEpilogue = false, bool TiledColumns = false, int Stages = 1>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
     const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* scales, Output output,
     Epilogue epilogue = {}, RowPolicy row_policy = {}, std::int32_t columns = ActiveCols) {
     w8_small_t_mma<Geometry, ActiveCols, Schedule, Output, Epilogue, RowPolicy, DirectPairEpilogue,
-                   TiledColumns>(x, codes, scales, output, epilogue, row_policy, columns);
+                   TiledColumns, W8SmallTMmaIdentityColumns, Stages>(x, codes, scales, output,
+                                                                     epilogue, row_policy, columns);
 }
 
 } // namespace ninfer::ops::detail
