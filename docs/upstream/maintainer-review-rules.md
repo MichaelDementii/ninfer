@@ -523,3 +523,36 @@ reach the upstream thread: once a thread starts, he reads the correspondence ins
 A layout change that speeds up the reader usually slows the writer. #238 measured both: the TMA GEMMs
 lose 47 ms and the quantizer gains 0.6 ms, so the trade is stated as a trade. A body that reports only
 the favourable side invites the reviewer to find the other one.
+
+### 11.11 A width added to a test proves nothing until the harness is sized for it
+
+Adding T=1025 to `tests/ops/linear_add/test_nvfp4.cpp` produced "non-finite at index 6", which reads
+exactly like a kernel defect on the new ragged path. It was not: the harness sized its host
+activation and residual from a literal 1024 while the invocation list is what drives them, so the
+width read past the end of the buffer. The symptom is indistinguishable from the defect you are
+looking for, and the way to tell them apart is the same decisive experiment as everywhere else -
+turn the route off and see whether it still fails. It did, so the fault was in the harness.
+
+Before reporting a failure on a newly added shape, check every bound in the harness that was written
+as a literal rather than derived from the case list.
+
+### 11.12 A test at a new threshold must be able to fail
+
+The first version of the 4/4 floor test added T=768, the floor itself. 768 is three whole M tiles and
+therefore configuration-identical to the 1024 case already in the list: the test passes whether the
+floor is two tiles, three tiles, or 769. It could not fail, so it was not evidence.
+
+The pair 767 / 769 replaced it - the widest width the old route still owns and the narrowest the new
+one admits. Straddle the boundary; a single case sitting on it is decoration. Ask of every added case:
+name the wrong value of the constant this case would catch.
+
+### 11.13 A constant shared by several call sites must be measured through each of them
+
+The route floor is read by four Ops with different output policies - `linear`, `attn_input_proj`
+(one row block scattered to four destinations), `gdn_input_proj` (two), `linear_add` (residual read
+per token, in place). The first sweep measured one of them. Running the other three did not change
+the decision, but it is what turned the single regressing cell at 640 from an anomaly of one
+benchmark into a reproduction on a second instrument.
+
+If the constant is shared, the sweep has to be too, or the body has to say plainly which call sites
+were not measured.
