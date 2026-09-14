@@ -50,8 +50,19 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
     return layout.peak_bytes(1);
 }
 
+// Which widths take the TMA route. The quantizer that writes the scale plane and the kernel that
+// reads it must agree on its layout, so both ask this one predicate instead of restating it at
+// each call site.
+[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
+    return tokens >= 1024 && (tokens % kNvfp4TmaBlockM) == 0;
+}
+
+[[nodiscard]] inline Nvfp4ScaleLayout nvfp4_w4a4_scale_layout(std::int32_t tokens) {
+    return nvfp4_w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled : Nvfp4ScaleLayout::RowMajor;
+}
+
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream);
+                                Nvfp4ScaleLayout scale_layout, cudaStream_t stream);
 
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);

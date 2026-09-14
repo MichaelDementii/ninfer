@@ -26,6 +26,22 @@ enum class Nvfp4SmallTBlockOrder : std::uint8_t {
     TokenTilesContiguous,
 };
 
+// Token extent of one activation-scale tile. The TMA route reads the scale plane one
+// [kNvfp4TmaBlockM tokens, 16 groups] tile per request and wants that tile contiguous; the
+// quantizer writes it in tiles of this width, so a TMA schedule must carry the same BlockM.
+inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
+
+// Group extent of that tile. Sixteen groups are 16 bytes of scales, which is two K tiles, which is
+// why the load below is issued on even k-tiles only.
+inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
+
+// Layout the quantizer writes the activation scale plane in. Named rather than passed as a flag so
+// that a call site forcing one of them says which.
+enum class Nvfp4ScaleLayout : std::uint8_t {
+    RowMajor,
+    Tiled,
+};
+
 template <std::int32_t OutputRows, std::int32_t InputRows>
 struct Nvfp4GemvGeometry {
     static_assert(OutputRows > 0 && InputRows > 0);

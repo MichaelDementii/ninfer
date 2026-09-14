@@ -21,7 +21,6 @@ enum class Nvfp4LinearSwiGluRoute {
     TmaFusedW4A4,
 };
 
-constexpr std::int32_t kTmaBlockM = 256;
 constexpr std::int32_t kFusedMaxTokens = 128;
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
@@ -37,7 +36,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= kFusedMaxTokens) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
-    if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
+    if (tokens >= kNvfp4TmaBlockM && (tokens % kNvfp4TmaBlockM) == 0) {
         return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
     }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
@@ -93,9 +92,9 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
         maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
     }
-    if (max_tokens >= kTmaBlockM) {
-        const std::int32_t largest_fused = max_tokens - (max_tokens % kTmaBlockM);
-        if (largest_fused >= std::max(min_tokens, kTmaBlockM)) {
+    if (max_tokens >= kNvfp4TmaBlockM) {
+        const std::int32_t largest_fused = max_tokens - (max_tokens % kNvfp4TmaBlockM);
+        if (largest_fused >= std::max(min_tokens, kNvfp4TmaBlockM)) {
             maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
         }
     }
@@ -126,7 +125,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();
         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+        // Inside the TMA case, so this route always reads tile-contiguous scales. Its own
+        // predicate admits every multiple of 256 from 256 up, which is wider than the shared one.
+        launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled, stream);
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_linear_swiglu_w4a4_tma(
             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
