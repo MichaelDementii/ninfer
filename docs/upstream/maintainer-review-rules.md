@@ -580,3 +580,81 @@ both, and state the instruction as arithmetic rather than as judgement.
 The corollary about the missing cell is worth its own line: **a cell the null gate emptied is not a
 cell that agrees with you.** Say which it was and how it was covered, or the first reader who counts
 the grid will find the hole.
+
+### 11.15 A green `ctest` with no test count is not a pass
+
+Configuring a fresh worktree without `-DBUILD_TESTING=ON` produces a build with no registered tests.
+`ctest` then prints `No tests were found!!!` and **exits 0**. A script that greps for failures finds
+none, and the pre-flight line "ctest clean" gets written on the strength of a suite that never ran.
+
+Always record the count, never the verdict: "115/115", not "passed". A claim with no denominator is
+the shape this failure hides in. And when a count changes between branches - 114 on one base, 115 on
+another - that is information about the base, not noise to round away.
+
+### 11.16 An output-comparison gate must be checked for emptiness before it is believed
+
+The witness for the Rows2 window compared generated completions between two binaries and reported
+six of six identical. The files were **one byte each**: the CLI writes its completion to stderr, and
+the script captured stdout. Two empty files compare equal, and the gate reports success in exactly
+the voice it uses when it has worked.
+
+This is the same defect as a gate that runs at a token count the change does not reach - and that one
+had already happened on the same PR. Print the size of what was compared, next to the verdict, every
+time. A witness that cannot say how many bytes it examined has not examined anything.
+
+### 11.17 Compute the roofline denominator at the clock you measured at
+
+A body reported 90.6 % of the bf16 tensor peak by dividing a figure measured at 2770 MHz by the peak
+at the 2407 MHz nameplate clock. The numerator had been re-measured on a faster session and the
+denominator had not, which inflated the efficiency by about a seventh and would have been read as
+overstating how close the kernel already runs to the machine.
+
+Two rules follow. Use the ceiling the maintainer states (1689.4 GB/s read on this part), not the
+constant the benchmark happens to print in its own header - those are the tools
+
+### 11.15 A green `ctest` with no test count is not a pass
+
+Configuring a fresh worktree without `-DBUILD_TESTING=ON` produces a build with no registered tests.
+`ctest` then prints `No tests were found!!!` and **exits 0**. A script that greps for failures finds
+none, and the pre-flight line "ctest clean" gets written on the strength of a suite that never ran.
+
+Always record the count, never the verdict: "115/115", not "passed". A claim with no denominator is
+the shape this failure hides in. And when a count changes between branches - 114 on one base, 115 on
+another - that is information about the base, not noise to round away.
+
+### 11.16 An output-comparison gate must be checked for emptiness before it is believed
+
+The witness for the Rows2 window compared generated completions between two binaries and reported six
+of six identical. The files were **one byte each**: the CLI writes its completion to stderr, and the
+script captured stdout. Two empty files compare equal, and the gate reports success in exactly the
+voice it uses when it has worked.
+
+This is the same defect as a gate that runs at a token count the change does not reach - and that one
+had already happened on the same PR. Print the size of what was compared, next to the verdict, every
+time. A witness that cannot say how many bytes it examined has not examined anything.
+
+### 11.17 Compute the roofline denominator at the clock you measured at
+
+A body reported 90.6 % of the bf16 tensor peak by dividing a figure measured at 2770 MHz by the peak
+at the 2407 MHz nameplate clock. The numerator had been re-measured on a faster session and the
+denominator had not, which inflates the efficiency by about a seventh and reads as overstating how
+close the kernel already runs to the machine.
+
+Two rules follow. Use the ceiling the maintainer states (1689.4 GB/s read on this part), not the
+constant the benchmark prints in its own header - those are the tool's defaults, not a measurement.
+And recompute the peak at the SM clock actually recorded for the cells reported: 170 x 512 x f_SM for
+dense bf16. If the clock was not recorded per cell, the roofline share cannot be stated at all.
+
+### 11.18 A precondition check needs its premise verified against the ISA, not assumed
+
+A submission added a runtime check rejecting a `cg` opt-in whose k was not a multiple of 8, on the
+stated grounds that `cp.async.cg` needs a 16 B-aligned source while the predicated path has no such
+guarantee. Reading `memory.cuh` settles it: both branches issue a 16-byte `cp.async` when the copy is
+16 bytes, and the natural-alignment requirement is on the copy size, not on the cache modifier. So the
+invariant was already master's, the check was unreachable, and the permanent comment stated the wrong
+rule about the hardware.
+
+Removing it made the diff smaller, took a `throw` off the launch path, and removed a claim a reviewer
+who knows the ISA would have corrected in public. Before adding a guard, establish that the condition
+can occur; a guard justified by a misread of the ISA is worse than no guard, because it teaches the
+next reader the misreading.
