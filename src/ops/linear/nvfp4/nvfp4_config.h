@@ -35,6 +35,16 @@ inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
 // why the load below is issued on even k-tiles only.
 inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
 
+// Narrowest token count the shared W4A4 TMA route is offered at.
+//
+// The last measured width at which the route this replaces still wins is 640: on 16384x5120 it is
+// 3.5 % faster there and 13.1 % slower at 672. 672, 704 and 736 measure faster on every registered
+// geometry, so this is not the largest admissible floor; it is the first whole number of tiles
+// above the last measured regression. That is deliberate: the sign is not monotone in T below 640 -
+// two geometries lose at 448 and 512 and win again at 640 - so a width measuring well does not
+// vouch for its neighbours, and this is one machine.
+inline constexpr std::int32_t kNvfp4TmaMinTokens = 3 * kNvfp4TmaBlockM;
+
 // Token extent the tiled scale plane is written over: the layout is a bijection onto whole tiles,
 // so a ragged token count is padded up to one and the padding is filled with zeroes.
 [[nodiscard]] inline constexpr std::int32_t nvfp4_w4a4_padded_tokens(std::int32_t tokens) {

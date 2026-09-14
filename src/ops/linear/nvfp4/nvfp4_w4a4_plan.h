@@ -57,7 +57,9 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 // reads it must agree on its layout, so both ask this one predicate instead of restating it at each
 // call site. The fused SwiGLU route keeps its own, which reaches below this floor; it forces the
 // tiled layout explicitly rather than deriving it from here.
-[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) { return tokens >= 1024; }
+[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
+    return tokens >= kNvfp4TmaMinTokens;
+}
 
 [[nodiscard]] inline Nvfp4ScaleLayout nvfp4_w4a4_scale_layout(std::int32_t tokens) {
     return nvfp4_w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled : Nvfp4ScaleLayout::RowMajor;
