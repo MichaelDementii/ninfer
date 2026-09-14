@@ -658,3 +658,22 @@ Removing it made the diff smaller, took a `throw` off the launch path, and remov
 who knows the ISA would have corrected in public. Before adding a guard, establish that the condition
 can occur; a guard justified by a misread of the ISA is worse than no guard, because it teaches the
 next reader the misreading.
+
+### 11.19 A SASS census compares bodies, not names, and not raw columns
+
+The claim "adding a defaulted template parameter changes exactly one instantiation" is checkable in
+the object file, and it is worth checking - but `cuobjdump -sass` lays two traps for that comparison.
+
+**Names all change.** Adding a parameter changes the schedule type, so every mangled kernel name
+differs between the two builds even where the code is identical. Matching functions by name reports
+that nothing corresponds to anything.
+
+**Columns all change too.** `cuobjdump` right-aligns its hex-encoding comments to the longest symbol
+in the file. A longer mangled name shifts that column in every line, so a naive text diff reports all
+thirty bodies as different when only whitespace moved.
+
+Compare bodies by content, with `/* ... */` address and encoding comments stripped and runs of
+whitespace collapsed, and count multiset differences rather than pairing by name. Done that way the
+census gave what the claim predicted: 30 bodies and 454 `LDGSTS` on each side, exactly one body
+differing, its 15 `LDGSTS` gaining `BYPASS`. Done naively it gave "all 30 differ", which is the kind
+of result that gets a true claim deleted from a body for being unsupportable.
