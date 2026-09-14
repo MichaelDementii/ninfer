@@ -556,3 +556,27 @@ benchmark into a reproduction on a second instrument.
 
 If the constant is shared, the sweep has to be too, or the body has to say plainly which call sites
 were not measured.
+
+### 11.14 Reviewing the diff and reviewing the body are two different jobs
+
+Preparing the route floor, the first adversarial pass was given the diff. It returned eight findings,
+all about the code, and none about a number. The second pass was given the diff, the body, and the
+raw measurement record together, with one instruction: check that every figure in the body appears in
+the record with the same value. It returned five more findings of the first rank, and all five were
+in the text:
+
+* a superlative in a code comment that the comment two lines below it falsified;
+* a threshold comment that documented a value one greater than the constant it sat on;
+* "conservative by one and a half tiles" where the gap is half a tile - a number that had never been
+  computed, only felt;
+* "all four Ops read 0.00 %" where the control table holds four bench cells over three Ops;
+* "seven of 49 cells" where the grid is fifty, the missing cell unnamed - and it turned out to sit at
+  the floor itself, on a geometry the claim depends on, having lost every pass to the null gate.
+
+None of these is reachable by reading the diff, and none would have been caught by re-reading the body
+alone: each needs the body and the raw file side by side. Make it a separate pass, give the reviewer
+both, and state the instruction as arithmetic rather than as judgement.
+
+The corollary about the missing cell is worth its own line: **a cell the null gate emptied is not a
+cell that agrees with you.** Say which it was and how it was covered, or the first reader who counts
+the grid will find the hole.
