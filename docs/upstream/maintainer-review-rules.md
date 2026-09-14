@@ -405,3 +405,121 @@ After Codex reviews:
 
 - [ ] Every P1 answered with a commit or a substantiated argument; every P2 answered explicitly.
 - [ ] Description updated to match the final commit, not the first one.
+
+---
+
+## 11. Our own defects — the checks that caught them, added 2026-09-14
+
+Everything in this section comes from preparing #238 and #239 and from two independent adversarial
+reviews of those diffs. Each item is here because we actually shipped or nearly shipped the mistake.
+**Read this section before every submission, not only §10.**
+
+### 11.1 Issue first — the rule we ignored for the whole campaign
+
+`CONTRIBUTING.md`, *Start with an Issue*, verbatim:
+
+> Every bug, performance opportunity, feature request, protocol change, and architecture proposal
+> **must begin with an Issue before implementation starts.** … Wait for the maintainer to confirm the
+> scope and implementation direction **before investing in a pull request**. … **A pull request
+> without a linked, confirmed Issue may be closed without detailed review.**
+
+We opened PRs cold, every time. It is not the sole cause of the backlog — #112, #150, #193, #198,
+#203, #204, #205 were merged with no Issue at all, while #191 (Issue #190), #206 (Issue #68) and
+#106/#140 (Issues #117/#118) had one — but it is a free reason to skip a PR, and skipping is what is
+happening.
+
+- New mechanism → short Issue first, wait for direction.
+- Work already finished → one line in the body, the shape that worked in #99: *"the direction was
+  established in your review rather than in an Issue; if you would rather it be re-filed as an Issue
+  first, say so."*
+- Evidence on his bandwidth: Issue #186 asked, at length, in what order to send fourteen finished
+  changes. The entire answer was **"ok, remember do a rebase to master"**. Short questions get
+  answers; long ones get one line.
+
+### 11.2 Every number in the body must belong to the branch head
+
+Check before submitting, not after. Three of our open PRs failed this at once:
+
+| PR | the body said | the head did |
+|---|---|---|
+| #160 | operator −19.4 / −13.5 / −16.6 %, prefill +5.99 % | −8.4 / −7.6 / −9.9 % after our own merged #204 took part of the gain |
+| #200 | "a single threshold of 19", Q6 moved to 17 | Q5 5 → 17, Q6 untouched |
+| #201 | "`cg` by default, `ca` on the two BM=16 schedules", 3 files | default unchanged, one schedule opts in, 2 files |
+| #194 | the pre-fix formula, numbers from `ad0f3d38` | the folded form, numbers from `b88c0f6` |
+
+The correction always existed — as a comment further down the thread. **He reads the description, not
+the thread.** A body that contradicts its own diff is the stated reason PR #2 was refused: *"This
+directly contradicts the PR description's claim."*
+
+### 11.3 `clang-format` clean is not the same as formatted
+
+`clang-format --output-replacements-xml` reported **zero** replacements on a file where we had just
+written two 101-character lines against `ColumnLimit: 100`. It cannot always rewrap, so it stays
+silent. Check both:
+
+```sh
+clang-format --output-replacements-xml FILE | grep -c '<replacement '
+awk 'length > 100 {print FILENAME":"NR" = "length}' FILE
+```
+
+and compare the second against master, so pre-existing long lines are not mistaken for ours.
+
+### 11.4 Three kinds of sentence that must never enter a body unmeasured
+
+All three were caught in our own drafts:
+
+1. **A share.** "this kernel is about 5 % of prefill kernel time" — it was **17.6 %**. Compute it from
+   the profile, do not estimate it.
+2. **A mechanism.** "the gain falls with T because the epilogue is computed once per output element" —
+   both the epilogue and the MMA grow linearly in T, so the explanation was wrong. If the mechanism
+   was not established, write the observation and say it is not explained.
+3. **An adjective standing in for arithmetic.** "four orders of magnitude below the bf16 quantum" — the
+   real ratio is ~3.1 orders. Give the two numbers instead; there is then nothing to argue with.
+
+### 11.5 A small sample is not a bound
+
+"0 of 2001 sampled points round to a different bf16" became, at 40 million points, **1 in 31 128**.
+When the claim is about a rate, measure the rate. Expected flips are about `d / 2^-9` per output for a
+relative perturbation `d`, so a 2001-point sample cannot see a 1-in-30 000 effect.
+
+### 11.6 Compare against what master does, not against the ideal
+
+The strongest form of a precision claim is not "we are close to the mathematics" but "we are this much
+further from it than master already is". For #239: master's own float `silu` disagrees with the
+mathematics once in 41 237 outputs and the new form once in 31 128 — one extra differing output per
+130 000. The same reframing turned a Codex P2 into a refutation: the zeroing it warned about is
+master's behaviour, and the change removes it.
+
+### 11.7 The identical-baseline arm is mandatory on the local card
+
+The card is shared with the Windows desktop through WDDM and a run can be preempted outright. Running
+the master binary a second time under another label as a third arm showed nulls of **+1490 %, −78 %,
++86 %** — 36 of 150 passes on the first sweep. Without it, a quarter of the passes would have entered
+the result as signal.
+
+- Drop a pass for a cell when its two identical binaries disagree by more than 1 %, and report how
+  many were dropped.
+- Three passes are not enough after dropping; take six or seven.
+- `nvidia-smi -lgc` is refused under WSL, so clocks cannot be pinned. Repetition is the only defence.
+- Wall clock on this machine has a ±2 % null on prefill throughput. Below that, measure kernel time.
+
+### 11.8 Answer a bot finding on its premise, not only on its request
+
+Codex P2 on #239 asked for a test guarding against a gate near −90 collapsing to zero. The premise was
+inverted: **master** returns a wrong zero there 31 379 times in 200 001 sampled points, and the change
+returns one nowhere. Answer with the measurement, then offer the test rather than building a contrived
+input — `AGENTS.md` asks for *represented* public inputs and warns against tests that mirror the
+implementation. Then ask for a re-review explicitly.
+
+### 11.9 Run an adversarial review before he sees it
+
+Both PRs went through an independent reviewer briefed to find defects before Codex and before a tired
+human. On #238 it found four P2s, **two of which were the commit message disagreeing with the diff**.
+On #239 it found nine items, three of which were our own unmeasured sentences. None of that should
+reach the upstream thread: once a thread starts, he reads the correspondence instead of the change.
+
+### 11.10 State the cost of the change, not only its gain
+
+A layout change that speeds up the reader usually slows the writer. #238 measured both: the TMA GEMMs
+lose 47 ms and the quantizer gains 0.6 ms, so the trade is stated as a trade. A body that reports only
+the favourable side invites the reviewer to find the other one.
