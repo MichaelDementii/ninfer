@@ -742,3 +742,43 @@ diverges, so a port must re-read every copy rather than assume they still agree.
 move the threshold has to be per shape now, against whatever that shape currently uses - our own
 floor work was measured when all five agreed, and one of the five has since moved past the value we
 were going to propose.
+
+### 12.5 A comparison arm must be rebuilt after anything touches its tree
+
+Comparing two arms on identical test widths means putting the same test sources in both. Doing that
+by copying the files across, running, and then restoring them with `git checkout -- tests/` leaves
+the restored arm's **binaries** built from the copied sources. The next comparison then runs one arm
+with extra widths and the other without.
+
+The symptom is not a value mismatch. It is a mismatch in the **number** of records - `diff` reports
+deleted lines rather than changed ones - and it appeared on two Ops that the change provably does not
+touch, which is exactly where a real defect would have been alarming. Rebuilding the restored arm
+made both read IDENTICAL.
+
+Two habits follow. Rebuild any arm whose tree was touched, even to undo it. And read the shape of a
+diff before reading its content: a count difference is almost always the harness, a value difference
+is almost always the change.
+
+### 12.6 A sweep that produced no files is not a sweep that found nothing
+
+Master renamed the `W8` qtype to `Q8`. The sweep script still passed `--qtype W8`, so the benchmark
+printed its usage text and exited zero on every single invocation. The script completed, the task
+reported success, and the analysis over an empty directory printed a clean empty table.
+
+Any script that collects measurements must fail loudly when it collected none; one line does it. This
+is the same family as 11.15 and 11.16: the dangerous outcome is not an error, it is a well-formed
+report of nothing.
+
+### 12.7 Sample the range densely before choosing a threshold
+
+The Rows2 window was first re-measured at every other width, which showed gains at T=6..14 and zeros
+at 16 and 17 - and led to a conclusion that the window should be narrowed to 14. Measuring every
+integer reversed it: 16 and 17 gain 1.5-1.6 % while 12, 14 and 15 read zero.
+
+The zeros are the instrument. Every absolute median in that sweep is an exact multiple of 2.048 us,
+and at T=12 one step is 2.08 % of the operation, so a cell reading zero means both arms landed on the
+same step. A sparse sweep across a quantized instrument does not measure a curve; it samples a
+staircase, and which cells look flat depends on where the samples happen to fall.
+
+Check the quantum first - it is visible in the absolute numbers, never in the ratios - and then
+sample every point in the interval the threshold will move.
