@@ -677,3 +677,68 @@ whitespace collapsed, and count multiset differences rather than pairing by name
 census gave what the claim predicted: 30 bodies and 454 `LDGSTS` on each side, exactly one body
 differing, its 15 `LDGSTS` gaining `BYPASS`. Done naively it gave "all 30 differ", which is the kind
 of result that gets a true claim deleted from a body for being unsupportable.
+
+## 12. What changed on 2026-09-15, and what it invalidates
+
+Master moved 21 commits in one night. Three of them change what a submission has to look like, and
+one of them contradicts a rule written here the day before.
+
+### 12.1 There is now a PR template, and it is the required shape
+
+`.github/pull_request_template.md`: **Problem and scope** (with a `Related Issue:` field),
+**Implementation**, **Verification**. That supersedes the Problem / Change / Result / Validation /
+Limits shape inferred from the #220 closure. The `Related Issue` field makes the issue-first rule a
+form field rather than a paragraph in CONTRIBUTING, so a blank there is now visible at a glance.
+
+CONTRIBUTING gained a table of what evidence each kind of change owes. For performance tuning it is
+"correctness evidence and a final performance report", and for Linear the report has a prescribed
+format.
+
+### 12.2 Retained performance reports must not contain speedups
+
+`docs/maintainer/linear-tuning.md` §4, verbatim: retained reports "omit old-implementation
+comparisons, speedup ratios, aggregate improvement scores, and candidate-search history. Candidate
+measurements remain working evidence for dispatch decisions; the report presents the resulting
+implementation."
+
+Every body we have written is built the other way round - a table of percentages against master.
+That framing is now explicitly not what a report is. The comparison still belongs somewhere: it is
+the argument in **Problem and scope** for why the change is worth making. What goes in
+**Verification** is the absolute performance of the final implementation: latency, logical GB/s,
+bandwidth utilization, useful TFLOP/s and Tensor Core utilization at the priority points and both
+bulk anchors, with the peak denominators named.
+
+The priority points are fixed: the hot interval is `1 <= T <= 128` with 1, 4 and 8 emphasized, and
+`T=512` and `T=1024` reported separately so that an average cannot hide a regression at one of them.
+
+### 12.3 The roofline denominators are the bench's constants, not a recomputed peak
+
+This overrides 11.17. `linear_bench` defines `kRtx5090DramGBs = 1792.0`,
+`kRtx5090SustainedReadGBs = 1674.5`, `kRtx5090Bf16Fp32AccumulateTFLOPs = 209.5`,
+`kRtx5090Fp8Fp16AccumulateTFLOPs = 838.0` and `kRtx5090Fp8Fp32AccumulateTFLOPs = 419.0`, and the Q4
+worked example divides by exactly those, naming 1792 for the nominal reference and 1674.5 as the
+separately labelled sustained-read reference. So quote the bench's constants and label which is
+which; do not substitute a peak recomputed at the measured clock, and do not use 1689.4.
+
+What 11.17 still gets right is narrower and worth keeping: do not silently mix a numerator measured
+in one session with a denominator from another, and do not quote a utilization figure at all when
+the denominator is not defined for that path.
+
+**The NVFP4 path has no defined peak.** The bench carries tensor peaks for fp8 and bf16 only, and
+its `TC_profile` and `TC_%` columns print a dash for NVFP4 rows. Measured logical throughput on the
+W4A4 TMA route already exceeds every constant the bench defines, so no Tensor Core utilization can
+be stated for it without a number nobody has established. Report the bandwidth columns, say plainly
+that the bench defines no NVFP4 tensor peak, and leave the ratio out.
+
+### 12.4 A shared threshold can stop being shared
+
+The W4A4 TMA floor used to be `tokens >= 1024 && tokens % 256 == 0` everywhere. After
+`refactor(ops): organize nvfp4 execution by matrix shape` it lives in each shape's own `select_a4`,
+and `perf(ops): tune nvfp4 34816x5120 linear routes` then lowered **that one shape** to 256 while
+the other four stayed at 1024.
+
+Two consequences. A change that centralizes such a predicate is wrong the moment one call site
+diverges, so a port must re-read every copy rather than assume they still agree. And a proposal to
+move the threshold has to be per shape now, against whatever that shape currently uses - our own
+floor work was measured when all five agreed, and one of the five has since moved past the value we
+were going to propose.
