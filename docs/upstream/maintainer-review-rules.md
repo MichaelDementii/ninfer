@@ -961,3 +961,50 @@ had been about to ship without it.
 
 The general form: any sentence of the shape "there are N of X" or "X always has property P" is a
 lookup you have not done yet. Do it before the reviewer does, because they have the tree open.
+
+### 12.20 A live null does not make a number portable between machines
+
+The PV block-buffered package is the cleanest counterexample we have to our own habit of treating
+"the null arm was green" as a warrant for the figure. Both campaigns had a working null, and the
+figure still moved by a factor of two.
+
+The measurement carries **two independent nulls inside one run**, not one:
+
+* `nvfp4` and `k8v4` are control formats — the route does not fold on them, so the change is
+  required to read exactly zero. It read **0.00 %** on both, in both passes.
+* Both passes agreed to the third digit.
+
+So the instrument was demonstrably sound. Then:
+
+| | base `ad0f3d38`, rented stand | base `b88c0f6`, our stand |
+|---|---|---|
+| headline | ×1.20…1.29, i.e. **−17…−22 %** | |
+| bf16 | | **−10.68 %** |
+| int8 | | **−16.82 %** |
+| fp8 | | **−16.67 %** |
+| nvfp4 (control) | | **0.00 %** |
+| k8v4 (control) | | **0.00 %** |
+
+Not one format landed inside the old band. Two landed just below its lower edge and the third at
+roughly half of it. Had the old headline gone into the body — the package was assembled to submit
+it — the maintainer would have read ×1.29 and measured ×1.12.
+
+**The rule.** A null arm proves the two sides of *this* run differ by more than the instrument. It
+says nothing about whether the figure survives a change of machine, driver, clock policy or base
+commit. Those are not noise; they are different populations. So:
+
+* A figure is quoted with the machine and the base commit it was taken on, every time.
+* A package that has sat while master moved is **re-measured**, not re-read. Its old numbers are
+  evidence that the direction is real, not that the magnitude is.
+* When an old and a new campaign disagree, the body carries the new one and says the old one
+  existed and what it read. 12.16 already requires reporting the alternative you rejected; a
+  superseded measurement of your own work is one.
+* Do not average across campaigns or quote the friendlier of the two.
+
+This sharpens 12.7 (one stand per report) rather than repeating it: 12.7 says do not mix stands
+inside one table, and this says a green null inside one stand is not a licence to carry the number
+out of it.
+
+A third measurement of the same cells, on `5b4303c0` and our local card, is in flight. If it lands
+on a third value with the control formats still at zero, "the number belongs to the machine, not to
+the change" stops being an inference and becomes a measurement.
