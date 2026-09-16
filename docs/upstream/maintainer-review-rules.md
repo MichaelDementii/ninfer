@@ -1178,3 +1178,57 @@ exactly one shape; it is included by three (`shapes/n248320_k5120.cu`,
 And "prefix reuse is absent upstream" was wrong about a subsystem of seventeen files with
 `ExecutionOptions::allow_prefix_reuse` defaulting to true and six `PrefixReusePath` kinds; what is
 absent is *position-independent* reuse, which is a claim a tenth the size. Found by `llm-5090-3b`.
+
+#### 12.22b And an instrument that reports *sameness* needs a known-same case
+
+12.22a is about tools that report absence. Its mirror bit on the same night, and the fix is the
+same shape.
+
+A gate that is `constexpr` can be checked without the card: disassemble both arms and compare kernel
+bodies. `cuobjdump -sass`, names normalised for the source path and the path-derived anonymous
+namespace hash, gave 24 of 28 `gemm_mma_kernel` instantiations byte-identical, with exactly the four
+above the gate's threshold changed. That is the claim the gate makes, proven by reading the binary.
+
+But "byte-identical" is a verdict an instrument can produce for the wrong reason — a normalisation
+too aggressive, a comparison of the wrong objects, a diff that silently succeeded on nothing. The
+check that makes it mean something happened by accident: a neighbouring object the change does not
+touch at all was disassembled first, by mistake. It differs by **12 lines out of 5317**, and all
+twelve are the source path and its hash.
+
+So the method has a measured zero, and the zero has a shape: twelve path lines. Any pair that
+differs by only those twelve is the same code; any pair that differs by more is not. Without that
+number, "identical" is an assertion about a diff, not about a binary.
+
+* Before comparing two builds, compare two builds that must be the same, and record what the noise
+  floor of your normalisation looks like.
+* State the floor in the body next to the comparison. `24 of 28 identical` means nothing until the
+  reader knows what your tooling calls identical.
+
+Measured by `llm-5090-3b`; raw in `pr_gdn_norm_warp_spread/ЗАМЕР_2026-09-17.md`.
+
+**The corollary that saved a claim from being wrong.** The same package showed +0.45 pp on widths
+where the gate makes the change a no-op — and the kernel is bitwise identical there, so the gain
+cannot be the kernel. The object is 6144 SASS lines shorter, so what moved is binary layout, and the
+candidate mechanism is instruction-cache alignment. That belongs in the body as a paragraph, because
+it is the reviewer's first question and the honest answer is "not from the code you are reading".
+
+### 12.23 Five arms do not balance in six passes
+
+Rotating arm order is how we stop a drifting card from being read as an effect. It only works if
+every arm spends the same time in every position.
+
+Three arms over six passes is balanced: 3! = 6, each ordering runs once. Six arms over six passes
+rotated cyclically is balanced: each arm visits each position exactly once, which is a Latin square.
+**Five arms over six passes is not balanced** — mean position came out 2.67 for one arm and 3.33 for
+another, so a card that drifts within a pass taxes the later arms.
+
+There it was checked rather than assumed, and the check cleared it: deviation from the pass mean,
+averaged by position, read −0.42, −0.08, −0.44, −0.36, −0.07 % — no trend, bias ≤ 0.4 pp, so the
+arms were comparable. That is the right order of operations. The rule is not "five arms are
+forbidden", it is:
+
+* Pick a pass count that balances the arm count — `n` arms want `n` passes cyclically, or `n!` when
+  `n` is small, or a Latin square on a multiple of `n`.
+* When the counts do not divide, measure the positional bias before comparing arms, and print it.
+* A rotation that is not balanced is not a control. It looks like one, which is worse than not
+  having it.
