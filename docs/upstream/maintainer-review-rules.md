@@ -1158,3 +1158,23 @@ look, a missing row does not.
 
 The cheap version of this costs one command. The expensive version is telling a colleague, or a
 maintainer, that something is not there.
+
+**The typo case deserves its own line, because it is the most common one.** Searching for
+`mma_nvf4` where the symbol is `mma_nvfp4` returns nothing, and nothing is exactly what a genuine
+absence returns. The conclusion drawn was "the wrapper exists but is dead"; the wrapper has three
+callers. One dropped letter, and a whole backlog item was about to be scored on the wrong premise.
+
+A probe catches this and nothing else does: a misspelled pattern fails against the known-present
+case too, so the probe comes back empty and the search is condemned before its verdict is used. A
+spell-check of your own pattern is not available; a probe is.
+
+Three false negatives in one night on one project, all three from the searcher's own tools, none
+from anyone's data. That ratio is the point. We check data we are given; we do not check the
+instrument we reach for, because reaching for it feels like looking.
+
+Two of the three had consequences worth naming. `fp8_a16_ksplit_mma` was reported as included by
+exactly one shape; it is included by three (`shapes/n248320_k5120.cu`,
+`gdn_input_proj/fp8/fp8_gdn_input_matrix.cu`, `attn_input_proj/fp8/fp8_attn_input_a16_small_t.cu`).
+And "prefix reuse is absent upstream" was wrong about a subsystem of seventeen files with
+`ExecutionOptions::allow_prefix_reuse` defaulting to true and six `PrefixReusePath` kinds; what is
+absent is *position-independent* reuse, which is a claim a tenth the size. Found by `llm-5090-3b`.
