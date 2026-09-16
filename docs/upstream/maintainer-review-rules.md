@@ -1125,3 +1125,36 @@ measurement to be believable — `select_q8_n34816_k5120` in
 MMA, then back to k-split, then MMA again. A table that reverses itself over eight tokens is a claim
 about the machine that some measurement once made and nobody has re-made. Reading it costs nothing
 and tells you where to point the instrument.
+
+#### 12.22a A tool that reports absence has to be shown a case where presence is certain
+
+Two failures in one evening, different tools, identical shape.
+
+**The scan filtered on sign.** Two passes of a cell agreeing in direction was treated as the cell
+being real. It reported 62 candidates. The filter had never been shown a cell that was known to be
+noise, so nobody knew it would pass 14.336 µs against 39.168 µs.
+
+**The grep reported no gate.** Reading `uses_a8` across five shape files, a one-line `sed` pattern
+was used against what turned out to be a two-line function body, and `n34816_k5120` printed as
+`<none>`. The conclusion drawn and passed on was "this shape has no gate at all". It has
+`min_tokens == 1 || max_tokens >= 5`, so A8 does not run at T = 2, 3, 4 — visible in the data as
+a16 and a8 columns agreeing to three digits at T=2 and T=4 and diverging at T=1.
+
+In both cases the instrument answered "there is nothing here" and was believed, because an empty
+answer looks like a clean answer. A false negative has no symptom: a wrong number invites a second
+look, a missing row does not.
+
+**So: before trusting a tool that reports absence, run it against a case where presence is certain.**
+
+* A grep or a parser: point it at a line you have read with your own eyes and confirm it comes back.
+  If five files are being scanned and one prints empty, that is the file to open, not the file to
+  skip.
+* A filter over candidates: feed it a cell you know is noise and confirm it is rejected. A filter
+  never tested against a known negative is a filter with an unknown false-positive rate, which is
+  the same thing as no filter.
+* A collection step: assert a non-zero count before analysing. `NINFER_OP_REPORT_STATS` with
+  `ctest --output-on-failure` collects nothing from a green suite (12.13) — the emptiness guard is
+  what caught that, and it is the same guard as this rule.
+
+The cheap version of this costs one command. The expensive version is telling a colleague, or a
+maintainer, that something is not there.
