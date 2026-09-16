@@ -1079,3 +1079,49 @@ in the same two functions, `mtp_forward_tail` and `attn_mix`, about twenty lines
 one body cited by line number moves from `text.cpp:1080` to `:1088` depending on which lands first.
 A clean cherry-pick and a shared file are two facts, and the first does not retire the second. Cite
 functions and symbols, not line numbers, whenever another open change touches the same file.
+
+### 12.22 Agreement of sign between passes is not agreement
+
+A scan over dispatch tables looked for widths where the table's own neighbour is faster. The filter
+was: the drop must appear in both passes with the same sign. It produced 62 candidates, headed by
+`35b_mtp_proj` at T=10, **−49.16 %**.
+
+That cell's two passes read **14.336 µs** and **39.168 µs**. They agree on the sign and disagree by
+a factor of 2.7. The headline finding was noise that happened to fall the same way twice.
+
+Replacing the filter with two conditions — the passes of a cell must agree **with each other**, and
+the drop must exceed the **worst spread of the two cells being compared** — left 20 of the 62. Every
+large "finding" was in the 42 that went. What survived is smaller and real: `27b.mtp_attention` q8
+`[14336,5120]` at 56→57 reads 120.679 → 74.469 µs, **−38.29 %**, with a pass spread of 0.65 %.
+
+Measured by `llm-5090-3b`.
+
+**The rule.** A sign test answers "did it move the same way twice", which is the wrong question when
+a single pass can be wrong by a factor of two. Before a delta between two cells is a candidate:
+
+* each cell's passes agree with each other, and you state by how much;
+* the delta is larger than the worst of the two cells' spreads, not larger than the average;
+* the spread is printed next to the delta, so a reader can apply the test rather than trust it.
+
+This is the same discipline the null arm enforces for A/B work (12.20, 12.21), applied where there
+is no null arm because both sides are real configurations. The pass spread *is* the null there, and
+it has to be printed for the same reason.
+
+It also explains a shape of error we keep repeating: the biggest number in a scan is the most likely
+to be junk, because a scan ranks by magnitude and noise has the largest magnitude. When a scan's
+headline is also its least reproducible cell, that is the expected outcome, not a surprise. Sort the
+survivors by delta-over-spread, not by delta.
+
+**And check whether the source already admits the finding.** The strongest of these did not need a
+measurement to be believable — `select_q8_n34816_k5120` in
+`src/ops/linear/q8/shapes/n34816_k5120.cu` reads:
+
+```
+    if (tokens <= 48) return launch_q8_mma_r64x16_c48_k128_a1;
+    if (tokens <= 56) return launch_q8_ksplit<Geometry, 56, C56>;
+    if (tokens <= 64) return launch_q8_mma_r128_c64;
+```
+
+MMA, then back to k-split, then MMA again. A table that reverses itself over eight tokens is a claim
+about the machine that some measurement once made and nobody has re-made. Reading it costs nothing
+and tells you where to point the instrument.
