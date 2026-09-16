@@ -1232,3 +1232,42 @@ forbidden", it is:
 * When the counts do not divide, measure the positional bias before comparing arms, and print it.
 * A rotation that is not balanced is not a control. It looks like one, which is worse than not
   having it.
+
+### 12.24 Put a region of identical code inside the sweep, on purpose
+
+A null arm answers "how much do two runs of the same build differ". A **self-calibrating region**
+answers the same question without a third arm: a band of the sweep where both arms provably execute
+the same code, measured in the same passes, in the same order, as everything else.
+
+It appeared by accident in a Q8 threshold sweep. Above T = 57 the threshold being moved no longer
+selects anything, so both columns run identical code — and they did not read the same. The gap was
+**≤ 0.25 %** on `[34816,5120]` and **about 1 %** on `[14336,5120]`, systematically favouring whichever
+column ran first in each pass. That is the method's own bias, priced inside the measurement, for
+free. The band being compared moves 14 to 38 %, so the bias does not threaten it — but nobody knew
+the number until the sweep happened to contain a region where the answer had to be zero.
+
+Two of our packages already do this, which is why the pattern deserves a name rather than an
+invention:
+
+* **#264** sweeps widths that are whole multiples of the M tile, where both arms take the same route.
+  Seven such widths read **+0.05 %** median, and the body labels them "controls rather than results".
+  The end-to-end arm does it too: chunk 1536 is six whole tiles, same route on both arms, and reads
+  −0.05 % against a candidate of +2.37 % at 1408.
+* **#268** carries 404 cells whose graph node count is unchanged, median **+0.00 %**, beside the 76
+  that fold.
+
+**#222 has no such region and cannot have one** — its two arms are `--route split` and `--route
+fused`, which differ at every width the bench accepts. There the whole burden falls on the null arm,
+`--route split` run a second time, and that is why its band (worst kept pass 0.97 %) is quoted so
+carefully. Know which of the two you have.
+
+So, when designing a sweep:
+
+* Ask whether the change has a region where it is provably a no-op — a width below a threshold, a
+  shape the dispatch does not reach, a format the route does not fold. If it does, **sweep it in the
+  same session** and print it.
+* A region is better than an extra arm when it exists: it costs no extra passes, and it controls for
+  arm order as well, because it sits in the same rotation.
+* When it does not exist, say so and lean on the null arm explicitly.
+* Either way the control's number goes in the body next to the result. A reader cannot price a
+  +2.37 % without knowing that the same instrument reads −0.05 % where nothing changed.
