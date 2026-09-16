@@ -782,3 +782,25 @@ staircase, and which cells look flat depends on where the samples happen to fall
 
 Check the quantum first - it is visible in the absolute numbers, never in the ratios - and then
 sample every point in the interval the threshold will move.
+
+### 12.8 No AI attribution anywhere in an upstream submission
+
+Asked on both #250 and #253, in the maintainer's own words: he does not want AI tools listed as
+authors or co-authors of commits, and the human author attribution is to be preserved.
+
+So, for anything that goes to his repository:
+
+* **no `Co-Authored-By:` trailer** in any commit message, and it must be absent from the final
+  squash message too - a squash merge assembles its message from the branch commits, so a trailer
+  left on any one of them reappears there;
+* **no "Generated with ..." line** in the pull request body either. He did not ask for that one to
+  go, but it is the same signal in a different place, and the point is to stop raising the subject
+  rather than to litigate where the line may stand.
+
+This is not a disclosure rule and it is not a judgement on using the tool. His CONTRIBUTING says
+plainly that "tool choice neither qualifies nor disqualifies a contribution"; what it demands is
+that the contributor understand the whole diff, explain the design and its boundary conditions, and
+answer review. The objection is narrower than it looks: `Co-Authored-By` is not a note, it is git
+metadata that makes a second author of record, visible in the history forever.
+
+Strip both before pushing, not after being asked.
