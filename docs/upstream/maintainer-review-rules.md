@@ -1005,6 +1005,8 @@ This sharpens 12.7 (one stand per report) rather than repeating it: 12.7 says do
 inside one table, and this says a green null inside one stand is not a licence to carry the number
 out of it.
 
-A third measurement of the same cells, on `5b4303c0` and our local card, is in flight. If it lands
+A third measurement of the same cells, on `5b4303c0` and the same local card, is in flight (session
+llm-5090-3b). Same machine, same driver 616.64, same 575 W cap as the second campaign - so if it
+lands on a third value with the controls still at zero, the base is left as the only explanation. If it lands
 on a third value with the control formats still at zero, "the number belongs to the machine, not to
 the change" stops being an inference and becomes a measurement.
