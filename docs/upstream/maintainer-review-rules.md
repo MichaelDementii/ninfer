@@ -1015,3 +1015,42 @@ it varies the base and the branch, not the machine. If it lands on a third value
 formats still reading zero, the machine is ruled out and the base commit is left holding the
 difference - which is the stronger finding of the two, because a base commit is something we choose
 and a rented machine is not.
+
+### 12.21 Portability is a property of the quantity, not of the measurement
+
+12.20 says a green null does not make a figure portable. That is true but too broad, and the
+correction is measured rather than argued. Three kinds of number behave differently across a change
+of machine or base:
+
+**Accuracy figures transfer exactly.** The PV package's cell `causal batch d256-h24-kv4 bf16 W=16
+B=1 phase=0` read 0.5977 → 0.6107 on a rented stand on 2026-09-10 and the same 0.5977 → 0.6107 on
+our card today. They are deterministic; there is nothing for a machine to change. Measured by
+`llm-5090-3b`.
+
+**End-to-end figures transfer closely.** The GDN change read **+0.213 %** decode
+[+0.123 … +0.277], 6 of 6 passes, on our stand, against **+0.228 %**, 6 of 6, on rented stand B at
+`b88c0f6`. Null arm +0.054 % [−0.071 … +0.151]. Raw in `/root/e2e_gdn`; measured by `llm-5090-3b`.
+
+**Operator figures do not.** GDN's operator read −29.7 % at T=16 and −26.98 % today. PV's bf16 cell
+went −22 → −10.7 → −12.6 % across three campaigns. This is the case 12.20 was written from.
+
+The mechanism is plausible and matches the shape: an end-to-end figure is a ratio of two whole
+passes, in which the change is a small part and most of the common time cancels. An operator figure
+is a ratio of two short kernels, where everything the machine does around them is the measurement.
+
+**But an end-to-end figure is only portable once it is sampled enough to be portable, and that is
+not free.** From this package's own record: the identical-baseline decode arm was collected twice on
+one machine, one base, one build. At `-r 2 --warmup 1` it read **+1.81 % median with a +5.41 % worst
+pass**. At `-r 10 --warmup 3` the same arm read **+0.55 % median over −0.44 … +0.89**. Nothing
+changed but the sampling. So "end-to-end transfers" is a statement about adequately sampled
+end-to-end figures; an under-sampled one is not portable even to itself, and the way to find out is
+the null arm, not the effect.
+
+So:
+
+* Quote an accuracy figure freely; say which build produced it and stop there.
+* Quote an end-to-end figure across machines only with its pass count, its warmup, and its null
+  arm's spread beside it. Without those three it is not evidence that it transfers.
+* Never carry an operator figure across a machine or a base. Re-measure.
+* When the three disagree about whether a change helps, the operator figure is the one that moved,
+  and it is the one to re-take.
