@@ -804,3 +804,42 @@ answer review. The objection is narrower than it looks: `Co-Authored-By` is not 
 metadata that makes a second author of record, visible in the history forever.
 
 Strip both before pushing, not after being asked.
+
+### 12.9 Compare against what the dispatcher will choose after the change lands
+
+The rejected revision of the ragged-tail PR sent ragged SwiGLU widths to the fused kernel, where the
+public `linear` + `silu_mul` composition was 8.5 to 11.6 % faster. The reason it was missed is worth
+keeping, because every gate we run was clean.
+
+The PR itself made the alternative faster. The composition's own `linear` gained the ragged TMA path
+from this very change, and the routing decision was then made against the baseline *as it had been*.
+The maintainer's control row showed it plainly: at the width just below the new floor both arms read
+the same number, because both were already taking the improved composition.
+
+So the comparison for a dispatch change is not "new route against master". It is **every
+implementation the dispatcher could select at that width, each built from the tree the change
+produces** - including the ones the change itself speeds up. Run it through the public entry point,
+so what is compared is what production would run.
+
+Two corollaries that cost us a second round here:
+
+**An arm must implement the condition being shipped.** One suite was collected with the *rejected*
+floor still in it, which left the band the new condition newly claimed completely unmeasured - and
+extrapolation put that band at a 13 to 18 % regression, worse than the defect already rejected.
+Check what each arm's binary actually does before trusting a table drawn from it.
+
+**If the right condition depends on another pending change, do not ship the condition.** Offering the
+maintainer both tables and letting merge order decide sounds even-handed; it is not, when one of the
+two orders ships a regression. Split it: land the mechanism with the dispatch untouched, which is
+correct under every order, and reclaim the routing afterwards against the tree that actually exists.
+
+### 12.10 Replacing a precondition with a convention is removing it
+
+The same PR deleted the whole-tile check in the quantizer - correctly, since padding made the old
+condition obsolete - and put nothing in its place. The new contract was "the caller allocated through
+`allocate_nvfp4_w4a4_workspace`", which nothing enforced: the workspace is two raw pointers, so a
+caller sizing its own would have had 255 tokens of scales written past the end, silently.
+
+When a change makes a guard obsolete, the question is never whether to delete it. It is what the new
+invariant is and where it is now checked. Here the plane's extent had to travel with the pointers so
+the check could live where the old one did.
