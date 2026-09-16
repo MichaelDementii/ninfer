@@ -909,3 +909,55 @@ option costs, and say which machine the crossover was measured on.
 This is not the same as offering the maintainer a choice between two outcomes, one of which is bad
 - 12.9 rules that out. Both options here are safe; one is more conservative, and the evidence for
 preferring it is stated rather than assumed.
+
+### 12.17 One figure, three populations: say which one you are quoting
+
+At T=256 this package can report −21.70 %, −21.97 % or −21.83 %. All three are honest. The first is
+the dense sweep, the second the wide sweep, the third pools both — and the pooled one is what the
+body's own summary tables are computed from, because the 38-of-38 count is over the pooled band.
+
+I corrected a narrative sentence to the dense figure while leaving the tables on the pooled one, and
+for two rounds the body quietly disagreed with itself two screens apart. Nothing was wrong; nothing
+traced either, and a reviewer checking a headline number against the table below it would have found
+a mismatch I could not explain on the spot.
+
+The rule is not "pick the pooled one". It is: a body quotes one population throughout, names it once
+("those figures pool the two sweeps"), and shows the other readings beside it so the spread is
+visible rather than hidden. Three sweeps agreeing to within 0.27 % is evidence. Three sweeps quoted
+interchangeably is a defect.
+
+### 12.18 Evidence borrowed from another submission has to travel with a label
+
+This body cites an identical-baseline decode arm at +0.55 % median. That arm was never collected for
+this change — it belongs to a different submission's package, on the same machine and the same build
+configuration. The number is the right one to quote: it is a property of the stand, and the stand is
+what decides whether an end-to-end claim is possible.
+
+What was wrong is that nothing in `raw/` carried it. The audit caught it as three percentages with no
+file behind them, which is exactly the shape of a number nobody measured — even though somebody had.
+
+If a figure comes from another package, copy the raw into this one, say in the body that it was
+collected elsewhere and why it still applies, and state what it is evidence *of*: the instrument, not
+the change. Otherwise the strongest argument in the submission — *"I am not claiming an end-to-end
+number, and here is the measurement that says I cannot"* — rests on a figure the reviewer cannot
+check.
+
+And when you go to fetch it, check whether there were two collections. There were: an earlier one at
+two repetitions read +1.81 % median with a +5.41 % worst pass. 12.16 says to report the alternative
+you rejected. A rejected *instrument* counts.
+
+### 12.19 Structure is looked up, not recalled
+
+I wrote "both registered text geometries are in play" from memory. The tree has five model cards over
+three base models, and I had artifacts for two of them. The sentence was not false, but it was an
+assertion about the shape of the world made without opening anything.
+
+Fetching the three published configs took one command and turned a hedge into the strongest claim in
+the submission: all three are head_dim 256 with a 64-channel rotation, and the two head geometries in
+the predicate are the only two that exist. The same lookup produced the fact the package was missing
+entirely — the call site is on the full-attention path, so it fires 16 times per pass of 64 layers,
+or 10 of 40, not once per layer. Every per-pass number in the body depends on that multiplier, and I
+had been about to ship without it.
+
+The general form: any sentence of the shape "there are N of X" or "X always has property P" is a
+lookup you have not done yet. Do it before the reviewer does, because they have the tree open.
