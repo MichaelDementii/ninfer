@@ -1027,9 +1027,26 @@ B=1 phase=0` read 0.5977 → 0.6107 on a rented stand on 2026-09-10 and the same
 our card today. They are deterministic; there is nothing for a machine to change. Measured by
 `llm-5090-3b`.
 
-**End-to-end figures transfer closely.** The GDN change read **+0.213 %** decode
-[+0.123 … +0.277], 6 of 6 passes, on our stand, against **+0.228 %**, 6 of 6, on rented stand B at
-`b88c0f6`. Null arm +0.054 % [−0.071 … +0.151]. Raw in `/root/e2e_gdn`; measured by `llm-5090-3b`.
+**End-to-end figures transfer closely — but read what the number is before citing it.** The GDN
+change read **+0.213 %** decode [+0.123 … +0.277], 6 of 6 passes, on our stand, against **+0.228 %**,
+6 of 6, on rented stand B at `b88c0f6`. Both at `-r 4 --warmup 2`, six passes, mirrored arm order.
+Raw in `/root/e2e_gdn`; measured by `llm-5090-3b`.
+
+I first wrote that pair up as evidence that end-to-end figures transfer. It is weaker than that, and
+the arithmetic says so. The null arm read +0.054 % [−0.071 … **+0.151**], and the effect's band
+starts at +0.123 — **the two overlap over [+0.123, +0.151]**. The effect does not separate from its
+own null; it holds on the sign criterion alone, 6 of 6, p = 1/64. So the two campaigns agreeing to
+0.015 pp is agreement an order of magnitude finer than the instrument's own null is wide
+(0.222 pp). With two campaigns you cannot tell that apart from luck.
+
+The companion figure behaves better and shows what a citable one looks like: PV prefill on 35B read
++0.999 % [+0.852 … +1.522], 6 of 6, against a null of +0.099 % [−0.401 … +0.721] — separated, but
+by **0.131 pp**, which is the number to quote alongside it rather than the bare +0.999 %.
+
+So the discipline: before citing an end-to-end figure as transferable, check whether its band clears
+its null's band, and say which of the two cases it is. "Reproduced in magnitude and on the sign
+criterion" and "separated from the null" are different claims, and only the second licenses the
+word *effect*.
 
 **Operator figures do not.** GDN's operator read −29.7 % at T=16 and −26.98 % today. PV's bf16 cell
 went −22 → −10.7 → −12.6 % across three campaigns. This is the case 12.20 was written from.
@@ -1054,3 +1071,11 @@ So:
 * Never carry an operator figure across a machine or a base. Re-measure.
 * When the three disagree about whether a change helps, the operator figure is the one that moved,
   and it is the one to re-take.
+
+One more distinction this exchange produced, about branches rather than numbers. Two of our open
+changes edit `src/models/qwen3_5/execution/text.cpp`. `git cherry-pick -n` of both onto master is
+clean, which says the *text* does not collide. It does not say the *meaning* does not: the hunks sit
+in the same two functions, `mtp_forward_tail` and `attn_mix`, about twenty lines apart, and a symbol
+one body cited by line number moves from `text.cpp:1080` to `:1088` depending on which lands first.
+A clean cherry-pick and a shared file are two facts, and the first does not retire the second. Cite
+functions and symbols, not line numbers, whenever another open change touches the same file.
