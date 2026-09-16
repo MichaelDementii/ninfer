@@ -815,3 +815,59 @@ caller sizing its own would have had 255 tokens of scales written past the end, 
 When a change makes a guard obsolete, the question is never whether to delete it. It is what the new
 invariant is and where it is now checked. Here the plane's extent had to travel with the pointers so
 the check could live where the old one did.
+
+### 12.11 `git checkout --` restores from HEAD, not from before the damage
+
+A strength control damages a file, builds, runs, and puts the file back. Ours put it back with
+`git checkout -- <file>`, which restores the committed state - and the change being tested was
+uncommitted, so the restore deleted it. The next build failed with a type error between two files
+that had been consistent five minutes earlier, and the only reason the work was not lost is that the
+patch script that produced it was still on disk.
+
+Save by copy and restore by copy, compare the two with `cmp`, and put the restore in a `trap` so it
+also runs when the script exits early:
+
+```sh
+SAVE=$OUT/file.orig
+cp "$FILE" "$SAVE"
+restore() { cp "$SAVE" "$FILE"; cmp -s "$SAVE" "$FILE" || { echo "RESTORE MISMATCH"; exit 1; }; }
+trap restore EXIT
+```
+
+The same applies to the other direction - copying one arm's test sources into the other's tree to
+compare identical widths. 12.5 already says to rebuild the restored arm; this says not to restore it
+with git in the first place.
+
+### 12.12 A strength control has to be louder than the criterion, not louder than the arithmetic
+
+The first control scaled the fused SwiGLU epilogue by 1.001 and **every case passed**, which reads
+exactly like a gate that cannot see the kernel at all. It was not: the A4 profile's relative-L2
+allowance is `1.6e-1`, because the weights are four bit, so a per-mille perturbation sits three
+orders inside the criterion.
+
+Size the damage against the tolerance the test actually applies, and read that tolerance out of the
+source before choosing the number. A control that fails to fail teaches nothing, and worse, it takes
+a while to tell apart from a gate that is genuinely blind.
+
+### 12.13 `ctest --output-on-failure` prints nothing when everything passes
+
+A witness that scrapes test stdout for statistics collects zero records from a green suite, because
+that flag shows output only for failures. The emptiness guard from 11.16 caught it, which is the
+only reason it is a footnote rather than a retraction. Use `ctest -V` for anything that reads test
+output, and strip the `N: ` prefix it puts on every line - the number differs between arms, so a
+naive comparison reports every record as changed.
+
+### 12.14 A change to workspace capacity perturbs widths it does not touch
+
+Three widths in the band this change deliberately leaves alone read +0.57 to +0.85 % in the wide
+sweep, against nulls of 0.15 to 0.32. Both arms take the same route there, so there was nothing to
+explain it - except that the benchmark sizes one arena from the whole sweep and hands it to every
+width, and the change cuts that arena from 663 MiB to 35 MiB. Different arena, different addresses,
+different cache behaviour at widths the dispatch never reaches.
+
+Sweeping that band on its own, where both arms compute the same capacity, the same widths read
+-0.07, -0.02 and 0.00 with a worst cell of +0.14 %. So the finding was the instrument.
+
+The rule is not "ignore it". It is that a change which moves an allocation has a second, diffuse
+effect on everything sharing that allocator, and the way to separate the two is a run whose extent
+makes both arms allocate identically.
