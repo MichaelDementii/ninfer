@@ -857,17 +857,55 @@ only reason it is a footnote rather than a retraction. Use `ctest -V` for anythi
 output, and strip the `N: ` prefix it puts on every line - the number differs between arms, so a
 naive comparison reports every record as changed.
 
-### 12.14 A change to workspace capacity perturbs widths it does not touch
+### 12.14 An outlier gets a rerun before it gets an explanation
 
-Three widths in the band this change deliberately leaves alone read +0.57 to +0.85 % in the wide
-sweep, against nulls of 0.15 to 0.32. Both arms take the same route there, so there was nothing to
-explain it - except that the benchmark sizes one arena from the whole sweep and hands it to every
-width, and the change cuts that arena from 663 MiB to 35 MiB. Different arena, different addresses,
-different cache behaviour at widths the dispatch never reaches.
+Three widths in the band this change deliberately leaves alone read +0.57 to +0.85 % in one sweep,
+against nulls of 0.15 to 0.32. Both arms take the same route there, so there was nothing in the
+dispatch to explain it, and a plausible mechanism was to hand: the benchmark sizes one arena from
+the whole sweep and hands it to every width, and the change cuts that arena by an order of
+magnitude, so different addresses and different cache behaviour at widths the dispatch never
+reaches.
 
-Sweeping that band on its own, where both arms compute the same capacity, the same widths read
--0.07, -0.02 and 0.00 with a worst cell of +0.14 %. So the finding was the instrument.
+That story was written up before it was tested. A narrow sweep over the band alone was consistent
+with it. Then a third session - four arms, same extent for all of them - read the same three widths
+at 0.00, 0.00 and -0.14 %, worst cell in the band +0.15 %. **The outliers were not a property of
+the change and not a property of the arena. They did not reproduce.**
 
-The rule is not "ignore it". It is that a change which moves an allocation has a second, diffuse
-effect on everything sharing that allocator, and the way to separate the two is a run whose extent
-makes both arms allocate identically.
+Two things to carry. An outlier in a single session is a candidate for a rerun, not a candidate for
+an explanation; the explanation is what you write once it survives one. And a mechanism that merely
+fits the observation is not established by an experiment that fails to contradict it - 11.4 already
+says this about sentences in a body, and it applies just as much to a paragraph written for our own
+notes.
+
+### 12.15 Pick a threshold where the sign is stable, not where the crossover is
+
+The fused SwiGLU floor was measured four ways. Every session put the sign flip at the same place -
+T=263 slower, T=264 faster, a tail of eight tokens - which is as clean a crossover as this bench
+produces. And at T=264 itself four readings give **-0.27, +0.59, +0.31 and -0.08 %**: the crossover
+is exactly where the two implementations cannot be told apart, so it is exactly where a threshold
+is least reproducible.
+
+What is stable is the ground either side of it. Below a tail of eight, every session agrees the
+composition wins, by up to 0.69 %. From a tail of sixteen upward every session agrees the fused
+route wins, by 0.5 % rising to 6.8 % at the top of the band. A threshold belongs in the stable
+region, and the distance from the crossover is the margin you are buying against the next machine.
+
+6.7 already says a tuned constant must be justified on the binding case or kept conservative. This
+is the operational form of it: measure the crossover to know where it is, then do not put the
+constant there.
+
+### 12.16 Report the alternative you rejected, with its numbers
+
+The choice here was a floor at one M tile - worth a further median of 0.77 % over 63 widths, at the
+cost of seven widths regressing up to 0.69 % - against a floor at two, which reads +0.03 % median
+across that band and regresses nothing. Both were measured in one session, four arms, so the
+comparison is paired rather than assembled from two runs.
+
+Shipping the conservative one and saying nothing would have invited exactly the review that killed
+the first version of this work: *"you left a gain on the table"* is the mirror of *"you shipped a
+regression"*, and both are answered by the same table. Put it in the body, name what the other
+option costs, and say which machine the crossover was measured on.
+
+This is not the same as offering the maintainer a choice between two outcomes, one of which is bad
+- 12.9 rules that out. Both options here are safe; one is more conservative, and the evidence for
+preferring it is stated rather than assumed.
