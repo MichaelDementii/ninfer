@@ -1351,3 +1351,19 @@ disclosed weakness that points against your own claim is worth more in the body 
 that points for it.
 
 Criterion generalised with `llm-5090-3b`, who raised the flag on a live submission.
+
+**And apply it to someone else's recomputation before calling it an artifact.** A parallel session
+recomputed this package's raw data independently and got −42.96 % where the body says −43.27 %. The
+conclusion drawn was "estimator difference, not data". It was neither: it was a different
+population. Theirs was the wide sweep's own 40 cells; the body's is the taken band, 38 cells pooled
+across both sweeps. Where the populations did match, the two pipelines agreed to the second decimal
+— −6.58 % on the dense sweep from both.
+
+So the rule has a second half. Before explaining a disagreement by method, check that both sides
+summed the same set. An independent recomputation that lands near your number is the strongest
+evidence a package can get, and it is wasted if the near-miss gets filed as rounding.
+
+The practical form, which costs one clause: **label the population beside every summary figure.**
+Not "median −43.27 %" but "median −43.27 % over the 38 cells of the taken band, pooling both
+sweeps". Then the next recomputation either agrees or shows immediately where it diverged, instead
+of producing a second number with no way to tell which question it answers.
