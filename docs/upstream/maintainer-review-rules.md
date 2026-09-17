@@ -1271,3 +1271,26 @@ So, when designing a sweep:
 * When it does not exist, say so and lean on the null arm explicitly.
 * Either way the control's number goes in the body next to the result. A reader cannot price a
   +2.37 % without knowing that the same instrument reads −0.05 % where nothing changed.
+
+**`pgrep -f` sees its own command line, by construction.** This one is worth naming because it
+produced the same failure twice in an hour, in two sessions, independently.
+
+A gate script waited for a build with `while pgrep -f "cmake --build /root/m222"; do sleep 15; done`.
+A *separate* background waiter had that same string inside its own command line, so `pgrep` matched
+the waiter, the waiter matched itself, and the gate waited for a process that was the wait. The
+build had finished ten minutes earlier.
+
+The other session then went looking for this class in its own scripts, ran `pgrep -af flagwatch`,
+and the second line of the output was the `pgrep` itself. Harmless there — it was printing a list,
+not looping on it — but the same shape.
+
+So a process search by pattern always finds at least one process: the search. Use `pgrep -x -f` with
+an exact command, or exclude your own shell (`pgrep -f pat | grep -v $$`), or stop searching by
+string and use a pid file. And when a loop waits on a search, make it prove the search can return
+empty before you trust it to end.
+
+**A watchdog that has gone half-blind is worse than none.** The same sweep found a background
+`flagwatch.sh` left running from the night before. It polls `GPU_BUSY_*` only, so once the second
+convention (`GPU_LOCK`) appeared it reported "no flags" **exactly when the card was held**. Nobody
+had touched it; the world moved and the watchdog kept answering confidently about the half it still
+knew. An acquire bug shows up in its consequences; an observer bug does not show up at all.
