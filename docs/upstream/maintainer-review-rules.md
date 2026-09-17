@@ -1294,3 +1294,28 @@ empty before you trust it to end.
 convention (`GPU_LOCK`) appeared it reported "no flags" **exactly when the card was held**. Nobody
 had touched it; the world moved and the watchdog kept answering confidently about the half it still
 knew. An acquire bug shows up in its consequences; an observer bug does not show up at all.
+
+**Failing closed has its own failure mode: "found nothing" and "could not look" are still two
+things, and conflating them the other way is an outage.** The morning's bug was a lock check that
+could not read its directory and reported the card free — fail open, the dangerous direction. The
+fix made it refuse when the directory was unreadable. Within the hour that fix denied the lock to
+every session on the machine.
+
+`/var/lock` is a symlink to `/run/lock`, which is tmpfs, and WSL tears the distribution down
+whenever no session is open. The lock directory therefore disappears several times an hour. But a
+missing directory on tmpfs is not an unread check — every process that held a lock died with the
+filesystem, so it is an empty set, and the correct response is to create the directory and carry on.
+A directory that *exists and cannot be read* is the unread check, and only that one must refuse.
+
+So a fail-closed guard needs three outcomes, not two:
+
+* **clear** — the check ran and found nothing. Proceed.
+* **held** — the check ran and found something. Wait.
+* **could not check** — refuse, and say which of your checks could not run.
+
+And when a check genuinely cannot run for a structural reason — a non-root session cannot read
+`/root`, and never will — the honest output is neither "clear" nor a refusal but a stated
+unknown: *"cannot read /root from here, so the retired path is unverified"*. Printing the gap is
+what lets the next reader decide whether it matters; swallowing it is how the first bug happened.
+
+Caught by `llm-5090-3b`, who also supplied the distinction.
