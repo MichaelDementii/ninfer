@@ -1367,3 +1367,55 @@ The practical form, which costs one clause: **label the population beside every 
 Not "median −43.27 %" but "median −43.27 % over the 38 cells of the taken band, pooling both
 sweeps". Then the next recomputation either agrees or shows immediately where it diverged, instead
 of producing a second number with no way to tell which question it answers.
+
+## 13. Settled by the maintainer — do not re-open
+
+Questions he has already answered, with the answer in his words and where he gave it. Before
+drafting anything that touches one of these, read his sentence, not our summary of it. He has no
+obligation to explain a decision twice, and asking him to is how a contributor stops being read.
+
+### 13.1 The default `prefill_chunk` of 1024. Settled: it stays.
+
+**PR #96, closing comment, 2026-08-27:**
+
+> "The default prefill chunk of 1024 is deliberate. The reported workspace grows from about
+> 120 MiB at 1024 to 482 MiB at 4096 and 963 MiB at 8192. That memory comes directly out of the
+> capacity available for KV, cached contexts, and active requests, so the larger-chunk gain is not
+> free and does not justify changing the default."
+
+Read what that argument is and is not.
+
+* **He knows the gain exists.** He is not missing a measurement. We have measured it repeatedly —
+  +25 to +31 % prefill on 35B-A3B in August, +24 to +28 % again on 2026-09-17 by an independent
+  session on a different base. Re-measuring it is not new information, it is the same information
+  with a fresh date.
+* **His objection is capacity, not speed.** The workspace comes out of the budget for KV, cached
+  contexts and concurrent requests. A throughput number on one request says nothing about that
+  trade, because the cost lands on requests that are not in the benchmark. A report that presents
+  the gain without pricing the lost capacity is answering a question he did not ask.
+* **It is a product decision, and it is his.** He weighed a single-request speedup against
+  multi-request capacity and chose capacity. That is the kind of call an owner makes, and
+  re-presenting our side of it is not evidence, it is repetition.
+
+**So do not propose changing the default, and do not write a performance report whose conclusion is
+that it should change.** Not as a PR, not as an issue, not as a "here are the numbers, the decision
+is yours" note — the last is the same proposal with a disclaimer.
+
+A prior session already understood this and wrote, in the body of #118, *"I am not proposing to
+change the default prefill chunk. When you closed #96 you wrote that 1024 is deliberate…"* — and a
+later session still came within a day of drafting exactly that report. That is why this is written
+down here rather than left in a memory note.
+
+**What is still open near this question**, so the ban is not read wider than it is:
+
+* Making a *given* chunk width cheaper or faster is fine and welcome — that is ordinary kernel work,
+  and it is what #264 and the merged NVFP4 route series do.
+* Reducing the workspace a wide chunk needs is fine, and is the one line of work that could
+  legitimately revisit the trade: his objection is the 482 and 963 MiB, so a change that lowers
+  those numbers argues against his premise instead of ignoring it. #264 cut the fused SwiGLU
+  workspace from 566.43 to 35.34 MiB on [1, 8192]; that is the shape of a real answer here.
+* Documenting the effect for a *user* who is choosing `--prefill-chunk` themselves is fine. Telling
+  the owner to change the shipped default is not.
+
+And if a report is ever justified because the premise has genuinely moved, it opens by quoting his
+sentence and saying which number in it is no longer true — not by re-deriving the speedup.
