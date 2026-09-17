@@ -1319,3 +1319,35 @@ unknown: *"cannot read /root from here, so the retired path is unverified"*. Pri
 what lets the next reader decide whether it matters; swallowing it is how the first bug happened.
 
 Caught by `llm-5090-3b`, who also supplied the distinction.
+
+### 12.25 A warm cache is dangerous exactly where the working set exceeds L2
+
+We had "warm mode is suspicious" as a hunch and it cost us an afternoon of doubt on a submitted PR.
+It is not a hunch; it has a threshold, and the threshold is arithmetic.
+
+An operator benchmark that launches N times inside one graph and never flushes L2 reads a warm cache
+on every launch but the first. Whether that destroys the measurement depends on one number: does the
+working set fit in L2?
+
+* **`pr_gdn_norm_warp_spread`** — a linear projection, so the weight matrix dominates and does not
+  fit. Warm L2 hid the dominant traffic. Null arm worst |N/A| **5.68 % warm against 0.60 % cold**,
+  and a clean −21.69 % step at T=13…16 became noise spread over −6.98…+2.59 %. The mode did not
+  inflate the result, it **drowned** it: the change was under-measured, not over-claimed.
+* **`pr_rmsnorm_rope_text`** — no weight matrix at all, only `q`, `k` and two 256-element norm
+  vectors. Worst working set over the whole sweep is **58.7 MB against 96 MB of L2**, 0.03 % of L2
+  at T=1. Null arm worst kept pass **0.97 %**, paired median 0.35 %, against a −43.27 % effect.
+
+Same mode, same machine, opposite consequences, and the residency arithmetic predicts which.
+
+**The empirical form is stronger than the structural one and should be quoted first.** A mode that
+costs resolution costs it in the null arm before anywhere else. 5.68 % against 0.35 % is the whole
+argument, visible in the instrument, needing no model of the cache. The residency table explains
+*why* — which turns a coincidence into a criterion — but the null is what settles it.
+
+And note which way the remaining asymmetry points before deciding whether to re-measure. Here the
+split route materialises intermediates and reads them back while the fused route does not, so a warm
+cache flatters **the route being replaced**: a cold measurement would report a larger gain. A
+disclosed weakness that points against your own claim is worth more in the body than a silent one
+that points for it.
+
+Criterion generalised with `llm-5090-3b`, who raised the flag on a live submission.
